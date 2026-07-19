@@ -1,0 +1,17 @@
+[package]
+name = "morreel-studio"
+version = "0.1.0"
+edition = "2021"
+description = "Portrait-only (9:16) video editor for phone reels — Dioxus UI over an ffmpeg engine"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/MoribundMurdoch/mor-reel-studio"
+
+[dependencies]
+dioxus = { version = "0.7", features = ["desktop"] }
+mor_rust_dioxus_ui_kit = { path = "../mor_rust_dioxus_ui_kit" }
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tokio = { version = "1", features = ["process", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
