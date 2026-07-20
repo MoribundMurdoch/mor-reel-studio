@@ -14,28 +14,29 @@ use mor_rust_dioxus_ui_kit::{
     MorShortcutRoot, MorStyleProvider, Slider, UiMode,
 };
 
-/// MorReel look: near-black neutral surround (color judgment happens against it),
-/// with the UI palette derived from the app's own title colors — tungsten amber
-/// for video, teal for audio, gold for titles, record-red for the playhead.
+/// MorReel look: deep-night surround (still near-neutral so color judgment
+/// holds), with a light retro MMO HUD smidge — brass-gold for video, gem-teal
+/// for audio, title gold, record-red for the playhead. Labels stay plain English;
+/// the fantasy is only in the chrome.
 const MORREEL_TOML: &str = r##"
-bg            = "#141417"
-panel         = "#1b1b20"
-header        = "#0f0f12"
-text          = "#eae7e0"
-text_muted    = "#8f8d97"
-border        = "#26262d"
-border_light  = "#37363f"
-accent        = "#e6a23d"
-accent_hover  = "#f2b755"
-btn           = "#2a2a31"
-btn_hover     = "#34343d"
+bg            = "#101018"
+panel         = "#181822"
+header        = "#0b0b11"
+text          = "#ebe6dc"
+text_muted    = "#8e8a96"
+border        = "#2a2836"
+border_light  = "#413e4f"
+accent        = "#d9a441"
+accent_hover  = "#efbc58"
+btn           = "#252530"
+btn_hover     = "#323240"
 font_family   = "Cantarell, 'Segoe UI', system-ui, sans-serif"
 font_size_base= "13px"
 font_size_h1  = "20px"
 padding_base  = "8px"
-border_radius = "6px"
+border_radius = "7px"
 destructive   = "#e5484d"
-success       = "#3dd6d0"
+success       = "#3dd6c8"
 warning       = "#e8c060"
 "##;
 
@@ -3079,6 +3080,7 @@ fn Editor() -> Element {
                                                     div {
                                                         key: "h{n}",
                                                         class: "mr-xf-h",
+                                                        title: "Drag to resize \u{2014} corners keep the shape",
                                                         style: "left:{clamp(fx)}%;top:{clamp(fy)}%",
                                                         onmousedown: move |evt| {
                                                             evt.stop_propagation();
@@ -4698,170 +4700,491 @@ fn Editor() -> Element {
 }
 
 const APP_CSS: &str = r#"
-.mr-root { display: flex; flex-direction: column; gap: 12px; height: 100%; min-height: 0; padding: 12px; box-sizing: border-box; }
+/* Fluid + a light retro MMO HUD: brass frames, soft glows, inventory-slot
+   clips. Motion is deliberate; labels stay plain English in the app itself. */
+.mr-root {
+  display: flex; flex-direction: column; gap: 12px; height: 100%; min-height: 0;
+  padding: 12px; box-sizing: border-box;
+  background:
+    radial-gradient(ellipse 90% 55% at 50% -8%, color-mix(in srgb, var(--mor-accent) 9%, transparent), transparent 58%),
+    radial-gradient(ellipse 50% 40% at 100% 100%, color-mix(in srgb, var(--mor-success) 5%, transparent), transparent 50%),
+    var(--mor-bg);
+}
 .mr-work { display: flex; gap: 16px; flex: 1; min-height: 0; }
 .mr-preview-col { display: flex; flex-direction: column; gap: 10px; align-items: center; min-height: 0; padding-top: 4px; }
 
-/* Signature: the preview is a phone — bezel and faint tungsten glow. */
-/* Width-driven: aspect-ratio height doesn't feed the flex column's intrinsic width
-   in WebKit, so a flex-sized phone overflows the column. 400px ≈ vertical chrome. */
-.mr-phone { position: relative; flex: none; width: calc((100vh - 400px) * 9 / 16); min-width: 140px; max-height: 100%; aspect-ratio: 9 / 16; background: #000; border: 5px solid #060608; box-shadow: 0 0 0 1px var(--mor-border-light), 0 14px 40px rgba(0, 0, 0, 0.55), 0 0 70px color-mix(in srgb, var(--mor-accent) 7%, transparent); border-radius: 24px; overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--mor-text-muted); font-size: 13px; }
+/* Buttons inside the editor: longer ease, slight lift, brass-rim primary. */
+.mr-root .mor-btn {
+  transition: background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.15s ease, color 0.15s ease;
+}
+.mr-root .mor-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.35), 0 0 0 1px color-mix(in srgb, var(--mor-border-light) 60%, transparent);
+}
+.mr-root .mor-btn:active:not(:disabled) { transform: translateY(0); }
+.mr-root .mor-btn.primary {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-accent-hover) 92%, white), var(--mor-accent));
+  border-color: color-mix(in srgb, var(--mor-accent) 70%, #5a4010);
+  color: #1a1408;
+  font-weight: 600;
+  text-shadow: 0 1px 0 color-mix(in srgb, white 25%, transparent);
+}
+.mr-root .mor-btn.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, var(--mor-accent-hover), color-mix(in srgb, var(--mor-accent) 85%, black));
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--mor-accent) 35%, transparent);
+}
+
+/* Signature: phone as a framed artifact — dual rim + soft brass bloom.
+   Width-driven: aspect-ratio height doesn't feed the flex column's intrinsic
+   width in WebKit, so a flex-sized phone overflows. 400px ≈ vertical chrome. */
+.mr-phone {
+  position: relative; flex: none;
+  width: calc((100vh - 400px) * 9 / 16); min-width: 140px; max-height: 100%;
+  aspect-ratio: 9 / 16; background: #000;
+  border: 5px solid #06060a;
+  border-radius: 24px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--mor-text-muted); font-size: 13px;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--mor-accent) 45%, var(--mor-border-light)),
+    0 0 0 3px #0a0a10,
+    0 16px 44px rgba(0, 0, 0, 0.6),
+    0 0 48px color-mix(in srgb, var(--mor-accent) 14%, transparent);
+  transition: box-shadow 0.35s ease, transform 0.25s ease;
+}
+.mr-phone:hover {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--mor-accent) 65%, var(--mor-border-light)),
+    0 0 0 3px #0a0a10,
+    0 18px 48px rgba(0, 0, 0, 0.62),
+    0 0 64px color-mix(in srgb, var(--mor-accent) 22%, transparent);
+}
 .mr-phone > span { text-align: center; padding: 0 16px; }
 .mr-phone img { width: 100%; height: 100%; object-fit: cover; display: block; }
 /* Punch-hole speaker slit: the bezel reads as a phone at a glance. */
-.mr-phone::after { content: ""; position: absolute; top: 6px; left: 50%; transform: translateX(-50%); width: 22%; height: 5px; border-radius: 3px; background: #060608; box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.05); z-index: 2; pointer-events: none; }
+.mr-phone::after {
+  content: ""; position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
+  width: 22%; height: 5px; border-radius: 3px; background: #06060a;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.06), 0 0 6px color-mix(in srgb, var(--mor-accent) 20%, transparent);
+  z-index: 2; pointer-events: none;
+}
 
-/* Drop target under a dragged file. Without this the gesture feels broken even
-   when it works — you get no confirmation of where it will land before you let
-   go. Inset shadow rather than a border, so nothing reflows mid-drag and the
-   lane geometry stays ruler-exact. */
-.mr-drop { box-shadow: inset 0 0 0 2px var(--mor-accent), 0 0 12px color-mix(in srgb, var(--mor-accent) 30%, transparent); background-color: color-mix(in srgb, var(--mor-accent) 12%, transparent); }
+/* Drop target: pulse the brass rim without reflowing lane geometry. */
+.mr-drop {
+  box-shadow:
+    inset 0 0 0 2px var(--mor-accent),
+    0 0 18px color-mix(in srgb, var(--mor-accent) 38%, transparent) !important;
+  background-color: color-mix(in srgb, var(--mor-accent) 12%, transparent);
+  animation: mr-drop-pulse 1.1s ease-in-out infinite;
+}
 .mr-timeline.mr-drop { border-radius: var(--mor-radius); }
+@keyframes mr-drop-pulse {
+  0%, 100% { box-shadow: inset 0 0 0 2px var(--mor-accent), 0 0 12px color-mix(in srgb, var(--mor-accent) 28%, transparent); }
+  50% { box-shadow: inset 0 0 0 2px var(--mor-accent-hover), 0 0 22px color-mix(in srgb, var(--mor-accent) 48%, transparent); }
+}
 
-/* On-screen transform handles, Final Cut style: drag inside the box to move,
-   a corner to scale, the knob above it to rotate. The box is the picture's
-   footprint, so it can sit partly outside the frame; the handles are pulled
-   back to the edge when it does, since the monitor clips. */
+/* Transform handles: gem-square corners, gold dashed frame. */
 .mr-xf { position: absolute; inset: 0; z-index: 4; }
-.mr-xf-box { position: absolute; box-sizing: border-box; border: 1px dashed var(--mor-accent); background: color-mix(in srgb, var(--mor-accent) 6%, transparent); pointer-events: auto; cursor: move; }
-.mr-xf-h { position: absolute; width: 13px; height: 13px; margin: -7px 0 0 -7px; box-sizing: border-box; background: var(--mor-accent); border: 1px solid #0f0f12; border-radius: 2px; pointer-events: auto; cursor: nwse-resize; box-shadow: 0 1px 3px rgba(0,0,0,0.6); }
-.mr-xf-rot { position: absolute; width: 13px; height: 13px; margin: -22px 0 0 -7px; box-sizing: border-box; background: var(--mor-warning); border: 1px solid #0f0f12; border-radius: 50%; pointer-events: auto; cursor: grab; box-shadow: 0 1px 3px rgba(0,0,0,0.6); }
-.mr-xf-rot::after { content: ""; position: absolute; left: 50%; top: 100%; width: 1px; height: 14px; background: var(--mor-warning); opacity: 0.7; }
+.mr-xf-box {
+  position: absolute; box-sizing: border-box;
+  border: 1px dashed var(--mor-accent);
+  background: color-mix(in srgb, var(--mor-accent) 7%, transparent);
+  pointer-events: auto; cursor: move;
+  box-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 18%, transparent);
+}
+.mr-xf-h {
+  position: absolute; width: 13px; height: 13px; margin: -7px 0 0 -7px; box-sizing: border-box;
+  background: linear-gradient(145deg, var(--mor-accent-hover), var(--mor-accent));
+  border: 1px solid #0f0f12; border-radius: 2px;
+  pointer-events: auto; cursor: nwse-resize;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.6), 0 0 6px color-mix(in srgb, var(--mor-accent) 40%, transparent);
+  transition: transform 0.12s ease;
+}
+.mr-xf-h:hover { transform: scale(1.15); }
+.mr-xf-e { position: absolute; box-sizing: border-box; background: var(--mor-accent); border: 1px solid #0f0f12; border-radius: 2px; pointer-events: auto; box-shadow: 0 1px 3px rgba(0,0,0,0.6); }
+.mr-xf-e.wide { width: 9px; height: 17px; margin: -9px 0 0 -5px; cursor: ew-resize; }
+.mr-xf-e.tall { width: 17px; height: 9px; margin: -5px 0 0 -9px; cursor: ns-resize; }
+.mr-xf-rot {
+  position: absolute; width: 13px; height: 13px; margin: -22px 0 0 -7px; box-sizing: border-box;
+  background: radial-gradient(circle at 35% 30%, #fff6c8, var(--mor-warning) 55%, #a07820);
+  border: 1px solid #0f0f12; border-radius: 50%;
+  pointer-events: auto; cursor: grab;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.6), 0 0 8px color-mix(in srgb, var(--mor-warning) 45%, transparent);
+}
+.mr-xf-rot::after {
+  content: ""; position: absolute; left: 50%; top: 100%; width: 1px; height: 14px;
+  background: var(--mor-warning); opacity: 0.75;
+}
 
-/* Safe-area guides: shaded bands where the phone app's own chrome sits over a
-   9:16 feed. Worst case across TikTok / Reels / Shorts, so clearing these
-   clears all three. Percentages are of the frame, so they hold at any preview
-   size. Non-interactive — it's a guide, not a mask. */
+/* Safe-area guides (phone app chrome). Non-interactive. */
 .mr-safe { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
-.mr-safe-zone { position: absolute; background: color-mix(in srgb, var(--mor-destructive) 15%, transparent); border: 1px dashed color-mix(in srgb, var(--mor-destructive) 55%, transparent); box-sizing: border-box; }
-.mr-safe-zone span { position: absolute; bottom: 2px; right: 4px; font-size: 8px; letter-spacing: 0.04em; text-transform: uppercase; color: color-mix(in srgb, var(--mor-destructive) 85%, white); text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); white-space: nowrap; }
+.mr-safe-zone {
+  position: absolute;
+  background: color-mix(in srgb, var(--mor-destructive) 15%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--mor-destructive) 55%, transparent);
+  box-sizing: border-box;
+}
+.mr-safe-zone span {
+  position: absolute; bottom: 2px; right: 4px; font-size: 8px; letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--mor-destructive) 85%, white);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); white-space: nowrap;
+}
 .mr-safe-top { top: 0; left: 0; right: 0; height: 8%; border-width: 0 0 1px 0; }
 .mr-safe-bottom { bottom: 0; left: 0; right: 0; height: 24%; border-width: 1px 0 0 0; }
 .mr-safe-bottom span { bottom: auto; top: 2px; }
 .mr-safe-rail { top: 8%; bottom: 24%; right: 0; width: 18%; border-width: 0 0 0 1px; }
 
-/* Pop-out monitor window: the phone alone, sized to the window. */
-.mr-monitor { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 14px; box-sizing: border-box; background: var(--mor-bg); }
+.mr-monitor {
+  height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 14px; box-sizing: border-box;
+  background:
+    radial-gradient(ellipse 70% 60% at 50% 40%, color-mix(in srgb, var(--mor-accent) 8%, transparent), transparent 65%),
+    var(--mor-bg);
+}
 .mr-monitor .mr-phone { width: auto; height: 100%; max-width: 100%; min-width: 0; }
 
 .mr-scrub { width: 100%; }
-/* Deck counter: master timecode, the one loud piece of type. Amber at rest,
-   record-red while rolling — same code as the playhead. */
-.mr-deck { display: flex; justify-content: center; align-items: baseline; gap: 7px; margin-bottom: 4px; padding: 3px 12px 4px; background: #0a0a0d; border: 1px solid var(--mor-border); border-radius: 6px; font-size: 21px; color: var(--mor-accent); letter-spacing: 0.05em; text-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 40%, transparent); }
-.mr-deck.playing { color: var(--mor-destructive); text-shadow: 0 0 10px color-mix(in srgb, var(--mor-destructive) 45%, transparent); }
+/* Deck: HUD readout — brass inset frame, amber at rest, record-red rolling. */
+.mr-deck {
+  display: flex; justify-content: center; align-items: baseline; gap: 7px;
+  margin-bottom: 4px; padding: 5px 14px 6px;
+  background: linear-gradient(180deg, #12121a, #08080c);
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 35%, var(--mor-border));
+  border-radius: 8px;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 18%, transparent),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.45),
+    0 0 16px color-mix(in srgb, var(--mor-accent) 12%, transparent);
+  font-size: 21px; color: var(--mor-accent); letter-spacing: 0.06em;
+  text-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 45%, transparent);
+  transition: color 0.25s ease, text-shadow 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+}
+.mr-deck.playing {
+  color: var(--mor-destructive);
+  border-color: color-mix(in srgb, var(--mor-destructive) 45%, var(--mor-border));
+  text-shadow: 0 0 14px color-mix(in srgb, var(--mor-destructive) 50%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--mor-destructive) 20%, transparent),
+    0 0 18px color-mix(in srgb, var(--mor-destructive) 18%, transparent);
+  animation: mr-deck-pulse 1.4s ease-in-out infinite;
+}
+@keyframes mr-deck-pulse {
+  0%, 100% { text-shadow: 0 0 10px color-mix(in srgb, var(--mor-destructive) 40%, transparent); }
+  50% { text-shadow: 0 0 18px color-mix(in srgb, var(--mor-destructive) 65%, transparent); }
+}
 .mr-deck-total { font-size: 12px; color: var(--mor-text-muted); text-shadow: none; letter-spacing: 0.03em; }
 .mr-play-row { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
-.mr-inspector { flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 12px; background: var(--mor-panel); border: 1px solid var(--mor-border); border-radius: var(--mor-radius); padding: 14px; overflow-y: auto; }
+
+/* Inspector: framed panel like a classic side window. */
+.mr-inspector {
+  flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 12px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 92%, white), var(--mor-panel));
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border));
+  border-radius: var(--mor-radius);
+  padding: 14px; overflow-y: auto;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 12%, transparent),
+    0 8px 28px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(0, 0, 0, 0.35);
+}
 .mr-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
-/* Export is the ship-it action: gold, pushed to the toolbar's far edge. */
-.mr-toolbar .mr-export { margin-left: auto; color: var(--mor-warning); border-color: color-mix(in srgb, var(--mor-warning) 45%, transparent); }
-.mr-toolbar .mr-export:hover:not(:disabled) { border-color: var(--mor-warning); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-warning) 25%, transparent); }
+.mr-toolbar .mr-export {
+  margin-left: auto; color: var(--mor-warning);
+  border-color: color-mix(in srgb, var(--mor-warning) 50%, transparent);
+  background: color-mix(in srgb, var(--mor-warning) 8%, var(--mor-btn));
+}
+.mr-toolbar .mr-export:hover:not(:disabled) {
+  border-color: var(--mor-warning);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--mor-warning) 30%, transparent);
+  color: #fff4c8;
+}
 .mr-clip-info h3 { margin: 0 0 4px 0; font-size: 14px; overflow-wrap: anywhere; }
 .mr-clip-info .mr-ctx-tag { vertical-align: 2px; }
 .mr-clip-info p { margin: 0; font-size: 12px; }
 .mr-danger { color: var(--mor-destructive); }
-/* Reset only appears once a transform is off its default, so its presence
-   doubles as the signal that a clip has been moved at all. */
 .mr-reset { align-self: flex-start; font-size: 11px; }
 .mr-keys { margin-top: auto; font-size: 11px; }
-.mr-progress { height: 6px; background: var(--mor-border); border-radius: 3px; overflow: hidden; }
-.mr-progress > div { height: 100%; background: var(--mor-accent); transition: width 0.3s; }
 
-/* Timeline sits on the darkest surface — the bench under the work.
-   overflow: scroll keeps both scrollbars visible, editor-style. */
-.mr-timeline { display: flex; overflow: scroll; padding: 12px 10px 8px; background: var(--mor-header); border: 1px solid var(--mor-border); border-radius: var(--mor-radius); min-height: 216px; max-height: 40vh; align-items: flex-start; flex: none; user-select: none; -webkit-user-select: none; }
+.mr-progress {
+  height: 7px; background: var(--mor-border); border-radius: 4px; overflow: hidden;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+.mr-progress > div {
+  height: 100%;
+  background: linear-gradient(90deg, var(--mor-accent), var(--mor-accent-hover), var(--mor-warning));
+  background-size: 200% 100%;
+  transition: width 0.3s ease;
+  animation: mr-progress-sheen 2.2s linear infinite;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--mor-accent) 40%, transparent);
+}
+@keyframes mr-progress-sheen {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+/* Timeline: darkest bench, brass outer rim. */
+.mr-timeline {
+  display: flex; overflow: scroll; padding: 12px 10px 8px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--mor-header) 88%, var(--mor-accent)), var(--mor-header));
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
+  border-radius: var(--mor-radius);
+  min-height: 216px; max-height: 40vh;
+  align-items: flex-start; flex: none;
+  user-select: none; -webkit-user-select: none;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 10%, transparent),
+    0 6px 22px rgba(0, 0, 0, 0.4);
+}
 .mr-timeline-hint { align-self: center; margin: auto; }
 .mr-track { position: relative; flex: none; min-width: 100%; }
 
-/* Timecodes are instrument readouts: monospace, tabular. */
-.mr-tick, .mr-clip-dur, .mr-key, .mr-ph-badge, .mr-deck { font-family: ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', monospace; font-variant-numeric: tabular-nums; }
+.mr-tick, .mr-clip-dur, .mr-key, .mr-ph-badge, .mr-deck {
+  font-family: ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
 
-/* Ruler: instrument strip — labeled majors, quarter minors, drag to scrub. */
-.mr-ruler { position: relative; height: 22px; margin-bottom: 6px; border-bottom: 1px solid var(--mor-border-light); cursor: ew-resize; }
-.mr-tick { position: absolute; bottom: 0; height: 5px; border-left: 1px solid var(--mor-border); font-size: 9px; color: var(--mor-text-muted); pointer-events: none; white-space: nowrap; }
-.mr-tick.major { height: 15px; border-left-color: var(--mor-border-light); padding-left: 3px; }
+.mr-ruler {
+  position: relative; height: 22px; margin-bottom: 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 25%, var(--mor-border-light));
+  cursor: ew-resize;
+}
+.mr-tick {
+  position: absolute; bottom: 0; height: 5px;
+  border-left: 1px solid var(--mor-border);
+  font-size: 9px; color: var(--mor-text-muted);
+  pointer-events: none; white-space: nowrap;
+}
+.mr-tick.major {
+  height: 15px;
+  border-left-color: color-mix(in srgb, var(--mor-accent) 40%, var(--mor-border-light));
+  padding-left: 3px; color: color-mix(in srgb, var(--mor-text-muted) 80%, var(--mor-accent));
+}
 
-.mr-lane { position: relative; height: 30px; margin-bottom: 6px; background: rgba(127, 127, 127, 0.06); border-radius: 4px; }
-.mr-lane-tag { position: absolute; top: 4px; left: 4px; z-index: 2; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: var(--mor-accent); color: #141417; pointer-events: none; }
-.mr-lane-tag.title { background: var(--mor-warning); }
-.mr-lane-a1 .mr-lane-tag { background: var(--mor-success); }
-/* A1 is taller than the marker lanes so the waveform has room to read. */
+.mr-lane {
+  position: relative; height: 30px; margin-bottom: 6px;
+  background: rgba(127, 127, 127, 0.06);
+  border-radius: 5px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.mr-lane-tag {
+  position: absolute; top: 4px; left: 4px; z-index: 2;
+  font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px;
+  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
+  color: #141417; pointer-events: none;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+.mr-lane-tag.title { background: linear-gradient(180deg, #f0d078, var(--mor-warning)); }
+.mr-lane-a1 .mr-lane-tag { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
 .mr-lane-a1 { height: 44px; }
 
-.mr-lane-item { position: absolute; top: 2px; bottom: 2px; box-sizing: border-box; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 10px; line-height: 22px; padding: 0 6px 0 30px; border-radius: 4px; border: 2px solid color-mix(in srgb, var(--mor-accent) 40%, transparent); background: color-mix(in srgb, var(--mor-accent) 24%, transparent); cursor: grab; }
-.mr-lane-item.audio { border-color: color-mix(in srgb, var(--mor-success) 40%, transparent); background: color-mix(in srgb, var(--mor-success) 22%, transparent); }
-.mr-lane-item.title { border-color: color-mix(in srgb, var(--mor-warning) 45%, transparent); background: color-mix(in srgb, var(--mor-warning) 26%, transparent); }
-.mr-lane-item.selected { border-color: var(--mor-accent); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-accent) 35%, transparent); }
-.mr-lane-item.audio.selected { border-color: var(--mor-success); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-success) 35%, transparent); }
-.mr-lane-item.title.selected { border-color: var(--mor-warning); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-warning) 35%, transparent); }
+/* Lane items: embossed inventory-slot feel. */
+.mr-lane-item {
+  position: absolute; top: 2px; bottom: 2px; box-sizing: border-box;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  font-size: 10px; line-height: 22px; padding: 0 6px 0 30px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 50%, transparent);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--mor-accent) 32%, transparent), color-mix(in srgb, var(--mor-accent) 16%, transparent));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 12%, transparent), 0 1px 2px rgba(0, 0, 0, 0.3);
+  cursor: grab;
+  transition: border-color 0.15s ease, box-shadow 0.18s ease, filter 0.15s ease;
+}
+.mr-lane-item:hover { filter: brightness(1.08); }
+.mr-lane-item.audio {
+  border-color: color-mix(in srgb, var(--mor-success) 50%, transparent);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-success) 30%, transparent), color-mix(in srgb, var(--mor-success) 14%, transparent));
+}
+.mr-lane-item.title {
+  border-color: color-mix(in srgb, var(--mor-warning) 55%, transparent);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 34%, transparent), color-mix(in srgb, var(--mor-warning) 16%, transparent));
+}
+.mr-lane-item.selected {
+  border-color: var(--mor-accent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, var(--mor-accent) 40%, transparent);
+}
+.mr-lane-item.audio.selected {
+  border-color: var(--mor-success);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, var(--mor-success) 40%, transparent);
+}
+.mr-lane-item.title.selected {
+  border-color: var(--mor-warning);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, var(--mor-warning) 40%, transparent);
+}
 
-/* Ctrl+click marks (grouping candidates) and group membership dots. */
-.mr-lane-item.marked, .mr-clip.marked { outline: 2px dashed var(--mor-accent-hover); outline-offset: 1px; }
-.mr-group-dot { position: absolute; left: 3px; bottom: 3px; z-index: 2; width: 7px; height: 7px; border-radius: 50%; box-shadow: 0 0 3px rgba(0, 0, 0, 0.7); pointer-events: none; }
+.mr-lane-item.marked, .mr-clip.marked {
+  outline: 2px dashed var(--mor-accent-hover); outline-offset: 1px;
+}
+.mr-group-dot {
+  position: absolute; left: 3px; bottom: 3px; z-index: 2;
+  width: 7px; height: 7px; border-radius: 50%;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.7), 0 0 6px color-mix(in srgb, currentColor 40%, transparent);
+  pointer-events: none;
+}
 
-/* V1 is the primary story: a faint tungsten bed sets it apart from the
-   attachment lanes (no horizontal padding — clip x must stay ruler-exact). */
-.mr-clips { position: relative; display: flex; margin-bottom: 6px; background: color-mix(in srgb, var(--mor-accent) 5%, transparent); border-radius: 6px; }
-.mr-clip { position: relative; flex: none; box-sizing: border-box; overflow: hidden; cursor: grab; border: 2px solid transparent; border-radius: 6px; padding: 3px; background: var(--mor-panel); display: flex; flex-direction: column; gap: 2px; transition: border-color 0.12s; }
-.mr-clip:hover { border-color: var(--mor-border-light); }
-.mr-clip.selected { border-color: var(--mor-accent); box-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 30%, transparent); }
-.mr-clip img, .mr-thumb-missing { width: 100%; height: 72px; object-fit: cover; border-radius: 4px; display: block; background: #000; }
-/* A clip's own audio, drawn under its thumbnail in the same teal A1 uses — a
-   clip with no strip is a clip with no sound. */
-.mr-clip-wave { height: 18px; flex: none; border-radius: 3px; background-color: color-mix(in srgb, var(--mor-success) 10%, transparent); }
-/* Transition badge on the incoming clip's leading edge: the junction is where
-   the two clips overlap, so it belongs at the cut rather than inside a clip. */
-.mr-xtrans { position: absolute; top: 3px; left: 3px; z-index: 2; font-size: 8px; line-height: 12px; padding: 0 3px; border-radius: 3px; background: var(--mor-accent); color: #141417; letter-spacing: -1px; pointer-events: none; }
+/* V1 story lane: faint gold bed; clips as raised tiles. */
+.mr-clips {
+  position: relative; display: flex; margin-bottom: 6px;
+  background: color-mix(in srgb, var(--mor-accent) 6%, transparent);
+  border-radius: 7px;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.28);
+}
+.mr-clip {
+  position: relative; flex: none; box-sizing: border-box; overflow: hidden;
+  cursor: grab; border: 2px solid transparent; border-radius: 7px; padding: 3px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 90%, white), var(--mor-panel));
+  display: flex; flex-direction: column; gap: 2px;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 8%, transparent), 0 1px 3px rgba(0, 0, 0, 0.28);
+  transition: border-color 0.16s ease, box-shadow 0.2s ease, transform 0.15s ease, filter 0.15s ease;
+}
+.mr-clip:hover {
+  border-color: var(--mor-border-light);
+  filter: brightness(1.05);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 10%, transparent), 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+.mr-clip.selected {
+  border-color: var(--mor-accent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, white 12%, transparent),
+    0 0 14px color-mix(in srgb, var(--mor-accent) 38%, transparent);
+}
+.mr-clip img, .mr-thumb-missing {
+  width: 100%; height: 72px; object-fit: cover; border-radius: 4px;
+  display: block; background: #000;
+}
+.mr-clip-wave {
+  height: 18px; flex: none; border-radius: 3px;
+  background-color: color-mix(in srgb, var(--mor-success) 10%, transparent);
+}
+.mr-xtrans {
+  position: absolute; top: 3px; left: 3px; z-index: 2;
+  font-size: 8px; line-height: 12px; padding: 0 4px; border-radius: 3px;
+  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
+  color: #141417; letter-spacing: -1px; pointer-events: none;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
 .mr-clip-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .mr-clip-dur { font-size: 10px; color: var(--mor-text-muted); }
 
-/* Record-red playhead with a head cap — reads at a glance against amber/teal/gold. */
-/* Beat markers: full-height hairlines behind everything, so a cut can be lined
-   up against the music without a lane of its own. */
-.mr-marker { position: absolute; top: 18px; bottom: 0; width: 1px; background: color-mix(in srgb, var(--mor-warning) 70%, transparent); pointer-events: none; z-index: 1; }
-.mr-marker::before { content: ""; position: absolute; top: -6px; left: -3px; border: 3px solid transparent; border-top: 5px solid var(--mor-warning); }
+.mr-marker {
+  position: absolute; top: 18px; bottom: 0; width: 1px;
+  background: color-mix(in srgb, var(--mor-warning) 70%, transparent);
+  pointer-events: none; z-index: 1;
+}
+.mr-marker::before {
+  content: ""; position: absolute; top: -6px; left: -3px;
+  border: 3px solid transparent; border-top: 5px solid var(--mor-warning);
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--mor-warning) 50%, transparent));
+}
 
-.mr-playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--mor-destructive); box-shadow: 0 0 6px color-mix(in srgb, var(--mor-destructive) 60%, transparent); pointer-events: none; }
-.mr-playhead::before { content: ""; position: absolute; top: 0; left: -4px; border: 5px solid transparent; border-top: 6px solid var(--mor-destructive); }
-/* Timecode readout riding the playhead — the ruler's live counterpart. */
-.mr-ph-badge { position: absolute; top: 0; left: 5px; padding: 0 4px; border-radius: 3px; background: var(--mor-destructive); color: #fff; font-size: 9px; line-height: 14px; white-space: nowrap; }
+.mr-playhead {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  background: var(--mor-destructive);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--mor-destructive) 65%, transparent);
+  pointer-events: none;
+}
+/* Diamond cap — a tiny retro-UI gem on the playhead. */
+.mr-playhead::before {
+  content: ""; position: absolute; top: 1px; left: -4px;
+  width: 10px; height: 10px;
+  background: linear-gradient(145deg, #ff8a8e, var(--mor-destructive) 50%, #9a2024);
+  border: 1px solid color-mix(in srgb, white 25%, var(--mor-destructive));
+  border-radius: 1px;
+  transform: rotate(45deg);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-destructive) 55%, transparent);
+}
+.mr-ph-badge {
+  position: absolute; top: 0; left: 10px; padding: 0 5px; border-radius: 3px;
+  background: linear-gradient(180deg, #f06a6e, var(--mor-destructive));
+  color: #fff; font-size: 9px; line-height: 14px; white-space: nowrap;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+}
 
-/* Right-click menu: the kit's dropdown chrome, summoned at the pointer.
-   Header chip names the lane the actions apply to, same colors as the timeline. */
 .mr-ctx-backdrop { position: fixed; inset: 0; z-index: 400; }
-.mr-ctx { display: block; position: fixed; margin: 0; width: 228px; z-index: 401; }
-.mr-ctx-head { display: flex; align-items: center; gap: 6px; padding: 4px 10px 7px; border-bottom: 1px solid var(--mor-border-light); margin-bottom: 4px; }
-.mr-ctx-tag { flex: none; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: var(--mor-accent); color: #141417; }
-.mr-ctx-tag.audio { background: var(--mor-success); }
-.mr-ctx-tag.title { background: var(--mor-warning); }
-.mr-ctx-name { font-size: 11px; color: var(--mor-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Destructive rows read record-red at rest and hover red, not accent. */
+.mr-ctx {
+  display: block; position: fixed; margin: 0; width: 228px; z-index: 401;
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 28%, var(--mor-border)) !important;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0, 0, 0, 0.3) !important;
+}
+.mr-ctx-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 10px 7px;
+  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 20%, var(--mor-border-light));
+  margin-bottom: 4px;
+}
+.mr-ctx-tag {
+  flex: none; font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px;
+  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
+  color: #141417;
+}
+.mr-ctx-tag.audio { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
+.mr-ctx-tag.title { background: linear-gradient(180deg, #f0d078, var(--mor-warning)); }
+.mr-ctx-name {
+  font-size: 11px; color: var(--mor-text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .mr-ctx .mor-menu-action.mr-danger { color: var(--mor-destructive); }
-.mr-ctx .mor-menu-action.mr-danger:hover:not(:disabled) { background-color: var(--mor-destructive); color: #fff; }
+.mr-ctx .mor-menu-action.mr-danger:hover:not(:disabled) {
+  background-color: var(--mor-destructive); color: #fff;
+}
 
-/* Status-bar zoom: magnifier buttons flanking a compact slider. */
 .mr-zoom { display: inline-flex; gap: 4px; align-items: center; }
-.mr-zoom button { background: none; border: none; color: var(--mor-text-muted); font-size: 14px; line-height: 1; padding: 0 2px; cursor: pointer; }
-.mr-zoom button:hover { color: var(--mor-accent-hover); }
+.mr-zoom button {
+  background: none; border: none; color: var(--mor-text-muted);
+  font-size: 14px; line-height: 1; padding: 0 2px; cursor: pointer;
+  transition: color 0.15s ease, transform 0.12s ease;
+}
+.mr-zoom button:hover { color: var(--mor-accent-hover); transform: scale(1.12); }
 .mr-zoom-slider { width: 90px; accent-color: var(--mor-accent); }
 
-/* Inspector tabs: Inspector | Effects. */
-.mr-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--mor-border); }
-.mr-tab { background: none; border: none; border-bottom: 2px solid transparent; color: var(--mor-text-muted); font-size: 12px; padding: 4px 12px; cursor: pointer; }
+.mr-tabs {
+  display: flex; gap: 2px;
+  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
+}
+.mr-tab {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--mor-text-muted); font-size: 12px; padding: 5px 14px; cursor: pointer;
+  transition: color 0.15s ease, border-color 0.18s ease, text-shadow 0.18s ease;
+}
 .mr-tab:hover { color: var(--mor-text); }
-.mr-tab.active { color: var(--mor-text); border-bottom-color: var(--mor-accent); }
+.mr-tab.active {
+  color: var(--mor-accent-hover);
+  border-bottom-color: var(--mor-accent);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 35%, transparent);
+}
 
-/* Effects browser: poster-frame swatches of the selected clip per effect. */
-.mr-fx-cat { margin: 4px 0 0; font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--mor-text-muted); }
+.mr-fx-cat {
+  margin: 4px 0 0; font-size: 10px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--mor-text-muted) 85%, var(--mor-accent));
+}
 .mr-fx-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; }
-.mr-fx-tile { padding: 3px; border: 2px solid transparent; border-radius: 6px; background: var(--mor-btn); cursor: pointer; display: flex; flex-direction: column; gap: 2px; align-items: center; color: var(--mor-text); font-size: 10px; }
-.mr-fx-tile:hover { border-color: var(--mor-border-light); }
-.mr-fx-tile.active { border-color: var(--mor-accent); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-accent) 30%, transparent); }
-.mr-fx-tile img, .mr-fx-ph { width: 100%; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 4px; background: #000; display: block; }
+.mr-fx-tile {
+  padding: 3px; border: 2px solid transparent; border-radius: 7px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-btn) 90%, white), var(--mor-btn));
+  cursor: pointer; display: flex; flex-direction: column; gap: 2px; align-items: center;
+  color: var(--mor-text); font-size: 10px;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
+  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.15s ease, filter 0.15s ease;
+}
+.mr-fx-tile:hover {
+  border-color: var(--mor-border-light);
+  transform: translateY(-2px);
+  filter: brightness(1.06);
+}
+.mr-fx-tile.active {
+  border-color: var(--mor-accent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 35%, transparent);
+}
+.mr-fx-tile img, .mr-fx-ph {
+  width: 100%; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 4px;
+  background: #000; display: block;
+}
 .mr-fx-tile span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* Export dialog: the format picker carries a one-line blurb, so the choice
-   doesn't need a manual. */
 .mr-export-dialog { display: flex; flex-direction: column; gap: 10px; min-width: 320px; }
 .mr-export-blurb { margin: -4px 0 2px; font-size: 12px; }
 .mr-export-dialog .mr-toolbar { justify-content: flex-end; margin-top: 4px; }
@@ -4869,16 +5192,29 @@ const APP_CSS: &str = r#"
 .mr-shortcut-table { border-collapse: collapse; width: 100%; font-size: 13px; }
 .mr-shortcut-table td { padding: 4px 10px 4px 0; }
 .mr-key { color: var(--mor-accent-hover); white-space: nowrap; }
+
 @media (max-width: 700px) {
-    .mr-work { flex-direction: column; }
-    .mr-phone { flex: none; width: auto; height: 45vh; }
-    .mr-inspector { min-width: 0; }
+  .mr-work { flex-direction: column; }
+  .mr-phone { flex: none; width: auto; height: 45vh; }
+  .mr-inspector { min-width: 0; }
 }
-/* Keyboard focus is always visible — same amber the pointer states use. */
-.mr-root button:focus-visible, .mr-root input:focus-visible, .mr-fx-tile:focus-visible, .mr-tab:focus-visible { outline: 2px solid var(--mor-accent-hover); outline-offset: 2px; }
+
+.mr-root button:focus-visible,
+.mr-root input:focus-visible,
+.mr-fx-tile:focus-visible,
+.mr-tab:focus-visible {
+  outline: 2px solid var(--mor-accent-hover);
+  outline-offset: 2px;
+}
 
 @media (prefers-reduced-motion: reduce) {
-    .mr-clip, .mr-progress > div { transition: none; }
+  .mr-clip, .mr-lane-item, .mr-fx-tile, .mr-root .mor-btn,
+  .mr-progress > div, .mr-deck, .mr-tab, .mr-phone, .mr-xf-h {
+    transition: none !important; animation: none !important;
+  }
+  .mr-drop, .mr-deck.playing, .mr-progress > div { animation: none !important; }
+  .mr-root .mor-btn:hover:not(:disabled),
+  .mr-fx-tile:hover { transform: none; }
 }
 "#;
 
@@ -5407,11 +5743,11 @@ mod tests {
         let start = engine::Transform::default();
         // Half the monitor's width to the right is x = 0.5, whatever the
         // monitor's pixel size — the transform is stored in frame fractions.
-        let t = xf_apply(XfGrab::Move, start, (135.0, 240.0), (270.0, 240.0), RECT);
+        let t = xf_apply(XfGrab::Move, start, (135.0, 240.0), (270.0, 240.0), RECT, false);
         assert!((t.x - 0.5).abs() < 1e-9, "x = {}", t.x);
         assert_eq!(t.y, 0.0);
         // Up a quarter of the height is negative y.
-        let t = xf_apply(XfGrab::Move, start, (135.0, 240.0), (135.0, 120.0), RECT);
+        let t = xf_apply(XfGrab::Move, start, (135.0, 240.0), (135.0, 120.0), RECT, false);
         assert!((t.y + 0.25).abs() < 1e-9, "y = {}", t.y);
         // Moving does not disturb the other knobs.
         assert_eq!((t.scale, t.rotation, t.opacity), (1.0, 0.0, 1.0));
