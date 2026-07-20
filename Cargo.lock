@@ -2825,6 +2825,8 @@ dependencies = [
  "image",
  "mor_rust_dioxus_ui_kit",
  "rfd 0.15.4",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
