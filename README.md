@@ -11,7 +11,8 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
 
 - **V1 main track** — trim, reorder, split at playhead, per-clip speed
   (0.25×–4×) and volume; every delete is a ripple delete by construction (a
-  concat timeline has no gaps to leave).
+  concat timeline has no gaps to leave). A clip with sound draws its own
+  waveform under its thumbnail, so a clip with no strip is a silent one.
 - **Photos on the timeline** — drop a PNG/JPEG onto V1 or V2 and it loops for
   as long as you hold it, so the Motion effects become camera moves over a
   still. Same lanes, same effects, same export.

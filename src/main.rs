@@ -264,6 +264,10 @@ struct Clip {
     volume: f64,
     #[serde(skip)]
     thumb: String,
+    /// Full-source waveform data URI for this clip's own audio; empty until the
+    /// background render lands, and always empty for a silent source.
+    #[serde(skip)]
+    wave: String,
     /// 480p scrub proxy path; empty until the background build finishes.
     #[serde(skip)]
     proxy: String,
@@ -355,18 +359,23 @@ struct AudioItem {
     group: usize,
 }
 
-/// Inline CSS windowing an item's full-source waveform to its trimmed span:
-/// the image maps to the whole source, so size = duration and offset = in_s.
-fn wave_css(a: &AudioItem, scale: f64) -> String {
-    if a.wave.is_empty() {
+/// Inline CSS windowing a full-source waveform image to the span an item keeps.
+/// The image spans the whole source, so it is stretched to `duration` seconds
+/// wide and shifted left by the in point; trims and splits are then free, since
+/// they only move this window rather than re-rendering anything.
+///
+/// `speed` compresses both, so a retimed V1 clip's waveform still lines up with
+/// its retimed width on the timeline. A1 items are never retimed and pass 1.0.
+fn wave_css(wave: &str, duration: f64, in_s: f64, scale: f64, speed: f64) -> String {
+    if wave.is_empty() {
         return String::new();
     }
+    let px = scale / speed.max(0.01);
     format!(
-        "background-image:url({});background-size:{:.1}px 100%;\
+        "background-image:url({wave});background-size:{:.1}px 100%;\
          background-position:-{:.1}px 0;background-repeat:no-repeat;",
-        a.wave,
-        a.duration * scale,
-        a.in_s * scale
+        duration * px,
+        in_s * px
     )
 }
 
@@ -1121,10 +1130,24 @@ fn Editor() -> Element {
                             speed: 1.0,
                             volume: 1.0,
                             thumb,
+                            wave: String::new(),
                             proxy: String::new(),
                             group: 0,
                         });
-                        queue_proxy(path);
+                        queue_proxy(path.clone());
+                        // A clip's own audio gets the same waveform strip A1
+                        // items have, so you can see where the sound is without
+                        // scrubbing for it. Rendered once per source in the
+                        // background; splits inherit it by clone.
+                        if has_audio {
+                            spawn(async move {
+                                if let Ok(uri) = engine::waveform_data_uri(&path).await {
+                                    for c in clips.write().iter_mut().filter(|c| c.path == path) {
+                                        c.wave = uri.clone();
+                                    }
+                                }
+                            });
+                        }
                         if selected().is_none() {
                             select_clip(0);
                         }
@@ -1371,6 +1394,24 @@ fn Editor() -> Element {
                 if let Ok(uri) = engine::waveform_data_uri(&path).await {
                     for a in audios.write().iter_mut().filter(|a| a.path == path) {
                         a.wave = uri.clone();
+                    }
+                }
+            });
+        }
+        // V1 clips carry a waveform of their own audio; silent ones never get one.
+        let voiced: Vec<String> = {
+            let cl = clips.read();
+            let mut v: Vec<String> =
+                cl.iter().filter(|c| c.has_audio).map(|c| c.path.clone()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        for path in voiced {
+            spawn(async move {
+                if let Ok(uri) = engine::waveform_data_uri(&path).await {
+                    for c in clips.write().iter_mut().filter(|c| c.path == path) {
+                        c.wave = uri.clone();
                     }
                 }
             });
@@ -3000,6 +3041,13 @@ fn Editor() -> Element {
                                                 } else {
                                                     img { src: "{c.thumb}" }
                                                 }
+                                                if !c.wave.is_empty() {
+                                                    div {
+                                                        class: "mr-clip-wave",
+                                                        title: "This clip's own audio",
+                                                        style: "{wave_css(&c.wave, c.duration, c.in_s, scale, c.speed)}",
+                                                    }
+                                                }
                                                 span { class: "mr-clip-name",
                                                     if c.effect != "None" { "✨ " }
                                                     "{c.name}"
@@ -3014,7 +3062,7 @@ fn Editor() -> Element {
                                             div {
                                                 key: "{k}-{a.path}",
                                                 class: item_class("mr-lane-item audio", selected() == Some(Sel::Aud(k)), marked().contains(&Sel::Aud(k))),
-                                                style: "left: {a.at * scale}px; width: {(a.out_s - a.in_s) * scale}px; {wave_css(&a, scale)}",
+                                                style: "left: {a.at * scale}px; width: {(a.out_s - a.in_s) * scale}px; {wave_css(&a.wave, a.duration, a.in_s, scale, 1.0)}",
                                                 onmousedown: move |evt| {
                                                     if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
                                                         selected.set(Some(Sel::Aud(k)));
@@ -3367,6 +3415,9 @@ const APP_CSS: &str = r#"
 .mr-clip:hover { border-color: var(--mor-border-light); }
 .mr-clip.selected { border-color: var(--mor-accent); box-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 30%, transparent); }
 .mr-clip img, .mr-thumb-missing { width: 100%; height: 72px; object-fit: cover; border-radius: 4px; display: block; background: #000; }
+/* A clip's own audio, drawn under its thumbnail in the same teal A1 uses — a
+   clip with no strip is a clip with no sound. */
+.mr-clip-wave { height: 18px; flex: none; border-radius: 3px; background-color: color-mix(in srgb, var(--mor-success) 10%, transparent); }
 .mr-clip-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .mr-clip-dur { font-size: 10px; color: var(--mor-text-muted); }
 
@@ -3444,6 +3495,7 @@ mod tests {
             speed: 1.0,
             volume: 1.0,
             thumb: String::new(),
+            wave: String::new(),
             proxy: String::new(),
             group: 0,
         }
@@ -3550,6 +3602,38 @@ mod tests {
         assert_eq!(locate(&clips, 0.0), Some((0, 0.0)));
         assert_eq!(locate(&clips, 1.0), Some((0, 2.0)));
         assert_eq!(locate(&clips, 2.0), Some((0, 4.0))); // clamped at the out point
+    }
+
+    #[test]
+    fn waveform_window_tracks_trim_and_speed() {
+        // 10 s source at 20 px/s: the image spans the whole source and slides
+        // left by the in point, so the visible slice is the kept span.
+        let css = wave_css("data:x", 10.0, 2.0, 20.0, 1.0);
+        assert!(css.contains("background-size:200.0px 100%"), "{css}");
+        assert!(css.contains("background-position:-40.0px 0"), "{css}");
+
+        // At 2x the clip occupies half the width, so the waveform compresses
+        // with it instead of drifting out of sync with the audio.
+        let css = wave_css("data:x", 10.0, 2.0, 20.0, 2.0);
+        assert!(css.contains("background-size:100.0px 100%"), "{css}");
+        assert!(css.contains("background-position:-20.0px 0"), "{css}");
+
+        // Nothing rendered yet: no background at all, not a broken url().
+        assert_eq!(wave_css("", 10.0, 0.0, 20.0, 1.0), "");
+
+        // The invariant that matters: the slice the CSS exposes is exactly as
+        // wide as the clip's box on the timeline, at any speed.
+        for speed in [0.5, 1.0, 2.0, 4.0] {
+            let (dur, in_s, out_s, scale) = (10.0, 2.0, 6.0, 20.0);
+            let mut c = clip(in_s, out_s);
+            c.duration = dur;
+            c.speed = speed;
+            let shown_px = (out_s - in_s) * scale / speed;
+            assert!(
+                (c.trimmed() * scale - shown_px).abs() < 1e-9,
+                "waveform slice and clip width disagree at {speed}x"
+            );
+        }
     }
 
     #[test]

@@ -887,6 +887,28 @@ mod tests {
         let uri = waveform_data_uri(&src).await.unwrap();
         assert!(uri.starts_with("data:image/png;base64,"), "not a png data uri");
         assert!(uri.len() > 100, "suspiciously empty waveform");
+
+        // A video's own audio draws the same way — that is what puts a waveform
+        // strip on a V1 clip. ffmpeg picks the audio stream out of the container.
+        let av = dir.join("av.mp4").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=30",
+            "-f", "lavfi", "-i", "sine=duration=1",
+            "-c:v", "libx264", "-c:a", "aac", "-shortest", &av,
+        ]).await.unwrap();
+        let uri = waveform_data_uri(&av).await.unwrap();
+        assert!(uri.starts_with("data:image/png;base64,") && uri.len() > 100, "no waveform from a video");
+
+        // A silent source has nothing to draw and errors rather than returning
+        // an empty image — callers gate on has_audio and never ask.
+        let silent = dir.join("silent.mp4").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=30",
+            "-c:v", "libx264", &silent,
+        ]).await.unwrap();
+        assert!(waveform_data_uri(&silent).await.is_err(), "silent source yielded a waveform");
     }
 
     #[test]
