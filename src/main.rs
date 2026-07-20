@@ -578,6 +578,10 @@ struct AudioItem {
     out_s: f64,
     at: f64,
     volume: f64,
+    /// How hard this bed ducks under the main track while it is talking.
+    /// 0 = never. Music under a voiceover is the reason this exists.
+    #[serde(default)]
+    duck: f64,
     /// Full-source waveform data URI; empty until the background render lands.
     #[serde(skip)]
     wave: String,
@@ -629,6 +633,10 @@ struct Snapshot {
     overlays: Vec<OverlayItem>,
     audios: Vec<AudioItem>,
     titles: Vec<TitleItem>,
+    /// Beat markers, in timeline seconds, sorted. Not a lane — they hold no
+    /// media, they are just the places you want cuts to land.
+    #[serde(default)]
+    markers: Vec<f64>,
 }
 
 /// What the inspector is editing.
@@ -1131,17 +1139,23 @@ fn Editor() -> Element {
     let mut undo_stack = use_signal(Vec::<Snapshot>::new);
     let mut redo_stack = use_signal(Vec::<Snapshot>::new);
     let mut undo_tag = use_signal(String::new);
+    // Beat markers: tap M along to the music while it plays and you get the
+    // grid you actually want to cut on. They are snap targets, so a dragged
+    // item lands on the beat instead of near it.
+    let mut markers = use_signal(Vec::<f64>::new);
     let snapshot = move || Snapshot {
         clips: clips(),
         overlays: overlays(),
         audios: audios(),
         titles: titles(),
+        markers: markers(),
     };
     let mut restore = move |s: Snapshot| {
         clips.set(s.clips);
         overlays.set(s.overlays);
         audios.set(s.audios);
         titles.set(s.titles);
+        markers.set(s.markers);
         // Indices just moved under us; a stale selection would edit the wrong item.
         selected.set(None);
         marked.write().clear();
@@ -1631,6 +1645,7 @@ fn Editor() -> Element {
                         out_s: duration,
                         at: at.max(0.0),
                         volume: 1.0,
+                        duck: 0.0,
                         wave: String::new(),
                         group: 0,
                     });
@@ -1732,6 +1747,7 @@ fn Editor() -> Element {
                 out_s: a.out_s,
                 at: a.at,
                 volume: a.volume,
+                duck: a.duck,
             })
             .collect();
         (specs, ospecs, tspecs, aspecs)
@@ -2270,6 +2286,29 @@ fn Editor() -> Element {
         }
     };
 
+    let mut drop_marker = move |_: ()| {
+        let t = playhead();
+        // Tapping the same beat twice is a slip, not a second marker.
+        if markers.read().iter().any(|m| (m - t).abs() < 0.02) {
+            return;
+        }
+        push_undo("");
+        let mut m = markers.write();
+        m.push(t);
+        m.sort_by(f64::total_cmp);
+        let n = m.len();
+        drop(m);
+        status.set(format!("Marker at {} ({n} total) — tap M on the beat while it plays.", fmt_t(t)));
+    };
+    let mut clear_markers = move |_: ()| {
+        if markers.read().is_empty() {
+            return;
+        }
+        push_undo("");
+        markers.write().clear();
+        status.set("Markers cleared.".to_string());
+    };
+
     // Safe-area guides over the monitor — the portrait editor's ruler for
     // "will this caption survive the app's own buttons".
     let mut safe_area = use_signal(|| false);
@@ -2307,6 +2346,8 @@ fn Editor() -> Element {
     use_shortcut(Some("ESCAPE".into()), Some(EventHandler::new(move |()| ctx_menu.set(None))));
     use_shortcut(Some("G".into()), Some(EventHandler::new(move |()| toggle_safe(()))));
     use_shortcut(Some("T".into()), Some(EventHandler::new(move |()| toggle_handles(()))));
+    use_shortcut(Some("M".into()), Some(EventHandler::new(move |()| drop_marker(()))));
+    use_shortcut(Some("SHIFT+M".into()), Some(EventHandler::new(move |()| clear_markers(()))));
     // The menu item binds "~"; this covers layouts where ~ is Shift+` and the
     // combo therefore arrives as SHIFT+~.
     use_shortcut(Some("SHIFT+~".into()), Some(EventHandler::new(move |()| toggle_magnet(()))));
@@ -2621,6 +2662,18 @@ fn Editor() -> Element {
                         label: "Move clip right".to_string(),
                         disabled: !matches!(selected(), Some(Sel::Main(_))),
                         on_action: move |_| move_sel(1),
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        label: "Add beat marker at playhead".to_string(),
+                        shortcut: Some("M".to_string()),
+                        on_action: move |_| drop_marker(()),
+                    }
+                    MenuItem {
+                        label: format!("Clear {} marker(s)", markers.read().len()),
+                        shortcut: Some("Shift+M".to_string()),
+                        disabled: markers.read().is_empty(),
+                        on_action: move |_| clear_markers(()),
                     }
                     MenuSeparator {}
                     MenuItem {
@@ -3490,6 +3543,42 @@ fn Editor() -> Element {
                                             }
                                         }
                                     }
+                                    // Auto captions can leave forty title items on the
+                                    // lane. Restyling them one at a time is not a job
+                                    // anyone should do twice.
+                                    if titles.read().iter().filter(|x| x.caption).count() > 1 {
+                                        button {
+                                            class: "mor-btn mr-reset",
+                                            title: "Copy this card's look — font, size, colour, backdrop, outline, bevel — onto every caption",
+                                            onclick: move |_| {
+                                                push_undo("");
+                                                let Some(src) = titles.read().get(k).cloned() else { return };
+                                                let mut n = 0;
+                                                for t in titles.write().iter_mut().filter(|t| t.caption) {
+                                                    // Wording and timing are the caption's
+                                                    // own; everything else is the style.
+                                                    let (text, at, dur, group) =
+                                                        (t.text.clone(), t.at, t.dur, t.group);
+                                                    *t = TitleItem {
+                                                        text,
+                                                        at,
+                                                        dur,
+                                                        group,
+                                                        caption: true,
+                                                        png: String::new(),
+                                                        ..src.clone()
+                                                    };
+                                                    n += 1;
+                                                }
+                                                spawn(async move {
+                                                    ensure_titles().await;
+                                                    seek_to(playhead());
+                                                });
+                                                status.set(format!("Restyled {n} caption(s)."));
+                                            },
+                                            "⇊ Apply this style to all captions"
+                                        }
+                                    }
                                     div { class: "mr-toolbar",
                                         button { class: "mor-btn mr-danger", onclick: move |_| delete_sel(()), "✕ Remove title" }
                                     }
@@ -3555,6 +3644,23 @@ fn Editor() -> Element {
                                             audios.write()[k].volume = v;
                                         })),
                                     }
+                                    Slider {
+                                        label: Some("Duck under video"),
+                                        min: 0.0,
+                                        max: 1.0,
+                                        step: 0.05,
+                                        precision: 2,
+                                        value: a.duck,
+                                        oninput: Some(EventHandler::new(move |v: f64| {
+                                            push_undo(&format!("aduck{k}"));
+                                            audios.write()[k].duck = v;
+                                        })),
+                                    }
+                                    if a.duck > 0.0 {
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "Pulls this bed down whenever the main track is talking, and lets it back up in the gaps."
+                                        }
+                                    }
                                     div { class: "mr-toolbar",
                                         button { class: "mor-btn mr-danger", onclick: move |_| delete_sel(()), "✕ Remove audio" }
                                     }
@@ -3570,7 +3676,7 @@ fn Editor() -> Element {
                         }
 
                         p { class: "mor-statusbar-muted mr-keys",
-                            "T transform handles · Drop files onto a lane · Ctrl+Z undo · I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · drag to move (snaps) · Ctrl+G group · ~ magnet · G safe areas · Ctrl+E export"
+                            "M beat marker · T transform handles · Drop files onto a lane · Ctrl+Z undo · I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · drag to move (snaps) · Ctrl+G group · ~ magnet · G safe areas · Ctrl+E export"
                         }
                     }
                 }
@@ -3660,6 +3766,7 @@ fn Editor() -> Element {
                                                 spans().iter().map(|&(s, _)| s).collect();
                                             targets.push(total_of());
                                             targets.push(playhead());
+                                            targets.extend(markers.read().iter().copied());
                                             snap_to(at + dt, &targets, 6.0 / scale) - at
                                         }
                                         None => dt,
@@ -3729,6 +3836,14 @@ fn Editor() -> Element {
                                                     "{fmt_t(k as f64 * minor_s)}"
                                                 }
                                             }
+                                        }
+                                    }
+                                    for (n, m) in markers.read().iter().copied().enumerate() {
+                                        div {
+                                            key: "mk{n}",
+                                            class: "mr-marker",
+                                            style: "left: {m * scale}px",
+                                            title: "Beat marker at {fmt_t(m)} — Shift+M clears all",
                                         }
                                     }
                                     div { class: "mr-lane",
@@ -4164,6 +4279,7 @@ fn Editor() -> Element {
                     ("~", "Toggle magnetic timeline (V2/A1/T ride V1 edits)"),
                     ("G", "Toggle safe-area guides (phone UI zones)"),
                     ("T", "Toggle on-screen transform handles"),
+                    ("M / Shift+M", "Drop a beat marker at the playhead / clear them all"),
                     ("Home / End", "Jump to start / end"),
                     ("Ctrl+O", "Add clips"),
                     ("Ctrl+Shift+O / Ctrl+S", "Open / save project"),
@@ -4363,6 +4479,11 @@ const APP_CSS: &str = r#"
 .mr-clip-dur { font-size: 10px; color: var(--mor-text-muted); }
 
 /* Record-red playhead with a head cap — reads at a glance against amber/teal/gold. */
+/* Beat markers: full-height hairlines behind everything, so a cut can be lined
+   up against the music without a lane of its own. */
+.mr-marker { position: absolute; top: 18px; bottom: 0; width: 1px; background: color-mix(in srgb, var(--mor-warning) 70%, transparent); pointer-events: none; z-index: 1; }
+.mr-marker::before { content: ""; position: absolute; top: -6px; left: -3px; border: 3px solid transparent; border-top: 5px solid var(--mor-warning); }
+
 .mr-playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--mor-destructive); box-shadow: 0 0 6px color-mix(in srgb, var(--mor-destructive) 60%, transparent); pointer-events: none; }
 .mr-playhead::before { content: ""; position: absolute; top: 0; left: -4px; border: 5px solid transparent; border-top: 6px solid var(--mor-destructive); }
 /* Timecode readout riding the playhead — the ruler's live counterpart. */
@@ -4785,13 +4906,14 @@ mod tests {
         c.volume = 0.25;
         c.thumb = "data:image/jpeg;base64,AAAA".to_string(); // derived, must not persist
         c.proxy = "/cache/proxy.mp4".to_string();
-        let snap = Snapshot { clips: vec![c], overlays: vec![], audios: vec![], titles: vec![] };
+        let snap = Snapshot { clips: vec![c], overlays: vec![], audios: vec![], titles: vec![], markers: vec![2.5] };
 
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("base64"), "thumbnail leaked into the project file");
         assert!(!json.contains("proxy.mp4"), "proxy path leaked into the project file");
 
         let back: Snapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.markers, vec![2.5], "beat markers should save with the project");
         let r = &back.clips[0];
         assert_eq!((r.in_s, r.out_s, r.speed, r.volume), (1.0, 3.0, 1.5, 0.25));
         assert!(r.thumb.is_empty() && r.proxy.is_empty(), "derived data should reload empty");

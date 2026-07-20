@@ -432,6 +432,58 @@ pub struct AudioSpec {
     pub out_s: f64,
     pub at: f64,
     pub volume: f64,
+    /// How hard to pull this bed down while the main track is talking.
+    /// 0 = never; 1 = duck hard. The classic music-under-voiceover move.
+    pub duck: f64,
+}
+
+/// A sidechain compressor keyed off the main track. The threshold decides how
+/// much speech it takes to trigger and the ratio how far it pulls; attack and
+/// release are pinned at values that catch a word without audibly pumping
+/// between them.
+// ponytail: two knobs behind one "amount" — expose the rest if a voice ever
+// needs different tuning.
+fn duck_chain(amount: f64) -> String {
+    let a = amount.clamp(0.0, 1.0);
+    format!(
+        "sidechaincompress=threshold={:.4}:ratio={:.2}:attack=20:release=300",
+        (0.1 - 0.085 * a).max(0.01),
+        2.0 + 10.0 * a
+    )
+}
+
+/// Mix the A1 beds under `main`, ducking the ones that ask for it, ending at
+/// `[out]`. Shared by the export graph and the playback mix so what you hear
+/// while scrubbing is what gets rendered.
+fn mix_audio(main: &str, audio: &[AudioSpec], out: &str) -> String {
+    if audio.is_empty() {
+        return format!("[{main}]anull[{out}]");
+    }
+    let ducked: Vec<usize> =
+        (0..audio.len()).filter(|k| audio[*k].duck > 0.0).collect();
+    let mut f = String::new();
+    // Every ducked bed needs its own copy of the main track to key from, and
+    // the mix still needs one, so the split has one output more than there are
+    // ducked beds.
+    let head = if ducked.is_empty() {
+        main.to_string()
+    } else {
+        f += &format!("[{main}]asplit={}[amain]", ducked.len() + 1);
+        for k in &ducked {
+            f += &format!("[akey{k}]");
+        }
+        f += ";";
+        for k in &ducked {
+            f += &format!("[au{k}][akey{k}]{}[au{k}d];", duck_chain(audio[*k].duck));
+        }
+        "amain".to_string()
+    };
+    f += &format!("[{head}]");
+    for k in 0..audio.len() {
+        f += &if ducked.contains(&k) { format!("[au{k}d]") } else { format!("[au{k}]") };
+    }
+    f += &format!("amix=inputs={}:duration=first:normalize=0[{out}]", audio.len() + 1);
+    f
 }
 
 /// T: a pre-rendered 1080×1920 transparent PNG shown from `at` for `dur`.
@@ -1023,16 +1075,13 @@ pub fn build_filter(
         vl = format!("vt{j}");
     }
 
-    let mut al = ahead;
+    let mut al = ahead.clone();
     if !audio.is_empty() {
         for (k, a) in audio.iter().enumerate() {
             f += &a1_audio(clips.len() + overlays.len() + titles.len() + k, k, a);
         }
-        f += "[ac]";
-        for k in 0..audio.len() {
-            f += &format!("[au{k}]");
-        }
-        f += &format!("amix=inputs={}:duration=first:normalize=0[am];", audio.len() + 1);
+        f += &mix_audio(&ahead, audio, "am");
+        f += ";";
         al = "am".to_string();
     }
 
@@ -1072,18 +1121,10 @@ pub fn build_audio_filter(clips: &[ClipSpec], audio: &[AudioSpec]) -> String {
         f += &format!("[a{i}]");
     }
     f += &format!("concat=n={}:v=0:a=1[ac];", clips.len());
-    if audio.is_empty() {
-        f += "[ac]anull[aout]";
-    } else {
-        for (k, a) in audio.iter().enumerate() {
-            f += &a1_audio(clips.len() + k, k, a);
-        }
-        f += "[ac]";
-        for k in 0..audio.len() {
-            f += &format!("[au{k}]");
-        }
-        f += &format!("amix=inputs={}:duration=first:normalize=0[aout]", audio.len() + 1);
+    for (k, a) in audio.iter().enumerate() {
+        f += &a1_audio(clips.len() + k, k, a);
     }
+    f += &mix_audio("ac", audio, "aout");
     f
 }
 
@@ -1417,7 +1458,7 @@ mod tests {
         ];
         let overlays = [OverlaySpec { path: "c.mp4".into(), in_s: 0.0, out_s: 1.0, at: 0.5, ..Default::default() }];
         let titles = [TitleSpec { png: "t.png".into(), at: 0.2, dur: 2.0 }];
-        let audio = [AudioSpec { path: "m.mp3".into(), in_s: 0.0, out_s: 2.0, at: 1.0, volume: 0.5 }];
+        let audio = [AudioSpec { path: "m.mp3".into(), in_s: 0.0, out_s: 2.0, at: 1.0, volume: 0.5, duck: 0.0 }];
         let f = build_filter(&clips, &overlays, &titles, &audio, ExportOpts::default());
         assert!(f.contains("[0:v]trim=start=0.500:end=2.000"));
         assert!(f.contains("setsar=1,hue=s=0[v0]"));
@@ -2222,6 +2263,98 @@ mod tests {
     }
 
     #[test]
+    fn ducking_keys_each_bed_off_the_main_track() {
+        let clips = [ClipSpec { path: "a.mp4".into(), out_s: 4.0, has_audio: true, ..Default::default() }];
+        let bed = |duck: f64| AudioSpec {
+            path: "m.mp3".into(),
+            in_s: 0.0,
+            out_s: 4.0,
+            at: 0.0,
+            volume: 1.0,
+            duck,
+        };
+
+        // Off: the mix is what it always was, with no sidechain anywhere.
+        let plain = build_filter(&clips, &[], &[], &[bed(0.0)], ExportOpts::default());
+        assert!(!plain.contains("sidechaincompress") && !plain.contains("asplit"), "{plain}");
+        assert!(plain.contains("[ac][au0]amix=inputs=2"), "{plain}");
+
+        // On: the main track is split so the compressor has something to key
+        // from, and the mix takes the ducked copy rather than the raw bed.
+        let ducked = build_filter(&clips, &[], &[], &[bed(0.8)], ExportOpts::default());
+        assert!(ducked.contains("[ac]asplit=2[amain][akey0]"), "{ducked}");
+        assert!(ducked.contains("[au0][akey0]sidechaincompress="), "{ducked}");
+        assert!(ducked.contains("[amain][au0d]amix=inputs=2"), "{ducked}");
+
+        // Two beds, one ducked: the split only serves the one that asked.
+        let mixed = build_filter(&clips, &[], &[], &[bed(0.0), bed(0.5)], ExportOpts::default());
+        assert!(mixed.contains("asplit=2[amain][akey1]"), "{mixed}");
+        assert!(mixed.contains("[amain][au0][au1d]amix=inputs=3"), "{mixed}");
+
+        // Harder ducking means a lower threshold and a steeper ratio.
+        let (soft, hard) = (duck_chain(0.2), duck_chain(1.0));
+        let thr = |c: &str| -> f64 {
+            c.split("threshold=").nth(1).unwrap().split(':').next().unwrap().parse().unwrap()
+        };
+        assert!(thr(&hard) < thr(&soft), "harder ducking should trigger sooner");
+    }
+
+    // A reel with both a transition and background music: the main track's
+    // label is no longer "ac" once clips are joined pairwise, and mixing
+    // against a label that does not exist is a hard filtergraph error.
+    #[tokio::test]
+    async fn a_transition_and_a_music_bed_render_together() {
+        let dir = std::env::temp_dir().join("morreel-transmix-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = dir.join("v.mp4").display().to_string();
+        let m = dir.join("m.m4a").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=2:size=320x568:rate=30",
+            "-f", "lavfi", "-i", "sine=duration=2",
+            "-c:v", "libx264", "-c:a", "aac", "-shortest", &v,
+        ]).await.unwrap();
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=200:duration=4",
+            "-c:a", "aac", &m,
+        ]).await.unwrap();
+
+        let clips = [
+            ClipSpec { path: v.clone(), out_s: 2.0, has_audio: true, ..Default::default() },
+            ClipSpec {
+                path: v,
+                out_s: 2.0,
+                has_audio: true,
+                transition: "Cross dissolve".into(),
+                trans_dur: 0.5,
+                ..Default::default()
+            },
+        ];
+        let audio = [AudioSpec {
+            path: m,
+            in_s: 0.0,
+            out_s: 3.0,
+            at: 0.0,
+            volume: 0.6,
+            duck: 0.7,
+        }];
+        let out = dir.join("out.mp4");
+        let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
+        export(&clips, &[], &[], &audio, &out, opts, |_| {}).await.unwrap();
+
+        let streams = capture("ffprobe", &[
+            "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+            &out.display().to_string(),
+        ]).await.unwrap();
+        assert!(streams.contains("audio") && streams.contains("video"), "{streams}");
+        let d: f64 = capture("ffprobe", &[
+            "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+            &out.display().to_string(),
+        ]).await.unwrap().trim().parse().unwrap();
+        assert!((d - 3.5).abs() < 0.2, "2 s + 2 s less a 0.5 s dissolve is 3.5 s, got {d}");
+    }
+
+    #[test]
     fn still_classification() {
         for p in ["a.png", "A.JPG", "/x/y/photo.jpeg", "shot.webp", "s.TIFF", "b.bmp"] {
             assert!(is_still(p), "{p} should be a still");
@@ -2335,7 +2468,7 @@ mod tests {
             ClipSpec { path: "a.mp4".into(), in_s: 0.5, out_s: 2.0, has_audio: true, ..Default::default() },
             ClipSpec { path: "b.mp4".into(), in_s: 0.0, out_s: 1.0, has_audio: false, ..Default::default() },
         ];
-        let audio = [AudioSpec { path: "m.mp3".into(), in_s: 0.0, out_s: 2.0, at: 1.0, volume: 0.5 }];
+        let audio = [AudioSpec { path: "m.mp3".into(), in_s: 0.0, out_s: 2.0, at: 1.0, volume: 0.5, duck: 0.0 }];
         let f = build_audio_filter(&clips, &audio);
         assert!(f.contains("[0:a]atrim=start=0.500:end=2.000"));
         assert!(f.contains("anullsrc"));
@@ -2396,7 +2529,7 @@ mod tests {
             ClipSpec { path: b.clone(), in_s: 0.0, out_s: 1.0, has_audio: false, ..Default::default() },
         ];
         let overlays = [OverlaySpec { path: b, in_s: 0.0, out_s: 0.5, at: 0.2, effect: "vignette".into(), ..Default::default() }];
-        let audio = [AudioSpec { path: a, in_s: 0.0, out_s: 1.0, at: 0.5, volume: 0.6 }];
+        let audio = [AudioSpec { path: a, in_s: 0.0, out_s: 1.0, at: 0.5, volume: 0.6, duck: 0.0 }];
         // a beveled title card over the first second
         let png = render_title(&TitleStyle { text: "MorReel".into(), font_size: 120, bevel: "Cameo".into(), ..Default::default() }).await.unwrap();
         assert!(std::fs::metadata(&png).unwrap().len() > 0);

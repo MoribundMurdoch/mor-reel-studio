@@ -50,7 +50,11 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   [wearable-dictionary-designer](../wearable-dictionary-designer), which is
   where it came from: size, softness, depth, light angle and height, and
   highlight/shadow strength.
-- **A1 audio track** — music/VO mixed under with per-item trim and volume.
+- **A1 audio track** — music/VO mixed under with per-item trim and volume, and
+  **auto ducking**: a bed pulls down whenever the main track is talking and
+  comes back up in the gaps (a sidechain compressor keyed off V1).
+- **Beat markers** (`M`) — tap along to the music while it plays and you get
+  the grid you want to cut on. They snap, so dragged items land on the beat.
 - **Effects** — B&W, Sepia, Warm, Cool, Punch, Dreamy, Vignette, and the
   Motion set (Slow/Pulse zoom, Drift, Sway) — keyed on time, so they animate
   in the monitor as you scrub — ported from
