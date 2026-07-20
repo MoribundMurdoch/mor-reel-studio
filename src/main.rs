@@ -43,22 +43,83 @@ fn main() {
     dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(App);
 }
 
-/// Named looks in the moranima spirit — each is one ffmpeg filter snippet,
-/// applied identically to preview frames and export so preview = export.
-const EFFECTS: &[(&str, &str)] = &[
-    ("None", ""),
-    ("B&W", "hue=s=0"),
-    ("Sepia", "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131"),
-    ("Warm", "colortemperature=4500"),
-    ("Cool", "colortemperature=8500"),
-    ("Punch", "eq=contrast=1.18:saturation=1.45"),
-    ("Dreamy", "gblur=sigma=2,eq=brightness=0.04:saturation=1.15"),
-    ("Vignette", "vignette"),
-    ("Slow zoom", "zoompan=z='min(zoom+0.0006,1.25)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1"),
+/// Named looks — (category, name, ffmpeg filter snippet), applied identically
+/// to preview frames and export so preview = export. "Motion" ports moranima's
+/// BgMotion camera moves (Zoom/Drift/Sway) with the same phase math
+/// (ph = 0.1π·t, so 2ph ≈ 0.628t) translated to ffmpeg time-expressions.
+// ponytail: moranima's particle overlays (fireflies/snow/embers) need a second
+// video input; the per-clip effect slot is one linear chain, so they wait
+// until effects can be filter_complex branches. Tilt (animated perspective)
+// has no per-frame ffmpeg equivalent — Sway covers the feel.
+const EFFECTS: &[(&str, &str, &str)] = &[
+    ("Color", "None", ""),
+    ("Color", "B&W", "hue=s=0"),
+    ("Color", "Sepia", "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131"),
+    ("Color", "Warm", "colortemperature=4500"),
+    ("Color", "Cool", "colortemperature=8500"),
+    ("Color", "Punch", "eq=contrast=1.18:saturation=1.45"),
+    ("Look", "Dreamy", "gblur=sigma=2,eq=brightness=0.04:saturation=1.15"),
+    ("Look", "Vignette", "vignette"),
+    ("Motion", "Slow zoom", "zoompan=z='min(zoom+0.0006,1.25)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1"),
+    // moranima Zoom: z = 1 + 0.12·(0.5+0.5·sin(2ph)); on/30 = t → 0.628t = 0.0209·on
+    ("Motion", "Pulse zoom", "zoompan=z='1.06+0.06*sin(0.0209*on)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1"),
+    // moranima Drift: 1.12× overscan, window slides ±0.05w / ±0.03h on offset sines
+    ("Motion", "Drift", "scale=1210:2150,crop=1080:1920:x='65+54*sin(0.628*t)':y='115+58*cos(0.408*t)',setsar=1"),
+    // moranima Sway: 1.1× overscan hides the corners of a ±0.035 rad rock
+    ("Motion", "Sway", "scale=1188:2112,rotate=0.035*sin(0.628*t):ow=1080:oh=1920,setsar=1"),
 ];
 
 fn effect_filter(name: &str) -> &'static str {
-    EFFECTS.iter().find(|(n, _)| *n == name).map_or("", |(_, f)| f)
+    EFFECTS.iter().find(|(_, n, _)| *n == name).map_or("", |(_, _, f)| f)
+}
+
+/// Effect at strength `a` (0..=1): parameters interpolate from identity to the
+/// full look, so a=1 is exactly the EFFECTS table and a=0 is no filter. Motion
+/// amounts scale amplitude, matching moranima's `amount` semantics.
+fn effect_filter_amt(name: &str, a: f64) -> String {
+    let a = a.clamp(0.0, 1.0);
+    let full = effect_filter(name);
+    if full.is_empty() || a <= 0.001 {
+        return String::new();
+    }
+    if a >= 0.999 {
+        return full.to_string(); // byte-identical to the table at full strength
+    }
+    match name {
+        "B&W" => format!("hue=s={:.3}", 1.0 - a),
+        // sepia matrix lerped toward identity
+        "Sepia" => format!(
+            "colorchannelmixer={:.3}:{:.3}:{:.3}:0:{:.3}:{:.3}:{:.3}:0:{:.3}:{:.3}:{:.3}",
+            1.0 - 0.607 * a, 0.769 * a, 0.189 * a,
+            0.349 * a, 1.0 - 0.314 * a, 0.168 * a,
+            0.272 * a, 0.534 * a, 1.0 - 0.869 * a
+        ),
+        "Warm" => format!("colortemperature={:.0}", 6500.0 - 2000.0 * a),
+        "Cool" => format!("colortemperature={:.0}", 6500.0 + 2000.0 * a),
+        "Punch" => format!("eq=contrast={:.3}:saturation={:.3}", 1.0 + 0.18 * a, 1.0 + 0.45 * a),
+        "Dreamy" => format!(
+            "gblur=sigma={:.2},eq=brightness={:.3}:saturation={:.3}",
+            2.0 * a, 0.04 * a, 1.0 + 0.15 * a
+        ),
+        "Vignette" => format!("vignette=angle={:.4}", 0.6283 * a), // PI/5 at full
+        "Slow zoom" => format!(
+            "zoompan=z='min(zoom+{:.6},{:.3})':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1",
+            0.0006 * a, 1.0 + 0.25 * a
+        ),
+        "Pulse zoom" => format!(
+            "zoompan=z='{:.3}+{:.3}*sin(0.0209*on)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1",
+            1.0 + 0.06 * a, 0.06 * a
+        ),
+        "Drift" => format!(
+            "scale=1210:2150,crop=1080:1920:x='65+{:.1}*sin(0.628*t)':y='115+{:.1}*cos(0.408*t)',setsar=1",
+            54.0 * a, 58.0 * a
+        ),
+        "Sway" => format!(
+            "scale=1188:2112,rotate={:.4}*sin(0.628*t):ow=1080:oh=1920,setsar=1",
+            0.035 * a
+        ),
+        _ => full.to_string(),
+    }
 }
 
 const TITLE_COLORS: &[(&str, &str)] = &[
@@ -71,8 +132,45 @@ const TITLE_COLORS: &[(&str, &str)] = &[
 
 const TITLE_POS: &[(&str, f64)] = &[("Top", 0.10), ("Middle", 0.45), ("Lower third", 0.72)];
 
+/// Fontconfig generic families — resolve everywhere without bundling fonts.
+const TITLE_FONTS: &[&str] = &["Sans", "Serif", "Mono"];
+
 /// Bevel styles from the mor_cameo_emboss plugin: cameo = raised, intaglio = sunken.
 const BEVELS: &[&str] = &["Off", "Cameo", "Intaglio"];
+
+/// How a source fills 9:16 — mostly for landscape imports. Crop covers and
+/// center-crops, Fit letterboxes on black, Zoom punches in 1.5× then crops.
+const FRAMINGS: &[&str] = &["Crop", "Fit", "Zoom"];
+
+/// What V1 and V2 accept. Photos ride the same lanes as video — ffmpeg loops
+/// the still, so a Motion effect turns it into a camera move over the picture.
+const MEDIA_EXT: [&str; 13] = [
+    "mp4", "mov", "mkv", "webm", "m4v", "avi", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff",
+];
+
+/// Timeline span a freshly imported source takes: a video keeps its whole
+/// length, a still gets a sensible default the Out point can stretch.
+fn initial_out(path: &str, duration: f64) -> f64 {
+    if engine::is_still(path) { engine::STILL_DEFAULT } else { duration }
+}
+
+/// Upload ceilings for a portrait video, shortest first. Going over doesn't
+/// break the export — it just means that platform will reject or truncate it,
+/// which is worth knowing before you render rather than after.
+// ponytail: static table, not a fetched policy — platforms change these rarely
+// and a stale number here is a nudge, not a hard block.
+const LIMITS: &[(&str, f64)] = &[("Shorts", 60.0), ("Reels", 90.0), ("TikTok", 600.0)];
+
+/// Which platforms the reel has outgrown, e.g. "over Shorts 1:00.0".
+/// None while it still fits everywhere.
+fn over_limits(total: f64) -> Option<String> {
+    let over: Vec<String> = LIMITS
+        .iter()
+        .filter(|(_, cap)| total > *cap)
+        .map(|(name, cap)| format!("{name} {}", fmt_t(*cap)))
+        .collect();
+    (!over.is_empty()).then(|| format!("over {}", over.join(", ")))
+}
 
 fn title_color(name: &str) -> &'static str {
     TITLE_COLORS.iter().find(|(n, _)| *n == name).map_or("white", |(_, c)| c)
@@ -80,6 +178,26 @@ fn title_color(name: &str) -> &'static str {
 
 fn title_y(name: &str) -> f64 {
     TITLE_POS.iter().find(|(n, _)| *n == name).map_or(0.45, |(_, y)| *y)
+}
+
+/// Greedy word-wrap for caption cards — drawtext has no auto-wrap, so long
+/// transcript segments would run off the 1080px frame.
+fn wrap_caption(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut line = 0;
+    for w in text.split_whitespace() {
+        let wlen = w.chars().count();
+        if line > 0 && line + 1 + wlen > max {
+            out.push('\n');
+            line = 0;
+        } else if line > 0 {
+            out.push(' ');
+            line += 1;
+        }
+        out.push_str(w);
+        line += wlen;
+    }
+    out
 }
 
 /// Rasterize a title card from its item's params.
@@ -91,11 +209,13 @@ async fn render_one(t: &TitleItem) -> Result<String, String> {
         title_y(&t.pos),
         &t.bevel,
         t.bevel_size as u32,
+        &t.font,
+        t.boxed,
     )
     .await
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct TitleItem {
     text: String,
     at: f64,
@@ -105,11 +225,26 @@ struct TitleItem {
     pos: String,
     bevel: String,
     bevel_size: f64,
+    /// Fontconfig family: "Sans" | "Serif" | "Mono".
+    font: String,
+    /// Semi-opaque backdrop box behind the text (caption legibility).
+    boxed: bool,
+    /// Made by Auto captions — lets "Remove captions" clear them in bulk.
+    caption: bool,
     /// Rendered PNG path; empty while a render is in flight.
+    #[serde(skip)]
     png: String,
+    /// Drag-together group id; 0 = ungrouped.
+    group: usize,
 }
 
-#[derive(Clone, PartialEq)]
+/// The export fade's opacity at global time `t`, for the scrub preview.
+fn title_alpha(t: f64, at: f64, dur: f64) -> f64 {
+    let f = engine::title_fade(dur).max(0.01);
+    ((t - at) / f).min((at + dur - t) / f).clamp(0.0, 1.0)
+}
+
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Clip {
     path: String,
     name: String,
@@ -118,9 +253,22 @@ struct Clip {
     out_s: f64,
     has_audio: bool,
     effect: String,
+    /// Effect strength 0..=1 (parameter interpolation, not a crossfade).
+    effect_amount: f64,
+    framing: String,
+    /// Playback rate: 0.5 is slow motion, 2.0 is double speed.
+    #[serde(default = "unity")]
+    speed: f64,
+    /// Gain on this clip's own audio; 0.0 mutes it.
+    #[serde(default = "unity")]
+    volume: f64,
+    #[serde(skip)]
     thumb: String,
     /// 480p scrub proxy path; empty until the background build finishes.
+    #[serde(skip)]
     proxy: String,
+    /// Drag-together group id; 0 = ungrouped.
+    group: usize,
 }
 
 impl Clip {
@@ -130,12 +278,16 @@ impl Clip {
             in_s: self.in_s,
             out_s: self.out_s,
             has_audio: self.has_audio,
-            effect: effect_filter(&self.effect).to_string(),
+            effect: effect_filter_amt(&self.effect, self.effect_amount),
+            framing: self.framing.clone(),
+            speed: self.speed,
+            volume: self.volume,
         }
     }
 
+    /// Seconds on the timeline — the source span retimed by the speed.
     fn trimmed(&self) -> f64 {
-        self.out_s - self.in_s
+        (self.out_s - self.in_s) / self.speed.max(0.01)
     }
 
     /// What preview/scrub extraction should read: the proxy once built.
@@ -144,7 +296,26 @@ impl Clip {
     }
 }
 
-#[derive(Clone, PartialEq)]
+/// The inspector's one-line summary of a V1 clip. A still has no source length
+/// to report and needs no proxy, so it reads differently from a video.
+fn clip_note(c: &Clip) -> String {
+    if engine::is_still(&c.path) {
+        return format!(
+            "Photo • holding {} — drag Out to hold it longer, or add a Motion effect",
+            fmt_t(c.trimmed())
+        );
+    }
+    format!(
+        "{} source • keeping {}{}{}{}",
+        fmt_t(c.duration),
+        fmt_t(c.trimmed()),
+        if (c.speed - 1.0).abs() > 0.01 { format!(" at {:.2}×", c.speed) } else { String::new() },
+        if c.has_audio { "" } else { " • no audio" },
+        if c.proxy.is_empty() { " • building proxy…" } else { " • proxy" },
+    )
+}
+
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct OverlayItem {
     path: String,
     name: String,
@@ -153,7 +324,13 @@ struct OverlayItem {
     out_s: f64,
     at: f64,
     effect: String,
+    /// Effect strength 0..=1 (parameter interpolation, not a crossfade).
+    effect_amount: f64,
+    framing: String,
+    #[serde(skip)]
     proxy: String,
+    /// Drag-together group id; 0 = ungrouped.
+    group: usize,
 }
 
 impl OverlayItem {
@@ -162,7 +339,7 @@ impl OverlayItem {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct AudioItem {
     path: String,
     name: String,
@@ -171,6 +348,45 @@ struct AudioItem {
     out_s: f64,
     at: f64,
     volume: f64,
+    /// Full-source waveform data URI; empty until the background render lands.
+    #[serde(skip)]
+    wave: String,
+    /// Drag-together group id; 0 = ungrouped.
+    group: usize,
+}
+
+/// Inline CSS windowing an item's full-source waveform to its trimmed span:
+/// the image maps to the whole source, so size = duration and offset = in_s.
+fn wave_css(a: &AudioItem, scale: f64) -> String {
+    if a.wave.is_empty() {
+        return String::new();
+    }
+    format!(
+        "background-image:url({});background-size:{:.1}px 100%;\
+         background-position:-{:.1}px 0;background-repeat:no-repeat;",
+        a.wave,
+        a.duration * scale,
+        a.in_s * scale
+    )
+}
+
+/// Serde fallback for rate-like fields, so a project written before they
+/// existed loads as 1x rather than as a divide-by-zero.
+fn unity() -> f64 {
+    1.0
+}
+
+/// A whole-timeline snapshot for undo/redo. Snapshotting every lane is cheaper
+/// to get *right* than per-action inverse operations — those silently miss a
+/// field the moment someone adds one — and a reel is tens of items, not
+/// thousands. Rendered PNGs and proxies ride along; they're content-addressed,
+/// so restoring an old one costs a cache hit, not a re-render.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Snapshot {
+    clips: Vec<Clip>,
+    overlays: Vec<OverlayItem>,
+    audios: Vec<AudioItem>,
+    titles: Vec<TitleItem>,
 }
 
 /// What the inspector is editing.
@@ -194,12 +410,13 @@ enum Ctx {
 }
 
 /// Map a global timeline position to (clip index, source-file time) on V1.
+/// A retimed clip covers `speed` seconds of source per timeline second.
 fn locate(clips: &[Clip], t: f64) -> Option<(usize, f64)> {
     let mut acc = 0.0;
     for (i, c) in clips.iter().enumerate() {
         let d = c.trimmed();
         if t < acc + d || i + 1 == clips.len() {
-            return Some((i, c.in_s + (t - acc).clamp(0.0, d)));
+            return Some((i, c.in_s + (t - acc).clamp(0.0, d) * c.speed.max(0.01)));
         }
         acc += d;
     }
@@ -207,7 +424,13 @@ fn locate(clips: &[Clip], t: f64) -> Option<(usize, f64)> {
 }
 
 fn fmt_t(s: f64) -> String {
+    let s = if s > 0.0 { s } else { 0.0 }; // squash -0.0 → "0:-0.0"
     format!("{}:{:04.1}", (s / 60.0) as u32, s % 60.0)
+}
+
+/// Timeline item class string: base + selection + group-mark states.
+fn item_class(base: &str, sel: bool, mark: bool) -> String {
+    format!("{base}{}{}", if sel { " selected" } else { "" }, if mark { " marked" } else { "" })
 }
 
 /// A cut at source-time `local` is valid only if both halves keep at least
@@ -227,6 +450,29 @@ fn magnet_delta(at: f64, old: &[(f64, f64)], new_start: impl Fn(usize) -> Option
         .unwrap_or(0.0)
 }
 
+/// Snap `at` to the nearest of `targets` within `tol` seconds, else leave it.
+/// Targets are the things an editor actually lines up against: clip cuts, the
+/// end of the reel, and the playhead.
+fn snap_to(at: f64, targets: &[f64], tol: f64) -> f64 {
+    targets
+        .iter()
+        .copied()
+        .filter(|t| (t - at).abs() <= tol)
+        .min_by(|a, b| (a - at).abs().total_cmp(&(b - at).abs()))
+        .unwrap_or(at)
+}
+
+/// Old→new index for a drag-reorder: clips[lo..lo+len] move so the block
+/// starts at `dest`, where `dest` indexes the sequence with the block removed.
+fn block_map(k: usize, lo: usize, len: usize, dest: usize) -> usize {
+    if k >= lo && k < lo + len {
+        dest + (k - lo)
+    } else {
+        let w = if k < lo { k } else { k - len };
+        if w < dest { w } else { w + len }
+    }
+}
+
 #[component]
 fn App() -> Element {
     rsx! {
@@ -236,10 +482,32 @@ fn App() -> Element {
     }
 }
 
+/// Where a phone app's own chrome sits over a 9:16 feed: the top header strip,
+/// the right-hand action rail (like / comment / share), and the bottom caption
+/// and username block. Anything you keep inside the clear middle reads on
+/// TikTok, Reels and Shorts alike.
+// ponytail: one worst-case mask across the three, not per-platform presets —
+// these are the widest margins of the set, so clearing them clears all of them.
+// Percentages are of the 1080x1920 frame and are deliberately generous; nudge
+// them in the CSS if a platform moves its furniture.
+#[component]
+fn SafeArea() -> Element {
+    rsx! {
+        div { class: "mr-safe",
+            div { class: "mr-safe-zone mr-safe-top", span { "header" } }
+            div { class: "mr-safe-zone mr-safe-rail", span { "actions" } }
+            div { class: "mr-safe-zone mr-safe-bottom", span { "caption / username" } }
+        }
+    }
+}
+
 /// Program monitor window: just the phone, fed by the editor's preview signal.
 /// Runs in its own VirtualDom, so it gets its own style provider.
 #[component]
-fn Monitor(preview: Signal<String>) -> Element {
+fn Monitor(preview: Signal<String>, out: Signal<bool>, safe: Signal<bool>) -> Element {
+    // Closing the window drops this VirtualDom — that drop is what docks the
+    // monitor back into the editor.
+    use_drop(move || out.set(false));
     rsx! {
         MorStyleProvider { theme_toml: Some(MORREEL_TOML.to_string()) }
         style { {APP_CSS} }
@@ -248,9 +516,12 @@ fn Monitor(preview: Signal<String>) -> Element {
             oncontextmenu: move |evt| evt.prevent_default(),
             div { class: "mr-phone",
                 if preview().is_empty() {
-                    span { "Portrait preview" }
+                    span { "Add clips to preview your reel" }
                 } else {
                     img { src: "{preview}" }
+                }
+                if safe() {
+                    SafeArea {}
                 }
             }
         }
@@ -311,28 +582,31 @@ fn Editor() -> Element {
     };
 
     // Preview extraction: latest-wins queue so slider drags don't stack ffmpeg runs.
-    let mut pending = use_signal(|| Option::<(String, f64, String, Option<String>)>::None);
+    // Title rides along as (png, opacity) so the scrub shows the export's fade.
+    let mut pending = use_signal(|| Option::<(String, f64, String, String, Option<(String, f64)>)>::None);
     let mut preview_busy = use_signal(|| false);
-    let mut request_preview = move |path: String, t: f64, effect: String, title: Option<String>| {
-        pending.set(Some((path, t, effect, title)));
-        if preview_busy() {
-            return;
-        }
-        preview_busy.set(true);
-        spawn(async move {
-            loop {
-                // Take-then-drop: a `while let` scrutinee guard would stay
-                // borrowed across the await, and any scrub event's pending.set
-                // during extraction panics (AlreadyBorrowedMut → abort).
-                let next = pending.write().take();
-                let Some((p, t, e, ti)) = next else { break };
-                if let Ok(uri) = engine::frame_data_uri(&p, t, 540, 960, &e, ti.as_deref()).await {
-                    preview.set(uri);
-                }
+    let mut request_preview =
+        move |path: String, t: f64, framing: String, effect: String, title: Option<(String, f64)>| {
+            pending.set(Some((path, t, framing, effect, title)));
+            if preview_busy() {
+                return;
             }
-            preview_busy.set(false);
-        });
-    };
+            preview_busy.set(true);
+            spawn(async move {
+                loop {
+                    // Take-then-drop: a `while let` scrutinee guard would stay
+                    // borrowed across the await, and any scrub event's pending.set
+                    // during extraction panics (AlreadyBorrowedMut → abort).
+                    let next = pending.write().take();
+                    let Some((p, t, fr, e, ti)) = next else { break };
+                    let ti = ti.as_ref().map(|(png, a)| (png.as_str(), *a));
+                    if let Ok(uri) = engine::frame_data_uri(&p, t, 540, 960, &fr, &e, ti).await {
+                        preview.set(uri);
+                    }
+                }
+                preview_busy.set(false);
+            });
+        };
 
     // Proxy builds: one at a time in the background; when a proxy lands, every
     // item using that source switches its scrub path over.
@@ -377,26 +651,31 @@ fn Editor() -> Element {
             .iter()
             .rev()
             .find(|ti| t >= ti.at && t < ti.at + ti.dur && !ti.png.is_empty())
-            .map(|ti| ti.png.clone());
-        let over = overlays
-            .read()
-            .iter()
-            .find(|o| t >= o.at && t < o.at + (o.out_s - o.in_s))
-            .map(|o| (o.scrub_path(), o.in_s + (t - o.at), effect_filter(&o.effect).to_string()));
+            .map(|ti| (ti.png.clone(), title_alpha(t, ti.at, ti.dur)));
+        let over = overlays.read().iter().find(|o| t >= o.at && t < o.at + (o.out_s - o.in_s)).map(
+            |o| {
+                (
+                    o.scrub_path(),
+                    o.in_s + (t - o.at),
+                    o.framing.clone(),
+                    effect_filter_amt(&o.effect, o.effect_amount),
+                )
+            },
+        );
         let loc = locate(&clips.read(), t);
         if let Some((i, _)) = loc {
             if selected() != Some(Sel::Main(i)) {
                 selected.set(Some(Sel::Main(i)));
             }
         }
-        if let Some((path, local, eff)) = over {
-            request_preview(path, local, eff, title_png);
+        if let Some((path, local, fr, eff)) = over {
+            request_preview(path, local, fr, eff, title_png);
         } else if let Some((i, local)) = loc {
-            let (path, eff) = {
+            let (path, fr, eff) = {
                 let cl = clips.read();
-                (cl[i].scrub_path(), effect_filter(&cl[i].effect).to_string())
+                (cl[i].scrub_path(), cl[i].framing.clone(), effect_filter_amt(&cl[i].effect, cl[i].effect_amount))
             };
-            request_preview(path, local, eff, title_png);
+            request_preview(path, local, fr, eff, title_png);
         }
     };
 
@@ -460,51 +739,288 @@ fn Editor() -> Element {
         .to_string());
     };
 
+    // Grouping: Ctrl+click marks items across any lane, Ctrl+G links the marks
+    // into a group (0 = ungrouped). Grouped items drag together; grouped V1
+    // clips reorder as a contiguous block.
+    // ponytail: marks are positional Sels, so structural edits clear them.
+    let mut marked = use_signal(Vec::<Sel>::new);
+    let mut next_group = use_signal(|| 1usize);
+    // Undo/redo. `push_undo` records the state *before* an edit; a non-empty
+    // tag collapses a run of edits that share it, so one slider drag is one
+    // undo step instead of forty. Discrete actions pass "" and never collapse.
+    let mut undo_stack = use_signal(Vec::<Snapshot>::new);
+    let mut redo_stack = use_signal(Vec::<Snapshot>::new);
+    let mut undo_tag = use_signal(String::new);
+    let snapshot = move || Snapshot {
+        clips: clips(),
+        overlays: overlays(),
+        audios: audios(),
+        titles: titles(),
+    };
+    let mut restore = move |s: Snapshot| {
+        clips.set(s.clips);
+        overlays.set(s.overlays);
+        audios.set(s.audios);
+        titles.set(s.titles);
+        // Indices just moved under us; a stale selection would edit the wrong item.
+        selected.set(None);
+        marked.write().clear();
+        seek_to(playhead().min(clips.read().iter().map(Clip::trimmed).sum()));
+    };
+    let mut push_undo = move |tag: &str| {
+        if !tag.is_empty() && undo_tag() == tag {
+            return;
+        }
+        undo_tag.set(tag.to_string());
+        let snap = snapshot();
+        let mut u = undo_stack.write();
+        u.push(snap);
+        // ponytail: 64 steps, dropped oldest-first — deep enough for a session,
+        // bounded so a long edit can't grow the stack without limit.
+        if u.len() > 64 {
+            u.remove(0);
+        }
+        drop(u);
+        redo_stack.write().clear();
+    };
+    let mut undo = move |_: ()| {
+        let prev = undo_stack.write().pop();
+        let Some(prev) = prev else {
+            status.set("Nothing to undo.".to_string());
+            return;
+        };
+        redo_stack.write().push(snapshot());
+        restore(prev);
+        undo_tag.set(String::new());
+        status.set("Undo.".to_string());
+    };
+    let mut redo = move |_: ()| {
+        let next = redo_stack.write().pop();
+        let Some(next) = next else {
+            status.set("Nothing to redo.".to_string());
+            return;
+        };
+        // Straight onto the undo stack, not via push_undo — that would clear
+        // the redo stack we are in the middle of walking.
+        undo_stack.write().push(snapshot());
+        restore(next);
+        undo_tag.set(String::new());
+        status.set("Redo.".to_string());
+    };
+
+    let mut toggle_mark = move |s: Sel| {
+        let mut m = marked.write();
+        if let Some(p) = m.iter().position(|x| *x == s) {
+            m.remove(p);
+        } else {
+            m.push(s);
+        }
+    };
+    let group_of = move |s: Sel| -> usize {
+        match s {
+            Sel::Main(i) => clips.read().get(i).map_or(0, |c| c.group),
+            Sel::Over(j) => overlays.read().get(j).map_or(0, |o| o.group),
+            Sel::Aud(k) => audios.read().get(k).map_or(0, |a| a.group),
+            Sel::Title(k) => titles.read().get(k).map_or(0, |t| t.group),
+        }
+    };
+    let mut group_marked = move |_: ()| {
+        let m = marked();
+        push_undo("");
+        if m.len() < 2 {
+            status.set("Ctrl+click two or more timeline items, then Ctrl+G to group them.".to_string());
+            return;
+        }
+        // Groups touched by any mark merge into the new one.
+        let gids: Vec<usize> = m.iter().map(|&s| group_of(s)).filter(|g| *g != 0).collect();
+        let gid = next_group();
+        next_group.set(gid + 1);
+        let joins = |g: usize| g != 0 && gids.contains(&g);
+        for (i, c) in clips.write().iter_mut().enumerate() {
+            if m.contains(&Sel::Main(i)) || joins(c.group) {
+                c.group = gid;
+            }
+        }
+        for (j, o) in overlays.write().iter_mut().enumerate() {
+            if m.contains(&Sel::Over(j)) || joins(o.group) {
+                o.group = gid;
+            }
+        }
+        for (k, a) in audios.write().iter_mut().enumerate() {
+            if m.contains(&Sel::Aud(k)) || joins(a.group) {
+                a.group = gid;
+            }
+        }
+        for (k, t) in titles.write().iter_mut().enumerate() {
+            if m.contains(&Sel::Title(k)) || joins(t.group) {
+                t.group = gid;
+            }
+        }
+        marked.write().clear();
+        status.set("Grouped — the items now move together; Ctrl+Shift+G ungroups.".to_string());
+    };
+    let mut ungroup_sel = move |_: ()| {
+        push_undo("");
+        let gid = selected()
+            .map(group_of)
+            .filter(|g| *g != 0)
+            .or_else(|| marked().iter().map(|&s| group_of(s)).find(|g| *g != 0));
+        let Some(gid) = gid else {
+            status.set("Select a grouped item to ungroup.".to_string());
+            return;
+        };
+        for c in clips.write().iter_mut().filter(|c| c.group == gid) {
+            c.group = 0;
+        }
+        for o in overlays.write().iter_mut().filter(|o| o.group == gid) {
+            o.group = 0;
+        }
+        for a in audios.write().iter_mut().filter(|a| a.group == gid) {
+            a.group = 0;
+        }
+        for t in titles.write().iter_mut().filter(|t| t.group == gid) {
+            t.group = 0;
+        }
+        marked.write().clear();
+        status.set("Ungrouped.".to_string());
+    };
+
+    // The Group/Ungroup pair every lane's context menu carries — only the
+    // "already ungrouped" test differs, so the caller passes it in.
+    let group_rows = move |ungroup_disabled: bool| {
+        rsx! {
+            CtxItem {
+                label: "Group marked items".to_string(),
+                shortcut: Some("Ctrl+G".to_string()),
+                disabled: marked().len() < 2,
+                on_action: move |_| group_marked(()),
+            }
+            CtxItem {
+                label: "Ungroup".to_string(),
+                shortcut: Some("Ctrl+Shift+G".to_string()),
+                disabled: ungroup_disabled,
+                on_action: move |_| ungroup_sel(()),
+            }
+        }
+    };
+
+    // Drag a lane item (V2/A1/T) by dt seconds; grouped members ride along,
+    // clamped so no member crosses 0.
+    // Where a lane item currently sits — used both to move it and to snap it.
+    let lane_at = move |target: Sel| -> Option<f64> {
+        match target {
+            Sel::Over(j) => overlays.read().get(j).map(|o| o.at),
+            Sel::Aud(k) => audios.read().get(k).map(|a| a.at),
+            Sel::Title(k) => titles.read().get(k).map(|t| t.at),
+            Sel::Main(_) => None,
+        }
+    };
+    let mut shift_lane = move |target: Sel, dt: f64| {
+        push_undo("drag-lane");
+        let gid = group_of(target);
+        if gid == 0 {
+            let Some(at) = lane_at(target) else { return };
+            let at = (at + dt).max(0.0);
+            match target {
+                Sel::Over(j) => overlays.write()[j].at = at,
+                Sel::Aud(k) => audios.write()[k].at = at,
+                Sel::Title(k) => titles.write()[k].at = at,
+                Sel::Main(_) => {}
+            }
+            return;
+        }
+        let min_at = overlays.read().iter().filter(|o| o.group == gid).map(|o| o.at)
+            .chain(audios.read().iter().filter(|a| a.group == gid).map(|a| a.at))
+            .chain(titles.read().iter().filter(|t| t.group == gid).map(|t| t.at))
+            .fold(f64::MAX, f64::min);
+        let dt = dt.max(-min_at);
+        for o in overlays.write().iter_mut().filter(|o| o.group == gid) {
+            o.at += dt;
+        }
+        for a in audios.write().iter_mut().filter(|a| a.group == gid) {
+            a.at += dt;
+        }
+        for t in titles.write().iter_mut().filter(|t| t.group == gid) {
+            t.at += dt;
+        }
+    };
+
+    // Contiguous run of V1 clips sharing i's group (a lone clip is a run of one).
+    let block_of = move |i: usize| -> (usize, usize) {
+        let cl = clips.read();
+        let gid = cl[i].group;
+        if gid == 0 {
+            return (i, 1);
+        }
+        let mut lo = i;
+        while lo > 0 && cl[lo - 1].group == gid {
+            lo -= 1;
+        }
+        let mut hi = i;
+        while hi + 1 < cl.len() && cl[hi + 1].group == gid {
+            hi += 1;
+        }
+        (lo, hi - lo + 1)
+    };
+
+    // Move clips[lo..lo+len] so the block lands at `dest` (index into the
+    // sequence with the block removed). Attached items ride via the magnet.
+    let mut move_block = move |lo: usize, len: usize, dest: usize| {
+        push_undo("drag-clip");
+        let old = spans();
+        {
+            let mut cl = clips.write();
+            let block: Vec<Clip> = cl.drain(lo..lo + len).collect();
+            for (n, c) in block.into_iter().enumerate() {
+                cl.insert(dest + n, c);
+            }
+        }
+        ride(old, &|k| Some(start_of(block_map(k, lo, len, dest))));
+    };
+
     // Split at playhead: a selected V2/A1 item splits if the playhead is inside
     // its span; otherwise the V1 clip under the playhead splits. Selection lands
     // on the right half — where the playhead is — matching seek behavior.
     let mut split_at_playhead = move |_: ()| {
         const MIN: f64 = 0.1;
+        push_undo("");
+        marked.write().clear(); // marks are positional; a split shifts indices
         let t = playhead();
         let mut too_close = move || status.set("Playhead is too close to an edge to split.".to_string());
 
-        if let Some(Sel::Over(j)) = selected() {
-            let Some(o) = overlays.read().get(j).cloned() else { return };
-            match cut_local(o.in_s, o.out_s, o.in_s + (t - o.at), MIN) {
-                Some(local) => {
-                    {
-                        let mut ov = overlays.write();
-                        let mut right = ov[j].clone();
-                        ov[j].out_s = local;
-                        right.in_s = local;
-                        right.at = t;
-                        ov.insert(j + 1, right);
+        // V2 and A1 split identically — the left half keeps the head, the right
+        // half starts at the cut and anchors to the playhead.
+        macro_rules! split_lane {
+            ($lane:ident, $idx:expr, $sel:path, $noun:literal) => {{
+                let i = $idx;
+                let Some(item) = $lane.read().get(i).cloned() else { return };
+                match cut_local(item.in_s, item.out_s, item.in_s + (t - item.at), MIN) {
+                    Some(local) => {
+                        {
+                            let mut lane = $lane.write();
+                            let mut right = lane[i].clone();
+                            lane[i].out_s = local;
+                            right.in_s = local;
+                            right.at = t;
+                            lane.insert(i + 1, right);
+                        }
+                        selected.set(Some($sel(i + 1)));
+                        status.set(format!(
+                            concat!("Split ", $noun, " {} at {}."),
+                            item.name,
+                            fmt_t(t)
+                        ));
                     }
-                    selected.set(Some(Sel::Over(j + 1)));
-                    status.set(format!("Split overlay {} at {}.", o.name, fmt_t(t)));
+                    None => too_close(),
                 }
-                None => too_close(),
-            }
-            return;
+                return;
+            }};
+        }
+        if let Some(Sel::Over(j)) = selected() {
+            split_lane!(overlays, j, Sel::Over, "overlay");
         }
         if let Some(Sel::Aud(k)) = selected() {
-            let Some(a) = audios.read().get(k).cloned() else { return };
-            match cut_local(a.in_s, a.out_s, a.in_s + (t - a.at), MIN) {
-                Some(local) => {
-                    {
-                        let mut au = audios.write();
-                        let mut right = au[k].clone();
-                        au[k].out_s = local;
-                        right.in_s = local;
-                        right.at = t;
-                        au.insert(k + 1, right);
-                    }
-                    selected.set(Some(Sel::Aud(k + 1)));
-                    status.set(format!("Split audio {} at {}.", a.name, fmt_t(t)));
-                }
-                None => too_close(),
-            }
-            return;
+            split_lane!(audios, k, Sel::Aud, "audio");
         }
 
         let loc = locate(&clips.read(), t);
@@ -517,20 +1033,20 @@ fn Editor() -> Element {
             too_close();
             return;
         };
-        let (scrub, path) = {
+        let (scrub, path, fr) = {
             let mut cl = clips.write();
             let mut right = cl[i].clone();
             cl[i].out_s = local;
             right.in_s = local;
             cl.insert(i + 1, right);
-            (cl[i + 1].scrub_path(), cl[i + 1].path.clone())
+            (cl[i + 1].scrub_path(), cl[i + 1].path.clone(), cl[i + 1].framing.clone())
         };
         selected.set(Some(Sel::Main(i + 1)));
         status.set(format!("Split {} at {}.", name, fmt_t(t)));
         // The right half's thumbnail still shows the left's frame — retake it
         // at the new in point so the two halves are tellable apart.
         spawn(async move {
-            if let Ok(thumb) = engine::frame_data_uri(&scrub, local, 108, 192, "", None).await {
+            if let Ok(thumb) = engine::frame_data_uri(&scrub, local, 108, 192, &fr, "", None).await {
                 let mut cl = clips.write();
                 if let Some(c) = cl.get_mut(i + 1) {
                     if c.path == path && (c.in_s - local).abs() < 1e-6 {
@@ -543,6 +1059,7 @@ fn Editor() -> Element {
 
     // I/O: trim the V1 clip under the playhead to the playhead.
     let mut set_in_here = move |_: ()| {
+        push_undo("");
         let loc = locate(&clips.read(), playhead());
         if let Some((i, local)) = loc {
             let old = spans();
@@ -554,6 +1071,7 @@ fn Editor() -> Element {
         }
     };
     let mut set_out_here = move |_: ()| {
+        push_undo("");
         let loc = locate(&clips.read(), playhead());
         if let Some((i, local)) = loc {
             let old = spans();
@@ -571,7 +1089,7 @@ fn Editor() -> Element {
         }
         spawn(async move {
             let Some(files) = rfd::AsyncFileDialog::new()
-                .add_filter("Video", &["mp4", "mov", "mkv", "webm", "m4v", "avi"])
+                .add_filter("Video & photos", &MEDIA_EXT)
                 .set_title("Add clips")
                 .pick_files()
                 .await
@@ -579,25 +1097,32 @@ fn Editor() -> Element {
                 return;
             };
             importing.set(true);
+            push_undo(""); // one step for the whole batch
             for f in files {
                 let path = f.path().display().to_string();
                 status.set(format!("Importing {}…", f.file_name()));
                 match engine::probe(&path).await {
                     Ok((duration, has_audio)) => {
-                        let thumb =
-                            engine::frame_data_uri(&path, (duration * 0.1).min(1.0), 108, 192, "", None)
-                                .await
-                                .unwrap_or_default();
+                        let thumb = engine::frame_data_uri(
+                            &path, (duration * 0.1).min(1.0), 108, 192, "", "", None,
+                        )
+                        .await
+                        .unwrap_or_default();
                         clips.write().push(Clip {
                             path: path.clone(),
                             name: f.file_name(),
                             duration,
                             in_s: 0.0,
-                            out_s: duration,
+                            out_s: initial_out(&path, duration),
                             has_audio,
                             effect: "None".to_string(),
+                            effect_amount: 1.0,
+                            framing: "Crop".to_string(),
+                            speed: 1.0,
+                            volume: 1.0,
                             thumb,
                             proxy: String::new(),
+                            group: 0,
                         });
                         queue_proxy(path);
                         if selected().is_none() {
@@ -615,7 +1140,7 @@ fn Editor() -> Element {
     let add_overlay = move |_: ()| {
         spawn(async move {
             let Some(f) = rfd::AsyncFileDialog::new()
-                .add_filter("Video", &["mp4", "mov", "mkv", "webm", "m4v", "avi"])
+                .add_filter("Video & photos", &MEDIA_EXT)
                 .set_title("Add overlay (V2)")
                 .pick_file()
                 .await
@@ -625,15 +1150,19 @@ fn Editor() -> Element {
             let path = f.path().display().to_string();
             match engine::probe(&path).await {
                 Ok((duration, _)) => {
+                    push_undo("");
                     overlays.write().push(OverlayItem {
                         path: path.clone(),
                         name: f.file_name(),
                         duration,
                         in_s: 0.0,
-                        out_s: duration,
+                        out_s: initial_out(&path, duration),
                         at: playhead(),
                         effect: "None".to_string(),
+                        effect_amount: 1.0,
+                        framing: "Crop".to_string(),
                         proxy: String::new(),
+                        group: 0,
                     });
                     queue_proxy(path);
                     selected.set(Some(Sel::Over(overlays.read().len() - 1)));
@@ -661,17 +1190,28 @@ fn Editor() -> Element {
                         status.set(format!("{} has no audio stream.", f.file_name()));
                         return;
                     }
+                    push_undo("");
                     audios.write().push(AudioItem {
-                        path,
+                        path: path.clone(),
                         name: f.file_name(),
                         duration,
                         in_s: 0.0,
                         out_s: duration,
                         at: playhead(),
                         volume: 1.0,
+                        wave: String::new(),
+                        group: 0,
                     });
                     selected.set(Some(Sel::Aud(audios.read().len() - 1)));
                     status.set("Audio added at the playhead — mixed under the main track.".to_string());
+                    // Waveform renders in the background; splits share it by path.
+                    spawn(async move {
+                        if let Ok(uri) = engine::waveform_data_uri(&path).await {
+                            for a in audios.write().iter_mut().filter(|a| a.path == path) {
+                                a.wave = uri.clone();
+                            }
+                        }
+                    });
                 }
                 Err(e) => status.set(format!("Could not add audio: {e}")),
             }
@@ -682,6 +1222,7 @@ fn Editor() -> Element {
         if clips.read().is_empty() {
             return;
         }
+        push_undo("");
         titles.write().push(TitleItem {
             text: "Title".to_string(),
             at: playhead(),
@@ -691,7 +1232,11 @@ fn Editor() -> Element {
             pos: "Middle".to_string(),
             bevel: "Cameo".to_string(),
             bevel_size: 10.0,
+            font: "Sans".to_string(),
+            boxed: false,
+            caption: false,
             png: String::new(),
+            group: 0,
         });
         let k = titles.read().len() - 1;
         selected.set(Some(Sel::Title(k)));
@@ -699,9 +1244,46 @@ fn Editor() -> Element {
         status.set("Title added at the playhead — edit it in the inspector.".to_string());
     };
 
+    let gather_specs = move || -> (Vec<ClipSpec>, Vec<OverlaySpec>, Vec<TitleSpec>, Vec<AudioSpec>) {
+        let specs = clips.read().iter().map(Clip::spec).collect();
+        let ospecs = overlays
+            .read()
+            .iter()
+            .map(|o| OverlaySpec {
+                path: o.path.clone(),
+                in_s: o.in_s,
+                out_s: o.out_s,
+                at: o.at,
+                effect: effect_filter_amt(&o.effect, o.effect_amount),
+                framing: o.framing.clone(),
+            })
+            .collect();
+        let tspecs = titles
+            .read()
+            .iter()
+            .filter(|t| !t.png.is_empty())
+            .map(|t| TitleSpec { png: t.png.clone(), at: t.at, dur: t.dur })
+            .collect();
+        let aspecs = audios
+            .read()
+            .iter()
+            .map(|a| AudioSpec {
+                path: a.path.clone(),
+                in_s: a.in_s,
+                out_s: a.out_s,
+                at: a.at,
+                volume: a.volume,
+            })
+            .collect();
+        (specs, ospecs, tspecs, aspecs)
+    };
+
     // In-app playback: a timer walks the playhead in real time and reuses the
     // scrub pipeline (proxies + latest-wins queue), so frames that can't keep
-    // up are dropped instead of queued. No audio — use Full preview for that.
+    // up are dropped instead of queued. Audio: the V1+A1 mix renders to a wav
+    // (fast — no video encode) and mpv/ffplay plays it alongside; both sides
+    // follow wall clock, so they stay in step.
+    // ponytail: seeking while playing desyncs audio until the next play.
     let mut playing = use_signal(|| false);
     let mut toggle_play = move |_: ()| {
         if playing() {
@@ -716,6 +1298,23 @@ fn Editor() -> Element {
         }
         playing.set(true);
         spawn(async move {
+            let wav = std::env::temp_dir().join("morreel-playmix.wav");
+            let (specs, _, _, aspecs) = gather_specs();
+            let mut audio = match engine::render_audio_mix(&specs, &aspecs, &wav).await {
+                // Guard: paused while the mix was rendering — don't start sound.
+                Ok(()) if playing() => match engine::launch_audio(&wav, playhead()) {
+                    Ok(child) => Some(child),
+                    Err(e) => {
+                        status.set(format!("Playing without audio ({e})"));
+                        None
+                    }
+                },
+                Ok(()) => None,
+                Err(e) => {
+                    status.set(format!("Playing without audio ({e})"));
+                    None
+                }
+            };
             let mut last = std::time::Instant::now();
             while playing() {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -728,6 +1327,9 @@ fn Editor() -> Element {
                     break;
                 }
                 seek_to(t);
+            }
+            if let Some(child) = audio.as_mut() {
+                let _ = child.start_kill();
             }
         });
     };
@@ -750,37 +1352,201 @@ fn Editor() -> Element {
         }
     };
 
-    let gather_specs = move || -> (Vec<ClipSpec>, Vec<OverlaySpec>, Vec<TitleSpec>, Vec<AudioSpec>) {
-        let specs = clips.read().iter().map(Clip::spec).collect();
-        let ospecs = overlays
+    // Thumbnails, proxies, waveforms and title PNGs are all derived from the
+    // sources, so they stay out of the project file and get rebuilt here after
+    // a load. Everything is content-addressed or cheap, so this is mostly cache
+    // hits on a project you saved a minute ago.
+    let mut rehydrate = move || {
+        let media: Vec<String> = clips
             .read()
             .iter()
-            .map(|o| OverlaySpec {
-                path: o.path.clone(),
-                in_s: o.in_s,
-                out_s: o.out_s,
-                at: o.at,
-                effect: effect_filter(&o.effect).to_string(),
-            })
+            .map(|c| c.path.clone())
+            .chain(overlays.read().iter().map(|o| o.path.clone()))
             .collect();
-        let tspecs = titles
+        for p in media {
+            queue_proxy(p);
+        }
+        for path in audios.read().iter().map(|a| a.path.clone()).collect::<Vec<_>>() {
+            spawn(async move {
+                if let Ok(uri) = engine::waveform_data_uri(&path).await {
+                    for a in audios.write().iter_mut().filter(|a| a.path == path) {
+                        a.wave = uri.clone();
+                    }
+                }
+            });
+        }
+        let posters: Vec<(usize, String, f64, String)> = clips
             .read()
             .iter()
-            .filter(|t| !t.png.is_empty())
-            .map(|t| TitleSpec { png: t.png.clone(), at: t.at, dur: t.dur })
+            .enumerate()
+            .map(|(i, c)| (i, c.path.clone(), c.in_s, c.framing.clone()))
             .collect();
-        let aspecs = audios
-            .read()
-            .iter()
-            .map(|a| AudioSpec {
-                path: a.path.clone(),
-                in_s: a.in_s,
-                out_s: a.out_s,
-                at: a.at,
-                volume: a.volume,
-            })
-            .collect();
-        (specs, ospecs, tspecs, aspecs)
+        spawn(async move {
+            for (i, path, t, fr) in posters {
+                if let Ok(thumb) = engine::frame_data_uri(&path, t, 108, 192, &fr, "", None).await {
+                    if let Some(c) = clips.write().get_mut(i) {
+                        if c.path == path {
+                            c.thumb = thumb;
+                        }
+                    }
+                }
+            }
+        });
+        spawn(async move {
+            ensure_titles().await;
+            seek_to(playhead());
+        });
+    };
+
+    const PROJECT_EXT: [&str; 2] = ["morreel", "json"];
+
+    let save_project = move |_: ()| {
+        spawn(async move {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .add_filter("MorReel project", &PROJECT_EXT)
+                .set_file_name("reel.morreel")
+                .set_title("Save project")
+                .save_file()
+                .await
+            else {
+                return;
+            };
+            // The project records the edit, not the media: sources stay
+            // referenced by path, so a project file is small and text.
+            let res = serde_json::to_string_pretty(&snapshot())
+                .map_err(|e| e.to_string())
+                .and_then(|json| std::fs::write(file.path(), json).map_err(|e| e.to_string()));
+            match res {
+                Ok(()) => status.set(format!("Saved {}", file.path().display())),
+                Err(e) => status.set(format!("Save failed: {e}")),
+            }
+        });
+    };
+
+    let open_project = move |_: ()| {
+        spawn(async move {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .add_filter("MorReel project", &PROJECT_EXT)
+                .set_title("Open project")
+                .pick_file()
+                .await
+            else {
+                return;
+            };
+            let parsed = std::fs::read_to_string(file.path())
+                .map_err(|e| e.to_string())
+                .and_then(|t| serde_json::from_str::<Snapshot>(&t).map_err(|e| e.to_string()));
+            let snap = match parsed {
+                Ok(s) => s,
+                Err(e) => {
+                    status.set(format!("Could not open {}: {e}", file.file_name()));
+                    return;
+                }
+            };
+            // Sources are referenced by path, so a moved file loads as a clip
+            // that will fail at export — say so now rather than then.
+            let missing = snap
+                .clips
+                .iter()
+                .map(|c| &c.path)
+                .chain(snap.overlays.iter().map(|o| &o.path))
+                .chain(snap.audios.iter().map(|a| &a.path))
+                .filter(|p| !std::path::Path::new(p).exists())
+                .count();
+            push_undo(""); // opening is undoable like any other edit
+            restore(snap);
+            rehydrate();
+            status.set(if missing > 0 {
+                format!("Opened {} — {missing} source file(s) are missing.", file.file_name())
+            } else {
+                format!("Opened {}", file.file_name())
+            });
+        });
+    };
+
+    // Auto captions, TikTok-style: transcribe the timeline's audio mix and
+    // drop each segment onto the T lane as a normal title item — fix wording,
+    // restyle or retime any caption in the inspector like any other title.
+    let mut transcribing = use_signal(|| false);
+    let mut auto_captions = move |_: ()| {
+        if clips.read().is_empty() || transcribing() || export_progress().is_some() {
+            return;
+        }
+        transcribing.set(true);
+        spawn(async move {
+            status.set("Transcribing audio for captions… (first run downloads the model)".to_string());
+            let wav = std::env::temp_dir().join("morreel-captions.wav");
+            // Reuses the export progress bar; also parks export/preview while busy.
+            export_progress.set(Some(0.0));
+            let res = {
+                let (specs, _, _, _) = gather_specs();
+                let total: f64 = specs.iter().map(ClipSpec::trimmed).sum();
+                async move {
+                    // V1 audio only: A1 music mixed under would pollute the
+                    // transcript. Voiceovers belong on V1 to be captioned.
+                    engine::render_audio_mix(&specs, &[], &wav).await?;
+                    engine::transcribe(&wav, total, |p| export_progress.set(Some(p))).await
+                }
+            }
+            .await;
+            export_progress.set(None);
+            match res {
+                Ok(segs) if segs.is_empty() => status.set("No speech found to caption.".to_string()),
+                Ok(segs) => {
+                    push_undo("");
+                    let n = segs.len();
+                    {
+                        let mut ts = titles.write();
+                        for (k, (start, end, text)) in segs.iter().enumerate() {
+                            // Whisper segments can overlap; end each caption a
+                            // hair before the next starts so they never stack.
+                            let mut dur = (end - start).max(0.5);
+                            if let Some((next, _, _)) = segs.get(k + 1) {
+                                dur = dur.min((next - start - 0.05).max(0.3));
+                            }
+                            ts.push(TitleItem {
+                                text: wrap_caption(text, 26),
+                                at: *start,
+                                dur,
+                                font_size: 64.0,
+                                color: "White".to_string(),
+                                pos: "Lower third".to_string(),
+                                bevel: "Off".to_string(),
+                                bevel_size: 10.0,
+                                font: "Sans".to_string(),
+                                boxed: true, // backdrop keeps captions readable over busy video
+                                caption: true,
+                                png: String::new(),
+                                group: 0,
+                            });
+                        }
+                    }
+                    ensure_titles().await;
+                    seek_to(playhead());
+                    status.set(format!(
+                        "{n} caption(s) on the T lane — check the wording in the inspector before export."
+                    ));
+                }
+                Err(e) => status.set(format!("Captions failed: {e}")),
+            }
+            transcribing.set(false);
+        });
+    };
+
+    // Bulk-clear a bad transcription; manual titles stay.
+    let mut clear_captions = move |_: ()| {
+        let n = titles.read().iter().filter(|t| t.caption).count();
+        if n == 0 {
+            return;
+        }
+        push_undo("");
+        marked.write().clear();
+        if matches!(selected(), Some(Sel::Title(_))) {
+            selected.set(None); // title indices shift under the retain
+        }
+        titles.write().retain(|t| !t.caption);
+        seek_to(playhead());
+        status.set(format!("Removed {n} caption(s) — manual titles kept."));
     };
 
     let mut do_export = move |_: ()| {
@@ -847,6 +1613,7 @@ fn Editor() -> Element {
             let j = i as i64 + delta;
             if j >= 0 && (j as usize) < clips.read().len() {
                 let j = j as usize;
+                push_undo("");
                 let old = spans();
                 clips.write().swap(i, j);
                 selected.set(Some(Sel::Main(j)));
@@ -856,6 +1623,8 @@ fn Editor() -> Element {
     };
 
     let mut delete_sel = move |_: ()| {
+        push_undo("");
+        marked.write().clear(); // marks are positional; a delete shifts indices
         match selected() {
             Some(Sel::Main(i)) => {
                 let old = spans();
@@ -901,6 +1670,18 @@ fn Editor() -> Element {
         seek_to((playhead() + d).clamp(0.0, total_of()));
     };
 
+    // Safe-area guides over the monitor — the portrait editor's ruler for
+    // "will this caption survive the app's own buttons".
+    let mut safe_area = use_signal(|| false);
+    let mut toggle_safe = move |_: ()| {
+        safe_area.toggle();
+        status.set(if safe_area() {
+            "Safe areas on — keep titles out of the shaded bands.".to_string()
+        } else {
+            "Safe areas off.".to_string()
+        });
+    };
+
     // Keyboard shortcuts. I/O/S/Delete/Ctrl+O/Ctrl+E are bound by their menu
     // items (the menu is the single source of truth); these have no menu row.
     use_shortcut(Some(" ".into()), Some(EventHandler::new(move |()| toggle_play(()))));
@@ -914,7 +1695,10 @@ fn Editor() -> Element {
     use_shortcut(Some("[".into()), Some(EventHandler::new(move |()| step_sel(-1))));
     use_shortcut(Some("]".into()), Some(EventHandler::new(move |()| step_sel(1))));
     use_shortcut(Some("ESCAPE".into()), Some(EventHandler::new(move |()| ctx_menu.set(None))));
-    use_shortcut(Some("~".into()), Some(EventHandler::new(move |()| toggle_magnet(()))));
+    use_shortcut(Some("G".into()), Some(EventHandler::new(move |()| toggle_safe(()))));
+    // The menu item binds "~"; this covers layouts where ~ is Shift+` and the
+    // combo therefore arrives as SHIFT+~.
+    use_shortcut(Some("SHIFT+~".into()), Some(EventHandler::new(move |()| toggle_magnet(()))));
 
     // Window chrome preference (frameless / native / tiling), persisted like
     // the blogger theme editor; takes effect on next launch.
@@ -929,11 +1713,18 @@ fn Editor() -> Element {
     };
     let radio = move |m: UiMode| if preferred_mode() == m { "●" } else { "○" };
 
-    // Pop-out program monitor: a second OS window sharing the same preview
-    // signal — closing it is how you "dock" it back.
-    let open_monitor = move || {
+    // Pop-out program monitor: the monitor MOVES to its own OS window — the
+    // embedded phone hides while it's out, and closing the window docks it back.
+    let mut monitor_out = use_signal(|| false);
+    let mut open_monitor = move || {
+        if monitor_out() {
+            return;
+        }
         use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
-        let dom = VirtualDom::new_with_props(Monitor, MonitorProps { preview });
+        let dom = VirtualDom::new_with_props(
+            Monitor,
+            MonitorProps { preview, out: monitor_out, safe: safe_area },
+        );
         let cfg = Config::new()
             .with_menu(None::<dioxus::desktop::muda::Menu>)
             .with_window(
@@ -942,12 +1733,117 @@ fn Editor() -> Element {
                     .with_inner_size(LogicalSize::new(414.0, 764.0)),
             );
         let _ = dioxus::desktop::window().new_window(dom, cfg);
+        monitor_out.set(true);
+        status.set("Monitor popped out — close its window to dock it back.".to_string());
+    };
+
+    // Timeline zoom (status-bar control) and middle-mouse panning state.
+    let mut zoom = use_signal(|| 1.0f64);
+    let mut pan = use_signal(|| Option::<(f64, f64)>::None);
+
+    // Timeline scale (px per second), shared by the rsx and the drag handlers.
+    // ponytail: keyed to the shortest clip (min 48px wide) — no per-clip
+    // min-width, so ruler/playhead geometry stays exact.
+    let calc_scale = move || {
+        let min_dur = clips.read().iter().map(Clip::trimmed).fold(f64::MAX, f64::min);
+        ((48.0 / min_dur).clamp(14.0, 240.0) * zoom()).clamp(2.0, 960.0)
+    };
+
+    // Left-drag state: (target, last pointer x, V1 block's floating start,
+    // total px travelled). `drag_moved` swallows the click after a real drag.
+    let mut drag = use_signal(|| Option::<(Sel, f64, f64, f64)>::None);
+    let mut drag_moved = use_signal(|| false);
+    // Ruler scrub: mousedown on the ruler seeks and keeps seeking while held.
+    let mut scrubbing = use_signal(|| false);
+
+    // Inspector tab: "edit" (item parameters) or "fx" (effects browser).
+    let mut insp_tab = use_signal(|| "edit");
+
+    // Effects browser thumbnails: the selected item's poster frame through
+    // every effect, generated lazily and cached until the frame changes.
+    let mut fx_thumbs = use_signal(std::collections::HashMap::<String, String>::new);
+    let mut fx_key = use_signal(String::new);
+    use_effect(move || {
+        if insp_tab() != "fx" {
+            return;
+        }
+        let target = match selected() {
+            Some(Sel::Main(i)) => clips.read().get(i).map(|c| (c.scrub_path(), c.in_s, c.framing.clone())),
+            Some(Sel::Over(j)) => overlays.read().get(j).map(|o| (o.scrub_path(), o.in_s, o.framing.clone())),
+            _ => None,
+        };
+        let Some((path, t, fr)) = target else { return };
+        let key = format!("{path}@{t:.2}@{fr}");
+        if fx_key() == key {
+            return;
+        }
+        fx_key.set(key.clone());
+        fx_thumbs.write().clear();
+        spawn(async move {
+            for &(_, name, filter) in EFFECTS {
+                if fx_key() != key {
+                    return; // selection moved on — this batch is stale
+                }
+                if let Ok(uri) = engine::frame_data_uri(&path, t, 108, 192, &fr, filter, None).await {
+                    if fx_key() == key {
+                        fx_thumbs.write().insert(name.to_string(), uri);
+                    }
+                }
+            }
+        });
+    });
+
+    let mut apply_effect = move |name: String| {
+        push_undo("");
+        match selected() {
+            Some(Sel::Main(i)) if i < clips.read().len() => {
+                let (path, t, fr, amt) = {
+                    let mut cl = clips.write();
+                    cl[i].effect = name.clone();
+                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].effect_amount)
+                };
+                request_preview(path, t, fr, effect_filter_amt(&name, amt), None);
+            }
+            Some(Sel::Over(j)) if j < overlays.read().len() => {
+                let (path, t, fr, amt) = {
+                    let mut ov = overlays.write();
+                    ov[j].effect = name.clone();
+                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].effect_amount)
+                };
+                request_preview(path, t, fr, effect_filter_amt(&name, amt), None);
+            }
+            _ => status.set("Select a V1 clip or V2 overlay to apply an effect.".to_string()),
+        }
+    };
+
+    // Live strength change for the selected video item's effect.
+    let mut set_effect_amount = move |v: f64| {
+        push_undo("fx-amount");
+        match selected() {
+            Some(Sel::Main(i)) if i < clips.read().len() => {
+                let (path, t, fr, eff) = {
+                    let mut cl = clips.write();
+                    cl[i].effect_amount = v;
+                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), effect_filter_amt(&cl[i].effect, v))
+                };
+                request_preview(path, t, fr, eff, None);
+            }
+            Some(Sel::Over(j)) if j < overlays.read().len() => {
+                let (path, t, fr, eff) = {
+                    let mut ov = overlays.write();
+                    ov[j].effect_amount = v;
+                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), effect_filter_amt(&ov[j].effect, v))
+                };
+                request_preview(path, t, fr, eff, None);
+            }
+            _ => {}
+        }
     };
 
     let total = total_of();
     let exporting = export_progress().is_some();
     let no_clips = clips.read().is_empty();
-    let effect_names: Vec<String> = EFFECTS.iter().map(|(n, _)| n.to_string()).collect();
+    let effect_names: Vec<String> = EFFECTS.iter().map(|(_, n, _)| n.to_string()).collect();
 
     rsx! {
         MorAppFrame {
@@ -956,6 +1852,19 @@ fn Editor() -> Element {
             app_name: "MorReel Studio".to_string(),
             menu: Some(rsx! {
                 MorMenuDropdown { label: "File".to_string(),
+                    MenuItem {
+                        label: "Open project…".to_string(),
+                        shortcut: Some("Ctrl+Shift+O".to_string()),
+                        disabled: exporting,
+                        on_action: move |_| open_project(()),
+                    }
+                    MenuItem {
+                        label: "Save project…".to_string(),
+                        shortcut: Some("Ctrl+S".to_string()),
+                        disabled: no_clips,
+                        on_action: move |_| save_project(()),
+                    }
+                    MenuSeparator {}
                     MenuItem {
                         label: "Add clips…".to_string(),
                         shortcut: Some("Ctrl+O".to_string()),
@@ -978,6 +1887,16 @@ fn Editor() -> Element {
                         disabled: no_clips || exporting,
                         on_action: move |_| add_title(()),
                     }
+                    MenuItem {
+                        label: if transcribing() { "Transcribing…".to_string() } else { "Auto captions (transcribe)".to_string() },
+                        disabled: no_clips || exporting || transcribing(),
+                        on_action: move |_| auto_captions(()),
+                    }
+                    MenuItem {
+                        label: "Remove captions".to_string(),
+                        disabled: !titles.read().iter().any(|t| t.caption),
+                        on_action: move |_| clear_captions(()),
+                    }
                     MenuSeparator {}
                     MenuItem {
                         label: "Export MP4…".to_string(),
@@ -993,6 +1912,19 @@ fn Editor() -> Element {
                     }
                 }
                 MorMenuDropdown { label: "Edit".to_string(),
+                    MenuItem {
+                        label: "Undo".to_string(),
+                        shortcut: Some("Ctrl+Z".to_string()),
+                        disabled: undo_stack.read().is_empty(),
+                        on_action: move |_| undo(()),
+                    }
+                    MenuItem {
+                        label: "Redo".to_string(),
+                        shortcut: Some("Ctrl+Shift+Z".to_string()),
+                        disabled: redo_stack.read().is_empty(),
+                        on_action: move |_| redo(()),
+                    }
+                    MenuSeparator {}
                     MenuItem {
                         label: "Set in point at playhead".to_string(),
                         shortcut: Some("I".to_string()),
@@ -1030,6 +1962,19 @@ fn Editor() -> Element {
                     }
                     MenuSeparator {}
                     MenuItem {
+                        label: "Group marked items".to_string(),
+                        shortcut: Some("Ctrl+G".to_string()),
+                        disabled: marked().len() < 2,
+                        on_action: move |_| group_marked(()),
+                    }
+                    MenuItem {
+                        label: "Ungroup".to_string(),
+                        shortcut: Some("Ctrl+Shift+G".to_string()),
+                        disabled: selected().map(group_of).unwrap_or(0) == 0,
+                        on_action: move |_| ungroup_sel(()),
+                    }
+                    MenuSeparator {}
+                    MenuItem {
                         label: format!("{} Magnetic timeline", if magnet() { "●" } else { "○" }),
                         shortcut: Some("~".to_string()),
                         on_action: move |_| toggle_magnet(()),
@@ -1052,7 +1997,13 @@ fn Editor() -> Element {
                 MorMenuDropdown { label: "View".to_string(),
                     MenuItem {
                         label: "Pop out monitor".to_string(),
+                        disabled: monitor_out(),
                         on_action: move |_| open_monitor(),
+                    }
+                    MenuItem {
+                        label: format!("{} Safe areas (phone UI)", if safe_area() { "●" } else { "○" }),
+                        shortcut: Some("G".to_string()),
+                        on_action: move |_| toggle_safe(()),
                     }
                     MenuSeparator {}
                     MenuItem {
@@ -1081,29 +2032,81 @@ fn Editor() -> Element {
             }),
             status_left: rsx! { span { class: "mor-statusbar-muted", "{status}" } },
             status_right: rsx! {
+                if !marked().is_empty() {
+                    span { class: "mor-statusbar-chip", "{marked().len()} marked · Ctrl+G groups" }
+                }
                 if !magnet() {
                     span { class: "mor-statusbar-chip mor-statusbar-warn", "magnet off" }
                 }
                 if preferred_mode() != active_mode {
                     span { class: "mor-statusbar-chip mor-statusbar-warn", "window mode: restart to apply" }
                 }
+                if let Some(warn) = over_limits(total) {
+                    span {
+                        class: "mor-statusbar-chip mor-statusbar-warn",
+                        title: "Longer than this platform accepts for a portrait upload",
+                        "{warn}"
+                    }
+                }
                 span { class: "mor-statusbar-chip mor-statusbar-muted", "{fmt_t(total)} total" }
                 span { class: "mor-statusbar-chip mor-statusbar-muted", "1080×1920 • 30 fps" }
+                span { class: "mr-zoom",
+                    button {
+                        title: "Zoom timeline out",
+                        onclick: move |_| zoom.set((zoom() / 1.25).max(0.25)),
+                        "⊖"
+                    }
+                    input {
+                        r#type: "range",
+                        class: "mr-zoom-slider",
+                        min: "0.25",
+                        max: "6",
+                        step: "0.05",
+                        value: "{zoom}",
+                        title: "Timeline zoom",
+                        onkeydown: move |evt| evt.stop_propagation(),
+                        oninput: move |evt| {
+                            if let Ok(v) = evt.value().parse::<f64>() {
+                                zoom.set(v);
+                            }
+                        },
+                    }
+                    button {
+                        title: "Zoom timeline in",
+                        onclick: move |_| zoom.set((zoom() * 1.25).min(6.0)),
+                        "⊕"
+                    }
+                }
             },
 
             div { class: "mr-root",
+                // Releasing the mouse ends an interaction, so the next drag of
+                // the same slider or item starts a fresh undo step instead of
+                // collapsing into the previous one's snapshot.
+                onmouseup: move |_| undo_tag.set(String::new()),
                 div { class: "mr-work",
                     div { class: "mr-preview-col",
-                        div { class: "mr-phone",
-                            oncontextmenu: move |evt| open_ctx(evt, Ctx::Monitor),
-                            if preview().is_empty() {
-                                span { "Portrait preview" }
-                            } else {
-                                img { src: "{preview}" }
+                        if !monitor_out() {
+                            div { class: "mr-phone",
+                                oncontextmenu: move |evt| open_ctx(evt, Ctx::Monitor),
+                                if preview().is_empty() {
+                                    span { "Add clips to preview your reel" }
+                                } else {
+                                    img { src: "{preview}" }
+                                }
+                                if safe_area() {
+                                    SafeArea {}
+                                }
                             }
                         }
                         if !clips.read().is_empty() {
                             div { class: "mr-scrub",
+                                // Deck counter: the master timecode readout — amber at
+                                // rest, record-red while the transport is rolling.
+                                div { class: if playing() { "mr-deck playing" } else { "mr-deck" },
+                                    span { "{fmt_t(playhead().min(total))}" }
+                                    span { class: "mr-deck-total", "/ {fmt_t(total)}" }
+                                }
                                 Slider {
                                     label: Some("Playhead"),
                                     min: 0.0,
@@ -1128,7 +2131,8 @@ fn Editor() -> Element {
                                     }
                                     button {
                                         class: "mor-btn",
-                                        title: "Open the monitor in its own window — edit on one screen, watch on another",
+                                        disabled: monitor_out(),
+                                        title: "Move the monitor to its own window — edit on one screen, watch on another",
                                         onclick: move |_| open_monitor(),
                                         "⧉ Pop out"
                                     }
@@ -1164,7 +2168,7 @@ fn Editor() -> Element {
                                 "＋ Title"
                             }
                             button {
-                                class: "mor-btn",
+                                class: "mor-btn mr-export",
                                 disabled: clips.read().is_empty() || exporting,
                                 onclick: move |_| do_export(()),
                                 "⇪ Export MP4"
@@ -1177,17 +2181,90 @@ fn Editor() -> Element {
                             }
                         }
 
+                        div { class: "mr-tabs",
+                            button {
+                                class: if insp_tab() == "edit" { "mr-tab active" } else { "mr-tab" },
+                                onclick: move |_| insp_tab.set("edit"),
+                                "Inspector"
+                            }
+                            button {
+                                class: if insp_tab() == "fx" { "mr-tab active" } else { "mr-tab" },
+                                onclick: move |_| insp_tab.set("fx"),
+                                "Effects"
+                            }
+                        }
+
+                        if insp_tab() == "fx" {
+                            {
+                                let cur = match selected() {
+                                    Some(Sel::Main(i)) => clips.read().get(i).map(|c| (c.effect.clone(), c.effect_amount)),
+                                    Some(Sel::Over(j)) => overlays.read().get(j).map(|o| (o.effect.clone(), o.effect_amount)),
+                                    _ => None,
+                                };
+                                match cur {
+                                    Some((current, amount)) => {
+                                        let thumbs = fx_thumbs();
+                                        // Categories in table order, deduped.
+                                        let cats = {
+                                            let mut v: Vec<&str> = Vec::new();
+                                            for &(c, _, _) in EFFECTS {
+                                                if !v.contains(&c) {
+                                                    v.push(c);
+                                                }
+                                            }
+                                            v
+                                        };
+                                        rsx! {
+                                            if current != "None" {
+                                                Slider {
+                                                    label: Some("Effect strength"),
+                                                    min: 0.0,
+                                                    max: 1.0,
+                                                    step: 0.05,
+                                                    precision: 2,
+                                                    value: amount,
+                                                    oninput: Some(EventHandler::new(move |v: f64| set_effect_amount(v))),
+                                                }
+                                            }
+                                            for cat in cats {
+                                                h4 { class: "mr-fx-cat", "{cat}" }
+                                                div { class: "mr-fx-grid",
+                                                    for (_, name, _) in EFFECTS.iter().copied().filter(move |&(c, _, _)| c == cat) {
+                                                        button {
+                                                            key: "{name}",
+                                                            class: if current == name { "mr-fx-tile active" } else { "mr-fx-tile" },
+                                                            onclick: move |_| apply_effect(name.to_string()),
+                                                            if let Some(uri) = thumbs.get(name) {
+                                                                img { src: "{uri}" }
+                                                            } else {
+                                                                div { class: "mr-fx-ph" }
+                                                            }
+                                                            span { "{name}" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None => rsx! {
+                                        p { class: "mor-statusbar-muted",
+                                            "Effects apply to video — select a V1 clip or V2 overlay on the timeline, then pick a look. Motion looks are ports of moranima's camera moves."
+                                        }
+                                    },
+                                }
+                            }
+                        } else {
+
                         {match selected() {
                             Some(Sel::Main(i)) if i < clips.read().len() => {
                                 let c = clips.read()[i].clone();
                                 rsx! {
                                     div { class: "mr-clip-info",
-                                        h3 { "V1 · {c.name}" }
-                                        p { class: "mor-statusbar-muted",
-                                            "{fmt_t(c.duration)} source • keeping {fmt_t(c.trimmed())}"
-                                            if !c.has_audio { " • no audio" }
-                                            if c.proxy.is_empty() { " • building proxy…" } else { " • proxy" }
+                                        h3 {
+                                            span { class: "mr-ctx-tag", "V1" }
+                                            " {c.name}"
                                         }
+                                        p { class: "mor-statusbar-muted", "{clip_note(&c)}" }
                                     }
                                     Slider {
                                         label: Some("In point"),
@@ -1198,8 +2275,10 @@ fn Editor() -> Element {
                                         value: c.in_s,
                                         oninput: Some(EventHandler::new({
                                             let path = c.scrub_path();
-                                            let eff = effect_filter(&c.effect).to_string();
+                                            let fr = c.framing.clone();
+                                            let eff = effect_filter_amt(&c.effect, c.effect_amount);
                                             move |v: f64| {
+                                                push_undo(&format!("in{i}"));
                                                 let old = spans();
                                                 let t = {
                                                     let mut cl = clips.write();
@@ -1208,7 +2287,7 @@ fn Editor() -> Element {
                                                 };
                                                 ride(old, &|k| Some(start_of(k)));
                                                 playhead.set(start_of(i));
-                                                request_preview(path.clone(), t, eff.clone(), None);
+                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), None);
                                             }
                                         })),
                                     }
@@ -1221,8 +2300,10 @@ fn Editor() -> Element {
                                         value: c.out_s,
                                         oninput: Some(EventHandler::new({
                                             let path = c.scrub_path();
-                                            let eff = effect_filter(&c.effect).to_string();
+                                            let fr = c.framing.clone();
+                                            let eff = effect_filter_amt(&c.effect, c.effect_amount);
                                             move |v: f64| {
+                                                push_undo(&format!("out{i}"));
                                                 let old = spans();
                                                 let t = {
                                                     let mut cl = clips.write();
@@ -1231,7 +2312,7 @@ fn Editor() -> Element {
                                                 };
                                                 ride(old, &|k| Some(start_of(k)));
                                                 playhead.set(start_of(i + 1));
-                                                request_preview(path.clone(), t, eff.clone(), None);
+                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), None);
                                             }
                                         })),
                                     }
@@ -1241,15 +2322,80 @@ fn Editor() -> Element {
                                         options: effect_names.clone(),
                                         onchange: {
                                             let path = c.scrub_path();
+                                            let fr = c.framing.clone();
+                                            let amt = c.effect_amount;
                                             move |name: String| {
                                                 let t = {
                                                     let mut cl = clips.write();
                                                     cl[i].effect = name.clone();
                                                     cl[i].in_s
                                                 };
-                                                request_preview(path.clone(), t, effect_filter(&name).to_string(), None);
+                                                request_preview(path.clone(), t, fr.clone(), effect_filter_amt(&name, amt), None);
                                             }
                                         },
+                                    }
+                                    if c.effect != "None" {
+                                        Slider {
+                                            label: Some("Effect strength"),
+                                            min: 0.0,
+                                            max: 1.0,
+                                            step: 0.05,
+                                            precision: 2,
+                                            value: c.effect_amount,
+                                            oninput: Some(EventHandler::new(move |v: f64| set_effect_amount(v))),
+                                        }
+                                    }
+                                    MorSelect {
+                                        label: "Framing (9:16)".to_string(),
+                                        value: c.framing.clone(),
+                                        options: FRAMINGS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                                        onchange: {
+                                            let path = c.scrub_path();
+                                            let eff = effect_filter_amt(&c.effect, c.effect_amount);
+                                            move |name: String| {
+                                                let t = {
+                                                    let mut cl = clips.write();
+                                                    cl[i].framing = name.clone();
+                                                    cl[i].in_s
+                                                };
+                                                request_preview(path.clone(), t, name, eff.clone(), None);
+                                            }
+                                        },
+                                    }
+                                    // A photo has no motion to retime — its length
+                                    // is just the Out point.
+                                    if !engine::is_still(&c.path) {
+                                    Slider {
+                                        label: Some("Speed (×)"),
+                                        min: 0.25,
+                                        max: 4.0,
+                                        step: 0.05,
+                                        precision: 2,
+                                        value: c.speed,
+                                        oninput: Some(EventHandler::new(move |v: f64| {
+                                            // Retiming changes how long the clip runs, so the
+                                            // magnet has to carry attached items the same way a
+                                            // trim does.
+                                            push_undo(&format!("speed{i}"));
+                                            let old = spans();
+                                            clips.write()[i].speed = v.max(0.05);
+                                            ride(old, &|k| Some(start_of(k)));
+                                        })),
+                                    }
+                                    }
+                                    if c.has_audio {
+                                        Slider {
+                                            label: Some("Clip volume"),
+                                            min: 0.0,
+                                            max: 2.0,
+                                            step: 0.05,
+                                            precision: 2,
+                                            value: c.volume,
+                                            oninput: Some(EventHandler::new(move |v: f64| {
+                                                push_undo(&format!("cvol{i}"));
+                                                clips.write()[i].volume = v;
+                                            })),
+                                        }
                                     }
                                     div { class: "mr-toolbar",
                                         button { class: "mor-btn", onclick: move |_| move_sel(-1), "◀ Move left" }
@@ -1263,7 +2409,10 @@ fn Editor() -> Element {
                                 let o = overlays.read()[j].clone();
                                 rsx! {
                                     div { class: "mr-clip-info",
-                                        h3 { "V2 · {o.name}" }
+                                        h3 {
+                                            span { class: "mr-ctx-tag", "V2" }
+                                            " {o.name}"
+                                        }
                                         p { class: "mor-statusbar-muted",
                                             "Cutaway covers V1 from {fmt_t(o.at)} for {fmt_t(o.out_s - o.in_s)} — main audio keeps playing."
                                         }
@@ -1276,6 +2425,7 @@ fn Editor() -> Element {
                                         precision: 1,
                                         value: o.at,
                                         oninput: Some(EventHandler::new(move |v: f64| {
+                                            push_undo(&format!("opos{j}"));
                                             overlays.write()[j].at = v.max(0.0);
                                         })),
                                     }
@@ -1288,14 +2438,15 @@ fn Editor() -> Element {
                                         value: o.in_s,
                                         oninput: Some(EventHandler::new({
                                             let path = o.scrub_path();
-                                            let eff = effect_filter(&o.effect).to_string();
+                                            let fr = o.framing.clone();
+                                            let eff = effect_filter_amt(&o.effect, o.effect_amount);
                                             move |v: f64| {
                                                 let t = {
                                                     let mut ov = overlays.write();
                                                     ov[j].in_s = v.min(ov[j].out_s - 0.1).max(0.0);
                                                     ov[j].in_s
                                                 };
-                                                request_preview(path.clone(), t, eff.clone(), None);
+                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), None);
                                             }
                                         })),
                                     }
@@ -1308,14 +2459,15 @@ fn Editor() -> Element {
                                         value: o.out_s,
                                         oninput: Some(EventHandler::new({
                                             let path = o.scrub_path();
-                                            let eff = effect_filter(&o.effect).to_string();
+                                            let fr = o.framing.clone();
+                                            let eff = effect_filter_amt(&o.effect, o.effect_amount);
                                             move |v: f64| {
                                                 let t = {
                                                     let mut ov = overlays.write();
                                                     ov[j].out_s = v.max(ov[j].in_s + 0.1).min(ov[j].duration);
                                                     ov[j].out_s
                                                 };
-                                                request_preview(path.clone(), t, eff.clone(), None);
+                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), None);
                                             }
                                         })),
                                     }
@@ -1325,13 +2477,43 @@ fn Editor() -> Element {
                                         options: effect_names.clone(),
                                         onchange: {
                                             let path = o.scrub_path();
+                                            let fr = o.framing.clone();
+                                            let amt = o.effect_amount;
                                             move |name: String| {
                                                 let t = {
                                                     let mut ov = overlays.write();
                                                     ov[j].effect = name.clone();
                                                     ov[j].in_s
                                                 };
-                                                request_preview(path.clone(), t, effect_filter(&name).to_string(), None);
+                                                request_preview(path.clone(), t, fr.clone(), effect_filter_amt(&name, amt), None);
+                                            }
+                                        },
+                                    }
+                                    if o.effect != "None" {
+                                        Slider {
+                                            label: Some("Effect strength"),
+                                            min: 0.0,
+                                            max: 1.0,
+                                            step: 0.05,
+                                            precision: 2,
+                                            value: o.effect_amount,
+                                            oninput: Some(EventHandler::new(move |v: f64| set_effect_amount(v))),
+                                        }
+                                    }
+                                    MorSelect {
+                                        label: "Framing (9:16)".to_string(),
+                                        value: o.framing.clone(),
+                                        options: FRAMINGS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                                        onchange: {
+                                            let path = o.scrub_path();
+                                            let eff = effect_filter_amt(&o.effect, o.effect_amount);
+                                            move |name: String| {
+                                                let t = {
+                                                    let mut ov = overlays.write();
+                                                    ov[j].framing = name.clone();
+                                                    ov[j].in_s
+                                                };
+                                                request_preview(path.clone(), t, name, eff.clone(), None);
                                             }
                                         },
                                     }
@@ -1344,7 +2526,10 @@ fn Editor() -> Element {
                                 let t = titles.read()[k].clone();
                                 rsx! {
                                     div { class: "mr-clip-info",
-                                        h3 { "T · Title" }
+                                        h3 {
+                                            span { class: "mr-ctx-tag title", "T" }
+                                            if t.caption { " Caption" } else { " Title" }
+                                        }
                                         p { class: "mor-statusbar-muted",
                                             "Shown from {fmt_t(t.at)} for {fmt_t(t.dur)}"
                                             if t.png.is_empty() { " • rendering…" }
@@ -1381,6 +2566,7 @@ fn Editor() -> Element {
                                         precision: 1,
                                         value: t.dur,
                                         oninput: Some(EventHandler::new(move |v: f64| {
+                                            push_undo(&format!("tdur{k}"));
                                             titles.write()[k].dur = v;
                                         })),
                                     }
@@ -1406,6 +2592,30 @@ fn Editor() -> Element {
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.color = v;
+                                                item.png.clear();
+                                            }
+                                            rerender_title(k);
+                                        },
+                                    }
+                                    MorSelect {
+                                        label: "Font".to_string(),
+                                        value: t.font.clone(),
+                                        options: TITLE_FONTS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                                        onchange: move |v: String| {
+                                            if let Some(item) = titles.write().get_mut(k) {
+                                                item.font = v;
+                                                item.png.clear();
+                                            }
+                                            rerender_title(k);
+                                        },
+                                    }
+                                    MorSelect {
+                                        label: "Backdrop".to_string(),
+                                        value: if t.boxed { "Box".to_string() } else { "None".to_string() },
+                                        options: vec!["None".to_string(), "Box".to_string()],
+                                        onchange: move |v: String| {
+                                            if let Some(item) = titles.write().get_mut(k) {
+                                                item.boxed = v == "Box";
                                                 item.png.clear();
                                             }
                                             rerender_title(k);
@@ -1461,7 +2671,10 @@ fn Editor() -> Element {
                                 let a = audios.read()[k].clone();
                                 rsx! {
                                     div { class: "mr-clip-info",
-                                        h3 { "A1 · {a.name}" }
+                                        h3 {
+                                            span { class: "mr-ctx-tag audio", "A1" }
+                                            " {a.name}"
+                                        }
                                         p { class: "mor-statusbar-muted",
                                             "Mixed under the main track from {fmt_t(a.at)} for {fmt_t(a.out_s - a.in_s)}."
                                         }
@@ -1474,6 +2687,7 @@ fn Editor() -> Element {
                                         precision: 1,
                                         value: a.at,
                                         oninput: Some(EventHandler::new(move |v: f64| {
+                                            push_undo(&format!("apos{k}"));
                                             audios.write()[k].at = v.max(0.0);
                                         })),
                                     }
@@ -1509,6 +2723,7 @@ fn Editor() -> Element {
                                         precision: 2,
                                         value: a.volume,
                                         oninput: Some(EventHandler::new(move |v: f64| {
+                                            push_undo(&format!("avol{k}"));
                                             audios.write()[k].volume = v;
                                         })),
                                     }
@@ -1519,45 +2734,157 @@ fn Editor() -> Element {
                             }
                             _ => rsx! {
                                 p { class: "mor-statusbar-muted",
-                                    "Add portrait or landscape clips — everything is center-cropped to 9:16. Select an item on the timeline to edit it."
+                                    "Add portrait or landscape clips — each clip's Framing picks crop, letterbox fit, or zoom into 9:16. Select an item on the timeline to edit it."
                                 }
                             },
                         }}
 
+                        }
+
                         p { class: "mor-statusbar-muted mr-keys",
-                            "I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · [ ] select clip · ~ magnet · Ctrl+O add · Ctrl+E export"
+                            "Ctrl+Z undo · I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · drag to move (snaps) · Ctrl+G group · ~ magnet · G safe areas · Ctrl+E export"
                         }
                     }
                 }
 
                 div { class: "mr-timeline",
                     oncontextmenu: move |evt| open_ctx(evt, Ctx::Timeline),
+                    // Middle-mouse drag pans the timeline on both axes.
+                    onmousedown: move |evt| {
+                        if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Auxiliary) {
+                            evt.prevent_default(); // no Linux middle-click paste / autoscroll
+                            let p = evt.client_coordinates();
+                            pan.set(Some((p.x, p.y)));
+                        }
+                    },
+                    onmousemove: move |evt| {
+                        let p = evt.client_coordinates();
+                        if let Some((px, py)) = pan() {
+                            pan.set(Some((p.x, p.y)));
+                            let _ = dioxus::document::eval(&format!(
+                                "document.querySelector('.mr-timeline').scrollBy({:.1}, {:.1});",
+                                px - p.x,
+                                py - p.y
+                            ));
+                            return;
+                        }
+                        let Some((target, last_x, t0, acc)) = drag() else { return };
+                        let dx = p.x - last_x;
+                        if dx == 0.0 {
+                            return;
+                        }
+                        let acc = acc + dx.abs(); // 4px dead zone tells a click from a drag
+                        let dt = dx / calc_scale();
+                        match target {
+                            Sel::Main(i) if i < clips.read().len() => {
+                                let t0 = t0 + dt;
+                                if acc > 4.0 {
+                                    let (lo, len) = block_of(i);
+                                    let bdur: f64 =
+                                        clips.read()[lo..lo + len].iter().map(Clip::trimmed).sum();
+                                    let center = t0 + bdur / 2.0;
+                                    // Insertion point: how many other clips' midpoints
+                                    // the block's center has passed.
+                                    let mut dest = 0;
+                                    let mut walked = 0.0;
+                                    for (k, c) in clips.read().iter().enumerate() {
+                                        if k >= lo && k < lo + len {
+                                            continue;
+                                        }
+                                        if center > walked + c.trimmed() / 2.0 {
+                                            dest += 1;
+                                        }
+                                        walked += c.trimmed();
+                                    }
+                                    if dest != lo {
+                                        move_block(lo, len, dest);
+                                        let ni = dest + (i - lo);
+                                        selected.set(Some(Sel::Main(ni)));
+                                        drag.set(Some((Sel::Main(ni), p.x, t0, acc)));
+                                        return;
+                                    }
+                                }
+                                drag.set(Some((Sel::Main(i), p.x, t0, acc)));
+                            }
+                            other => {
+                                if acc > 4.0 {
+                                    // Snap the item's leading edge to the nearest cut,
+                                    // the end of the reel, or the playhead — within a
+                                    // few pixels, so it never fights a deliberate drag.
+                                    let dt = match lane_at(other) {
+                                        Some(at) => {
+                                            let scale = calc_scale();
+                                            let mut targets: Vec<f64> =
+                                                spans().iter().map(|&(s, _)| s).collect();
+                                            targets.push(total_of());
+                                            targets.push(playhead());
+                                            snap_to(at + dt, &targets, 6.0 / scale) - at
+                                        }
+                                        None => dt,
+                                    };
+                                    shift_lane(other, dt);
+                                }
+                                drag.set(Some((other, p.x, t0, acc)));
+                            }
+                        }
+                    },
+                    onmouseup: move |_| {
+                        if let Some((_, _, _, acc)) = drag() {
+                            if acc > 4.0 {
+                                drag_moved.set(true); // swallow the click that follows
+                            }
+                        }
+                        drag.set(None);
+                        pan.set(None);
+                        scrubbing.set(false);
+                    },
+                    onmouseleave: move |_| {
+                        drag.set(None);
+                        pan.set(None);
+                        scrubbing.set(false);
+                    },
                     if clips.read().is_empty() {
-                        span { class: "mor-statusbar-muted mr-timeline-hint", "Timeline — clips play left to right" }
+                        span { class: "mor-statusbar-muted mr-timeline-hint", "Add clips (Ctrl+O) — your story builds left to right" }
                     } else {
                         {
-                            // ponytail: scale keyed to shortest clip (min 48px wide) — no
-                            // per-clip min-width, so ruler/playhead geometry stays exact.
-                            let min_dur = clips.read().iter().map(Clip::trimmed).fold(f64::MAX, f64::min);
-                            let scale = (48.0 / min_dur).clamp(14.0, 240.0);
+                            let scale = calc_scale();
                             let track_end = total
                                 .max(overlays.read().iter().map(|o| o.at + o.out_s - o.in_s).fold(0.0, f64::max))
                                 .max(titles.read().iter().map(|t| t.at + t.dur).fold(0.0, f64::max))
                                 .max(audios.read().iter().map(|a| a.at + a.out_s - a.in_s).fold(0.0, f64::max));
-                            let tick_s = if track_end <= 30.0 { 5.0 } else if track_end <= 120.0 { 10.0 } else { 30.0 };
+                            // Adaptive ruler: a labeled tick every ~72px whatever the
+                            // zoom, minor ticks at quarter steps (dropped when the
+                            // timeline is long enough that they'd flood the DOM).
+                            let tick_s = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0]
+                                .into_iter()
+                                .find(|s| s * scale >= 72.0)
+                                .unwrap_or(120.0);
+                            let minor_s = if track_end / tick_s > 400.0 { tick_s } else { tick_s / 4.0 };
+                            let per = (tick_s / minor_s).round() as usize;
                             let ph = playhead().min(total);
                             rsx! {
                                 div { class: "mr-track", style: "width: {track_end * scale}px",
                                     div {
                                         class: "mr-ruler",
-                                        onclick: move |evt: Event<MouseData>| {
-                                            seek_to((evt.element_coordinates().x / scale).clamp(0.0, total_of()));
+                                        // Press seeks, holding drags the playhead along.
+                                        onmousedown: move |evt| {
+                                            if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
+                                                scrubbing.set(true);
+                                                seek_to((evt.element_coordinates().x / calc_scale()).clamp(0.0, total_of()));
+                                            }
                                         },
-                                        for k in 0..=((track_end / tick_s) as usize) {
+                                        onmousemove: move |evt| {
+                                            if scrubbing() {
+                                                seek_to((evt.element_coordinates().x / calc_scale()).clamp(0.0, total_of()));
+                                            }
+                                        },
+                                        for k in 0..=((track_end / minor_s) as usize) {
                                             span {
-                                                class: "mr-tick",
-                                                style: "left: {k as f64 * tick_s * scale}px",
-                                                "{fmt_t(k as f64 * tick_s)}"
+                                                class: if k % per == 0 { "mr-tick major" } else { "mr-tick" },
+                                                style: "left: {k as f64 * minor_s * scale}px",
+                                                if k % per == 0 {
+                                                    "{fmt_t(k as f64 * minor_s)}"
+                                                }
                                             }
                                         }
                                     }
@@ -1566,9 +2893,23 @@ fn Editor() -> Element {
                                         for (k, t) in titles().into_iter().enumerate() {
                                             div {
                                                 key: "title-{k}",
-                                                class: if selected() == Some(Sel::Title(k)) { "mr-lane-item title selected" } else { "mr-lane-item title" },
+                                                class: item_class("mr-lane-item title", selected() == Some(Sel::Title(k)), marked().contains(&Sel::Title(k))),
                                                 style: "left: {t.at * scale}px; width: {t.dur * scale}px",
-                                                onclick: move |_| {
+                                                onmousedown: move |evt| {
+                                                    if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
+                                                        selected.set(Some(Sel::Title(k)));
+                                                        drag.set(Some((Sel::Title(k), evt.client_coordinates().x, 0.0, 0.0)));
+                                                    }
+                                                },
+                                                onclick: move |evt| {
+                                                    if drag_moved() {
+                                                        drag_moved.set(false);
+                                                        return;
+                                                    }
+                                                    if evt.modifiers().ctrl() {
+                                                        toggle_mark(Sel::Title(k));
+                                                        return;
+                                                    }
                                                     let at = titles.read()[k].at;
                                                     seek_to(at);
                                                     selected.set(Some(Sel::Title(k)));
@@ -1577,6 +2918,9 @@ fn Editor() -> Element {
                                                     selected.set(Some(Sel::Title(k)));
                                                     open_ctx(evt, Ctx::Title(k));
                                                 },
+                                                if t.group != 0 {
+                                                    span { class: "mr-group-dot", style: "background: hsl({(t.group * 67) % 360}, 70%, 60%)" }
+                                                }
                                                 "𝐓 {t.text}"
                                             }
                                         }
@@ -1586,9 +2930,23 @@ fn Editor() -> Element {
                                         for (j, o) in overlays().into_iter().enumerate() {
                                             div {
                                                 key: "{j}-{o.path}",
-                                                class: if selected() == Some(Sel::Over(j)) { "mr-lane-item selected" } else { "mr-lane-item" },
+                                                class: item_class("mr-lane-item", selected() == Some(Sel::Over(j)), marked().contains(&Sel::Over(j))),
                                                 style: "left: {o.at * scale}px; width: {(o.out_s - o.in_s) * scale}px",
-                                                onclick: move |_| {
+                                                onmousedown: move |evt| {
+                                                    if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
+                                                        selected.set(Some(Sel::Over(j)));
+                                                        drag.set(Some((Sel::Over(j), evt.client_coordinates().x, 0.0, 0.0)));
+                                                    }
+                                                },
+                                                onclick: move |evt| {
+                                                    if drag_moved() {
+                                                        drag_moved.set(false);
+                                                        return;
+                                                    }
+                                                    if evt.modifiers().ctrl() {
+                                                        toggle_mark(Sel::Over(j));
+                                                        return;
+                                                    }
                                                     let at = overlays.read()[j].at;
                                                     seek_to(at);
                                                     selected.set(Some(Sel::Over(j)));
@@ -1597,23 +2955,46 @@ fn Editor() -> Element {
                                                     selected.set(Some(Sel::Over(j)));
                                                     open_ctx(evt, Ctx::Over(j));
                                                 },
+                                                if o.group != 0 {
+                                                    span { class: "mr-group-dot", style: "background: hsl({(o.group * 67) % 360}, 70%, 60%)" }
+                                                }
                                                 "{o.name}"
                                             }
                                         }
                                     }
                                     div { class: "mr-clips",
-                                        span { class: "mr-lane-tag", "V1" }
+                                        span { class: "mr-lane-tag", title: "Primary story — drag clips to reorder", "V1" }
                                         for (i, c) in clips().into_iter().enumerate() {
                                             div {
                                                 key: "{i}-{c.path}",
-                                                class: if selected() == Some(Sel::Main(i)) { "mr-clip selected" } else { "mr-clip" },
+                                                class: item_class("mr-clip", selected() == Some(Sel::Main(i)), marked().contains(&Sel::Main(i))),
                                                 style: "width: {c.trimmed() * scale}px",
-                                                onclick: move |_| select_clip(i),
+                                                onmousedown: move |evt| {
+                                                    if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
+                                                        selected.set(Some(Sel::Main(i)));
+                                                        let (lo, _) = block_of(i);
+                                                        drag.set(Some((Sel::Main(i), evt.client_coordinates().x, start_of(lo), 0.0)));
+                                                    }
+                                                },
+                                                onclick: move |evt| {
+                                                    if drag_moved() {
+                                                        drag_moved.set(false);
+                                                        return;
+                                                    }
+                                                    if evt.modifiers().ctrl() {
+                                                        toggle_mark(Sel::Main(i));
+                                                        return;
+                                                    }
+                                                    select_clip(i)
+                                                },
                                                 // Right-click selects without moving the playhead.
                                                 oncontextmenu: move |evt| {
                                                     selected.set(Some(Sel::Main(i)));
                                                     open_ctx(evt, Ctx::Clip(i));
                                                 },
+                                                if c.group != 0 {
+                                                    span { class: "mr-group-dot", style: "background: hsl({(c.group * 67) % 360}, 70%, 60%)" }
+                                                }
                                                 if c.thumb.is_empty() {
                                                     div { class: "mr-thumb-missing" }
                                                 } else {
@@ -1632,9 +3013,23 @@ fn Editor() -> Element {
                                         for (k, a) in audios().into_iter().enumerate() {
                                             div {
                                                 key: "{k}-{a.path}",
-                                                class: if selected() == Some(Sel::Aud(k)) { "mr-lane-item audio selected" } else { "mr-lane-item audio" },
-                                                style: "left: {a.at * scale}px; width: {(a.out_s - a.in_s) * scale}px",
-                                                onclick: move |_| {
+                                                class: item_class("mr-lane-item audio", selected() == Some(Sel::Aud(k)), marked().contains(&Sel::Aud(k))),
+                                                style: "left: {a.at * scale}px; width: {(a.out_s - a.in_s) * scale}px; {wave_css(&a, scale)}",
+                                                onmousedown: move |evt| {
+                                                    if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
+                                                        selected.set(Some(Sel::Aud(k)));
+                                                        drag.set(Some((Sel::Aud(k), evt.client_coordinates().x, 0.0, 0.0)));
+                                                    }
+                                                },
+                                                onclick: move |evt| {
+                                                    if drag_moved() {
+                                                        drag_moved.set(false);
+                                                        return;
+                                                    }
+                                                    if evt.modifiers().ctrl() {
+                                                        toggle_mark(Sel::Aud(k));
+                                                        return;
+                                                    }
                                                     let at = audios.read()[k].at;
                                                     seek_to(at);
                                                     selected.set(Some(Sel::Aud(k)));
@@ -1643,11 +3038,16 @@ fn Editor() -> Element {
                                                     selected.set(Some(Sel::Aud(k)));
                                                     open_ctx(evt, Ctx::Aud(k));
                                                 },
+                                                if a.group != 0 {
+                                                    span { class: "mr-group-dot", style: "background: hsl({(a.group * 67) % 360}, 70%, 60%)" }
+                                                }
                                                 "♪ {a.name}"
                                             }
                                         }
                                     }
-                                    div { class: "mr-playhead", style: "left: {ph * scale}px" }
+                                    div { class: "mr-playhead", style: "left: {ph * scale}px",
+                                        span { class: "mr-ph-badge", "{fmt_t(ph)}" }
+                                    }
                                 }
                             }
                         }
@@ -1760,6 +3160,8 @@ fn Editor() -> Element {
                                     on_action: move |_| move_sel(1),
                                 }
                                 MenuSeparator {}
+                                {group_rows(clips.read().get(i).map_or(0, |c| c.group) == 0)}
+                                MenuSeparator {}
                                 CtxItem {
                                     label: "Ripple delete".to_string(),
                                     shortcut: Some("Delete".to_string()),
@@ -1780,6 +3182,7 @@ fn Editor() -> Element {
                                     shortcut: Some("S".to_string()),
                                     on_action: move |_| split_at_playhead(()),
                                 }
+                                {group_rows(overlays.read().get(j).map_or(0, |o| o.group) == 0)}
                                 MenuSeparator {}
                                 CtxItem {
                                     label: "Remove overlay".to_string(),
@@ -1800,6 +3203,7 @@ fn Editor() -> Element {
                                     shortcut: Some("S".to_string()),
                                     on_action: move |_| split_at_playhead(()),
                                 }
+                                {group_rows(audios.read().get(k).map_or(0, |a| a.group) == 0)}
                                 MenuSeparator {}
                                 CtxItem {
                                     label: "Remove audio".to_string(),
@@ -1815,6 +3219,8 @@ fn Editor() -> Element {
                                     span { class: "mr-ctx-tag title", "T" }
                                     span { class: "mr-ctx-name", "{text}" }
                                 }
+                                {group_rows(titles.read().get(k).map_or(0, |t| t.group) == 0)}
+                                MenuSeparator {}
                                 CtxItem {
                                     label: "Remove title".to_string(),
                                     danger: true,
@@ -1832,16 +3238,22 @@ fn Editor() -> Element {
             title: "Keyboard shortcuts".to_string(),
             table { class: "mr-shortcut-table",
                 for (keys, what) in [
-                    ("Space", "Play / pause (silent proxy playback)"),
+                    ("Space", "Play / pause (proxy video + audio mix)"),
                     ("Ctrl+P", "Full preview with audio in mpv/ffplay"),
+                    ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
                     ("I / O", "Set in / out point at playhead"),
                     ("S", "Split at playhead"),
                     ("Delete / Backspace", "Ripple delete selection"),
                     ("← / →", "Nudge playhead 0.1s (Shift = 1s)"),
                     ("[ / ]", "Select previous / next clip"),
+                    ("Drag", "Move items; snaps to cuts and the playhead, V1 clips reorder"),
+                    ("Ctrl+Click", "Mark items for grouping"),
+                    ("Ctrl+G / Ctrl+Shift+G", "Group marked items / ungroup"),
                     ("~", "Toggle magnetic timeline (V2/A1/T ride V1 edits)"),
+                    ("G", "Toggle safe-area guides (phone UI zones)"),
                     ("Home / End", "Jump to start / end"),
                     ("Ctrl+O", "Add clips"),
+                    ("Ctrl+Shift+O / Ctrl+S", "Open / save project"),
                     ("Ctrl+T", "Add title at playhead"),
                     ("Ctrl+E", "Export MP4"),
                     ("Ctrl+Q", "Quit"),
@@ -1875,48 +3287,83 @@ const APP_CSS: &str = r#"
 /* Width-driven: aspect-ratio height doesn't feed the flex column's intrinsic width
    in WebKit, so a flex-sized phone overflows the column. 400px ≈ vertical chrome. */
 .mr-phone { position: relative; flex: none; width: calc((100vh - 400px) * 9 / 16); min-width: 140px; max-height: 100%; aspect-ratio: 9 / 16; background: #000; border: 5px solid #060608; box-shadow: 0 0 0 1px var(--mor-border-light), 0 14px 40px rgba(0, 0, 0, 0.55), 0 0 70px color-mix(in srgb, var(--mor-accent) 7%, transparent); border-radius: 24px; overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--mor-text-muted); font-size: 13px; }
+.mr-phone > span { text-align: center; padding: 0 16px; }
 .mr-phone img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* Punch-hole speaker slit: the bezel reads as a phone at a glance. */
+.mr-phone::after { content: ""; position: absolute; top: 6px; left: 50%; transform: translateX(-50%); width: 22%; height: 5px; border-radius: 3px; background: #060608; box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.05); z-index: 2; pointer-events: none; }
+
+/* Safe-area guides: shaded bands where the phone app's own chrome sits over a
+   9:16 feed. Worst case across TikTok / Reels / Shorts, so clearing these
+   clears all three. Percentages are of the frame, so they hold at any preview
+   size. Non-interactive — it's a guide, not a mask. */
+.mr-safe { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+.mr-safe-zone { position: absolute; background: color-mix(in srgb, var(--mor-destructive) 15%, transparent); border: 1px dashed color-mix(in srgb, var(--mor-destructive) 55%, transparent); box-sizing: border-box; }
+.mr-safe-zone span { position: absolute; bottom: 2px; right: 4px; font-size: 8px; letter-spacing: 0.04em; text-transform: uppercase; color: color-mix(in srgb, var(--mor-destructive) 85%, white); text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); white-space: nowrap; }
+.mr-safe-top { top: 0; left: 0; right: 0; height: 8%; border-width: 0 0 1px 0; }
+.mr-safe-bottom { bottom: 0; left: 0; right: 0; height: 24%; border-width: 1px 0 0 0; }
+.mr-safe-bottom span { bottom: auto; top: 2px; }
+.mr-safe-rail { top: 8%; bottom: 24%; right: 0; width: 18%; border-width: 0 0 0 1px; }
 
 /* Pop-out monitor window: the phone alone, sized to the window. */
 .mr-monitor { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 14px; box-sizing: border-box; background: var(--mor-bg); }
 .mr-monitor .mr-phone { width: auto; height: 100%; max-width: 100%; min-width: 0; }
 
 .mr-scrub { width: 100%; }
+/* Deck counter: master timecode, the one loud piece of type. Amber at rest,
+   record-red while rolling — same code as the playhead. */
+.mr-deck { display: flex; justify-content: center; align-items: baseline; gap: 7px; margin-bottom: 4px; padding: 3px 12px 4px; background: #0a0a0d; border: 1px solid var(--mor-border); border-radius: 6px; font-size: 21px; color: var(--mor-accent); letter-spacing: 0.05em; text-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 40%, transparent); }
+.mr-deck.playing { color: var(--mor-destructive); text-shadow: 0 0 10px color-mix(in srgb, var(--mor-destructive) 45%, transparent); }
+.mr-deck-total { font-size: 12px; color: var(--mor-text-muted); text-shadow: none; letter-spacing: 0.03em; }
 .mr-play-row { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
 .mr-inspector { flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 12px; background: var(--mor-panel); border: 1px solid var(--mor-border); border-radius: var(--mor-radius); padding: 14px; overflow-y: auto; }
 .mr-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+/* Export is the ship-it action: gold, pushed to the toolbar's far edge. */
+.mr-toolbar .mr-export { margin-left: auto; color: var(--mor-warning); border-color: color-mix(in srgb, var(--mor-warning) 45%, transparent); }
+.mr-toolbar .mr-export:hover:not(:disabled) { border-color: var(--mor-warning); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-warning) 25%, transparent); }
 .mr-clip-info h3 { margin: 0 0 4px 0; font-size: 14px; overflow-wrap: anywhere; }
+.mr-clip-info .mr-ctx-tag { vertical-align: 2px; }
 .mr-clip-info p { margin: 0; font-size: 12px; }
 .mr-danger { color: var(--mor-destructive); }
 .mr-keys { margin-top: auto; font-size: 11px; }
 .mr-progress { height: 6px; background: var(--mor-border); border-radius: 3px; overflow: hidden; }
 .mr-progress > div { height: 100%; background: var(--mor-accent); transition: width 0.3s; }
 
-/* Timeline sits on the darkest surface — the bench under the work. */
-.mr-timeline { display: flex; overflow-x: auto; padding: 12px 10px 8px; background: var(--mor-header); border: 1px solid var(--mor-border); border-radius: var(--mor-radius); min-height: 216px; align-items: flex-start; flex: none; }
+/* Timeline sits on the darkest surface — the bench under the work.
+   overflow: scroll keeps both scrollbars visible, editor-style. */
+.mr-timeline { display: flex; overflow: scroll; padding: 12px 10px 8px; background: var(--mor-header); border: 1px solid var(--mor-border); border-radius: var(--mor-radius); min-height: 216px; max-height: 40vh; align-items: flex-start; flex: none; user-select: none; -webkit-user-select: none; }
 .mr-timeline-hint { align-self: center; margin: auto; }
 .mr-track { position: relative; flex: none; min-width: 100%; }
 
 /* Timecodes are instrument readouts: monospace, tabular. */
-.mr-tick, .mr-clip-dur, .mr-key { font-family: ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', monospace; font-variant-numeric: tabular-nums; }
+.mr-tick, .mr-clip-dur, .mr-key, .mr-ph-badge, .mr-deck { font-family: ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', monospace; font-variant-numeric: tabular-nums; }
 
-.mr-ruler { position: relative; height: 18px; margin-bottom: 6px; border-bottom: 1px solid var(--mor-border-light); cursor: pointer; }
-.mr-tick { position: absolute; top: 0; height: 100%; border-left: 1px solid var(--mor-border-light); padding-left: 3px; font-size: 9px; color: var(--mor-text-muted); pointer-events: none; }
+/* Ruler: instrument strip — labeled majors, quarter minors, drag to scrub. */
+.mr-ruler { position: relative; height: 22px; margin-bottom: 6px; border-bottom: 1px solid var(--mor-border-light); cursor: ew-resize; }
+.mr-tick { position: absolute; bottom: 0; height: 5px; border-left: 1px solid var(--mor-border); font-size: 9px; color: var(--mor-text-muted); pointer-events: none; white-space: nowrap; }
+.mr-tick.major { height: 15px; border-left-color: var(--mor-border-light); padding-left: 3px; }
 
 .mr-lane { position: relative; height: 30px; margin-bottom: 6px; background: rgba(127, 127, 127, 0.06); border-radius: 4px; }
 .mr-lane-tag { position: absolute; top: 4px; left: 4px; z-index: 2; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: var(--mor-accent); color: #141417; pointer-events: none; }
 .mr-lane-tag.title { background: var(--mor-warning); }
 .mr-lane-a1 .mr-lane-tag { background: var(--mor-success); }
+/* A1 is taller than the marker lanes so the waveform has room to read. */
+.mr-lane-a1 { height: 44px; }
 
-.mr-lane-item { position: absolute; top: 2px; bottom: 2px; box-sizing: border-box; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 10px; line-height: 22px; padding: 0 6px 0 30px; border-radius: 4px; border: 2px solid color-mix(in srgb, var(--mor-accent) 40%, transparent); background: color-mix(in srgb, var(--mor-accent) 24%, transparent); cursor: pointer; }
+.mr-lane-item { position: absolute; top: 2px; bottom: 2px; box-sizing: border-box; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 10px; line-height: 22px; padding: 0 6px 0 30px; border-radius: 4px; border: 2px solid color-mix(in srgb, var(--mor-accent) 40%, transparent); background: color-mix(in srgb, var(--mor-accent) 24%, transparent); cursor: grab; }
 .mr-lane-item.audio { border-color: color-mix(in srgb, var(--mor-success) 40%, transparent); background: color-mix(in srgb, var(--mor-success) 22%, transparent); }
 .mr-lane-item.title { border-color: color-mix(in srgb, var(--mor-warning) 45%, transparent); background: color-mix(in srgb, var(--mor-warning) 26%, transparent); }
 .mr-lane-item.selected { border-color: var(--mor-accent); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-accent) 35%, transparent); }
 .mr-lane-item.audio.selected { border-color: var(--mor-success); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-success) 35%, transparent); }
 .mr-lane-item.title.selected { border-color: var(--mor-warning); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-warning) 35%, transparent); }
 
-.mr-clips { position: relative; display: flex; margin-bottom: 6px; }
-.mr-clip { flex: none; box-sizing: border-box; overflow: hidden; cursor: pointer; border: 2px solid transparent; border-radius: 6px; padding: 3px; background: var(--mor-panel); display: flex; flex-direction: column; gap: 2px; transition: border-color 0.12s; }
+/* Ctrl+click marks (grouping candidates) and group membership dots. */
+.mr-lane-item.marked, .mr-clip.marked { outline: 2px dashed var(--mor-accent-hover); outline-offset: 1px; }
+.mr-group-dot { position: absolute; left: 3px; bottom: 3px; z-index: 2; width: 7px; height: 7px; border-radius: 50%; box-shadow: 0 0 3px rgba(0, 0, 0, 0.7); pointer-events: none; }
+
+/* V1 is the primary story: a faint tungsten bed sets it apart from the
+   attachment lanes (no horizontal padding — clip x must stay ruler-exact). */
+.mr-clips { position: relative; display: flex; margin-bottom: 6px; background: color-mix(in srgb, var(--mor-accent) 5%, transparent); border-radius: 6px; }
+.mr-clip { position: relative; flex: none; box-sizing: border-box; overflow: hidden; cursor: grab; border: 2px solid transparent; border-radius: 6px; padding: 3px; background: var(--mor-panel); display: flex; flex-direction: column; gap: 2px; transition: border-color 0.12s; }
 .mr-clip:hover { border-color: var(--mor-border-light); }
 .mr-clip.selected { border-color: var(--mor-accent); box-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 30%, transparent); }
 .mr-clip img, .mr-thumb-missing { width: 100%; height: 72px; object-fit: cover; border-radius: 4px; display: block; background: #000; }
@@ -1926,6 +3373,8 @@ const APP_CSS: &str = r#"
 /* Record-red playhead with a head cap — reads at a glance against amber/teal/gold. */
 .mr-playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--mor-destructive); box-shadow: 0 0 6px color-mix(in srgb, var(--mor-destructive) 60%, transparent); pointer-events: none; }
 .mr-playhead::before { content: ""; position: absolute; top: 0; left: -4px; border: 5px solid transparent; border-top: 6px solid var(--mor-destructive); }
+/* Timecode readout riding the playhead — the ruler's live counterpart. */
+.mr-ph-badge { position: absolute; top: 0; left: 5px; padding: 0 4px; border-radius: 3px; background: var(--mor-destructive); color: #fff; font-size: 9px; line-height: 14px; white-space: nowrap; }
 
 /* Right-click menu: the kit's dropdown chrome, summoned at the pointer.
    Header chip names the lane the actions apply to, same colors as the timeline. */
@@ -1940,6 +3389,27 @@ const APP_CSS: &str = r#"
 .mr-ctx .mor-menu-action.mr-danger { color: var(--mor-destructive); }
 .mr-ctx .mor-menu-action.mr-danger:hover:not(:disabled) { background-color: var(--mor-destructive); color: #fff; }
 
+/* Status-bar zoom: magnifier buttons flanking a compact slider. */
+.mr-zoom { display: inline-flex; gap: 4px; align-items: center; }
+.mr-zoom button { background: none; border: none; color: var(--mor-text-muted); font-size: 14px; line-height: 1; padding: 0 2px; cursor: pointer; }
+.mr-zoom button:hover { color: var(--mor-accent-hover); }
+.mr-zoom-slider { width: 90px; accent-color: var(--mor-accent); }
+
+/* Inspector tabs: Inspector | Effects. */
+.mr-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--mor-border); }
+.mr-tab { background: none; border: none; border-bottom: 2px solid transparent; color: var(--mor-text-muted); font-size: 12px; padding: 4px 12px; cursor: pointer; }
+.mr-tab:hover { color: var(--mor-text); }
+.mr-tab.active { color: var(--mor-text); border-bottom-color: var(--mor-accent); }
+
+/* Effects browser: poster-frame swatches of the selected clip per effect. */
+.mr-fx-cat { margin: 4px 0 0; font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--mor-text-muted); }
+.mr-fx-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; }
+.mr-fx-tile { padding: 3px; border: 2px solid transparent; border-radius: 6px; background: var(--mor-btn); cursor: pointer; display: flex; flex-direction: column; gap: 2px; align-items: center; color: var(--mor-text); font-size: 10px; }
+.mr-fx-tile:hover { border-color: var(--mor-border-light); }
+.mr-fx-tile.active { border-color: var(--mor-accent); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-accent) 30%, transparent); }
+.mr-fx-tile img, .mr-fx-ph { width: 100%; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 4px; background: #000; display: block; }
+.mr-fx-tile span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 .mr-shortcut-table { border-collapse: collapse; width: 100%; font-size: 13px; }
 .mr-shortcut-table td { padding: 4px 10px 4px 0; }
 .mr-key { color: var(--mor-accent-hover); white-space: nowrap; }
@@ -1948,6 +3418,9 @@ const APP_CSS: &str = r#"
     .mr-phone { flex: none; width: auto; height: 45vh; }
     .mr-inspector { min-width: 0; }
 }
+/* Keyboard focus is always visible — same amber the pointer states use. */
+.mr-root button:focus-visible, .mr-root input:focus-visible, .mr-fx-tile:focus-visible, .mr-tab:focus-visible { outline: 2px solid var(--mor-accent-hover); outline-offset: 2px; }
+
 @media (prefers-reduced-motion: reduce) {
     .mr-clip, .mr-progress > div { transition: none; }
 }
@@ -1966,8 +3439,13 @@ mod tests {
             out_s,
             has_audio: true,
             effect: "None".to_string(),
+            effect_amount: 1.0,
+            framing: "Crop".to_string(),
+            speed: 1.0,
+            volume: 1.0,
             thumb: String::new(),
             proxy: String::new(),
+            group: 0,
         }
     }
 
@@ -1994,6 +3472,14 @@ mod tests {
     }
 
     #[test]
+    fn caption_wrap_is_greedy_and_word_safe() {
+        assert_eq!(wrap_caption("one two three", 8), "one two\nthree");
+        assert_eq!(wrap_caption("short", 26), "short");
+        // a word longer than max gets its own line, never split
+        assert_eq!(wrap_caption("hi extraordinarily so", 6), "hi\nextraordinarily\nso");
+    }
+
+    #[test]
     fn magnet_delta_rides_v1_edits() {
         // two clips on the timeline: [0,2) and [2,5)
         let old = [(0.0, 2.0), (2.0, 5.0)];
@@ -2016,8 +3502,118 @@ mod tests {
     fn every_effect_has_a_filter_or_is_none() {
         assert_eq!(effect_filter("None"), "");
         assert_eq!(effect_filter("nonsense"), "");
-        for (name, filter) in EFFECTS.iter().skip(1) {
+        for (_, name, filter) in EFFECTS.iter().skip(1) {
             assert!(!filter.is_empty(), "effect {name} has no filter");
         }
+        // moranima camera-move ports are present
+        for port in ["Pulse zoom", "Drift", "Sway"] {
+            assert!(!effect_filter(port).is_empty(), "missing moranima port {port}");
+        }
+    }
+
+    #[test]
+    fn effect_strength_interpolates() {
+        // endpoints: full strength is byte-identical to the table, zero is off
+        for (_, name, filter) in EFFECTS {
+            assert_eq!(effect_filter_amt(name, 1.0), *filter, "{name} at full");
+            assert_eq!(effect_filter_amt(name, 0.0), "", "{name} at zero");
+        }
+        assert_eq!(effect_filter_amt("None", 0.5), "");
+        assert_eq!(effect_filter_amt("nonsense", 0.5), "");
+        // midpoints move toward identity, not a weaker copy of the string
+        assert_eq!(effect_filter_amt("B&W", 0.5), "hue=s=0.500");
+        assert_eq!(effect_filter_amt("Warm", 0.5), "colortemperature=5500");
+        assert!(effect_filter_amt("Sway", 0.5).contains("rotate=0.0175"));
+        assert!(effect_filter_amt("Drift", 0.5).contains("65+27.0*sin"));
+        // every mid-strength filter stays non-empty and export-shaped
+        for (_, name, _) in EFFECTS.iter().skip(1) {
+            assert!(!effect_filter_amt(name, 0.5).is_empty(), "{name} at half");
+        }
+    }
+
+    #[test]
+    fn speed_retimes_the_timeline() {
+        let mut c = clip(0.0, 4.0);
+        assert_eq!(c.trimmed(), 4.0);
+        c.speed = 2.0;
+        assert_eq!(c.trimmed(), 2.0); // 4 s of source in 2 s of reel
+        c.speed = 0.5;
+        assert_eq!(c.trimmed(), 8.0); // slow motion stretches it
+
+        // Timeline time maps back to source time through the rate: halfway
+        // through a 2x clip is halfway through its source.
+        let clips = [{
+            let mut c = clip(0.0, 4.0);
+            c.speed = 2.0;
+            c
+        }];
+        assert_eq!(locate(&clips, 0.0), Some((0, 0.0)));
+        assert_eq!(locate(&clips, 1.0), Some((0, 2.0)));
+        assert_eq!(locate(&clips, 2.0), Some((0, 4.0))); // clamped at the out point
+    }
+
+    #[test]
+    fn snap_pulls_only_within_tolerance() {
+        let targets = [0.0, 5.0, 12.0];
+        assert_eq!(snap_to(5.08, &targets, 0.1), 5.0); // inside tolerance
+        assert_eq!(snap_to(5.4, &targets, 0.1), 5.4); // outside: left alone
+        assert_eq!(snap_to(4.95, &targets, 0.1), 5.0);
+        // Ties go to the nearer target, not the first one listed.
+        assert_eq!(snap_to(11.0, &[10.0, 12.0], 2.0), 10.0);
+        assert_eq!(snap_to(11.5, &[10.0, 12.0], 2.0), 12.0);
+        assert_eq!(snap_to(3.0, &[], 1.0), 3.0); // nothing to snap to
+    }
+
+    #[test]
+    fn platform_limits_warn_only_when_over() {
+        assert_eq!(over_limits(30.0), None);
+        assert_eq!(over_limits(60.0), None); // exactly at the cap still fits
+        let w = over_limits(75.0).unwrap();
+        assert!(w.contains("Shorts") && !w.contains("Reels"), "{w}");
+        let w = over_limits(120.0).unwrap();
+        assert!(w.contains("Shorts") && w.contains("Reels") && !w.contains("TikTok"), "{w}");
+        assert!(over_limits(1200.0).unwrap().contains("TikTok"));
+    }
+
+    #[test]
+    fn project_round_trips_without_derived_data() {
+        let mut c = clip(1.0, 3.0);
+        c.speed = 1.5;
+        c.volume = 0.25;
+        c.thumb = "data:image/jpeg;base64,AAAA".to_string(); // derived, must not persist
+        c.proxy = "/cache/proxy.mp4".to_string();
+        let snap = Snapshot { clips: vec![c], overlays: vec![], audios: vec![], titles: vec![] };
+
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("base64"), "thumbnail leaked into the project file");
+        assert!(!json.contains("proxy.mp4"), "proxy path leaked into the project file");
+
+        let back: Snapshot = serde_json::from_str(&json).unwrap();
+        let r = &back.clips[0];
+        assert_eq!((r.in_s, r.out_s, r.speed, r.volume), (1.0, 3.0, 1.5, 0.25));
+        assert!(r.thumb.is_empty() && r.proxy.is_empty(), "derived data should reload empty");
+    }
+
+    #[test]
+    fn project_without_a_speed_field_loads_at_1x() {
+        // A file written before speed existed must not deserialize to 0.0 and
+        // divide the timeline by zero.
+        let json = r#"{"clips":[{"path":"a.mp4","name":"a","duration":5.0,"in_s":0.0,
+            "out_s":5.0,"has_audio":true,"effect":"None","effect_amount":1.0,
+            "framing":"Crop","group":0}],"overlays":[],"audios":[],"titles":[]}"#;
+        let snap: Snapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snap.clips[0].speed, 1.0);
+        assert_eq!(snap.clips[0].volume, 1.0);
+        assert_eq!(snap.clips[0].trimmed(), 5.0);
+    }
+
+    #[test]
+    fn block_map_reorders() {
+        // move clips [1,2] of 0..5 to the front: new order 1,2,0,3,4
+        assert_eq!((0..5).map(|k| block_map(k, 1, 2, 0)).collect::<Vec<_>>(), vec![2, 0, 1, 3, 4]);
+        // move clip [0] to the end: new order 1,2,3,4,0
+        assert_eq!((0..5).map(|k| block_map(k, 0, 1, 4)).collect::<Vec<_>>(), vec![4, 0, 1, 2, 3]);
+        // no-op move keeps identity
+        assert_eq!((0..4).map(|k| block_map(k, 1, 2, 1)).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
     }
 }
