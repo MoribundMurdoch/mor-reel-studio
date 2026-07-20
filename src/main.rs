@@ -135,8 +135,23 @@ const TITLE_POS: &[(&str, f64)] = &[("Top", 0.10), ("Middle", 0.45), ("Lower thi
 /// Fontconfig generic families — resolve everywhere without bundling fonts.
 const TITLE_FONTS: &[&str] = &["Sans", "Serif", "Mono"];
 
-/// Bevel styles from the mor_cameo_emboss plugin: cameo = raised, intaglio = sunken.
-const BEVELS: &[&str] = &["Off", "Cameo", "Intaglio"];
+/// Bevel styles from the mor_cameo_emboss plugin. The stored value keeps the
+/// cameo/intaglio lineage; the label says what it actually looks like, the way
+/// the designer app words it — "raised" and "sunken" mean something to someone
+/// who has never cut a seal.
+const BEVELS: &[(&str, &str)] = &[
+    ("Off", "Off"),
+    ("Cameo", "Raised — stands off the video"),
+    ("Intaglio", "Sunken — carved into it"),
+];
+
+fn bevel_label(value: &str) -> String {
+    BEVELS.iter().find(|(v, _)| *v == value).map_or("Off", |(_, l)| l).to_string()
+}
+
+fn bevel_value(label: &str) -> String {
+    BEVELS.iter().find(|(_, l)| *l == label).map_or("Off", |(v, _)| v).to_string()
+}
 
 /// How a source fills 9:16 — mostly for landscape imports. Crop covers and
 /// center-crops, Fit letterboxes on black, Zoom punches in 1.5× then crops.
@@ -202,17 +217,7 @@ fn wrap_caption(text: &str, max: usize) -> String {
 
 /// Rasterize a title card from its item's params.
 async fn render_one(t: &TitleItem) -> Result<String, String> {
-    engine::render_title(
-        &t.text,
-        t.font_size as u32,
-        title_color(&t.color),
-        title_y(&t.pos),
-        &t.bevel,
-        t.bevel_size as u32,
-        &t.font,
-        t.boxed,
-    )
-    .await
+    engine::render_title(&t.style()).await
 }
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -229,6 +234,25 @@ struct TitleItem {
     font: String,
     /// Semi-opaque backdrop box behind the text (caption legibility).
     boxed: bool,
+    /// Outline width in px, 0 = none — legibility without an opaque plate.
+    #[serde(default)]
+    outline: f64,
+    #[serde(default = "black")]
+    outline_color: String,
+    /// The rest of the bevel's own controls. Defaults match the designer app
+    /// this bevel came from, so an older project loads looking as it did.
+    #[serde(default = "bevel_soften")]
+    soften: f64,
+    #[serde(default = "bevel_depth")]
+    depth: f64,
+    #[serde(default = "bevel_angle")]
+    angle: f64,
+    #[serde(default = "bevel_altitude")]
+    altitude: f64,
+    #[serde(default = "bevel_opacity")]
+    hi_opacity: f64,
+    #[serde(default = "bevel_opacity")]
+    sh_opacity: f64,
     /// Made by Auto captions — lets "Remove captions" clear them in bulk.
     caption: bool,
     /// Rendered PNG path; empty while a render is in flight.
@@ -236,6 +260,71 @@ struct TitleItem {
     png: String,
     /// Drag-together group id; 0 = ungrouped.
     group: usize,
+}
+
+/// The palette name, not the CSS colour — `title_color` looks these up by
+/// display name and falls back to white on a miss.
+fn black() -> String {
+    "Black".to_string()
+}
+fn bevel_soften() -> f64 {
+    4.0
+}
+fn bevel_depth() -> f64 {
+    100.0
+}
+fn bevel_angle() -> f64 {
+    120.0
+}
+fn bevel_altitude() -> f64 {
+    30.0
+}
+fn bevel_opacity() -> f64 {
+    0.75
+}
+
+/// One row of the bevel panel: label, current value, max, step, and how to
+/// write it back. A table beats seven near-identical slider blocks, and the
+/// ranges are the designer app's.
+type BevelKnob = (&'static str, f64, f64, f64, fn(&mut TitleItem, f64));
+
+fn bevel_knobs(t: &TitleItem) -> Vec<BevelKnob> {
+    let set_size: fn(&mut TitleItem, f64) = |i, v| i.bevel_size = v;
+    vec![
+        ("Size", t.bevel_size, 100.0, 1.0, set_size),
+        ("Softness", t.soften, 100.0, 1.0, |i, v| i.soften = v),
+        ("Depth", t.depth, 100.0, 1.0, |i, v| i.depth = v),
+        ("Light angle", t.angle, 360.0, 5.0, |i, v| i.angle = v),
+        ("Light height", t.altitude, 90.0, 5.0, |i, v| i.altitude = v),
+        ("Highlight strength", t.hi_opacity, 1.0, 0.05, |i, v| i.hi_opacity = v),
+        ("Shadow strength", t.sh_opacity, 1.0, 0.05, |i, v| i.sh_opacity = v),
+    ]
+}
+
+impl TitleItem {
+    /// Map the timeline item onto the engine's render parameters. The item
+    /// stores friendly choices (a colour name, a position name); the style
+    /// stores what ffmpeg and the bevel actually need.
+    fn style(&self) -> engine::TitleStyle {
+        engine::TitleStyle {
+            text: self.text.clone(),
+            font_size: self.font_size as u32,
+            color: title_color(&self.color).to_string(),
+            y_frac: title_y(&self.pos),
+            font: self.font.clone(),
+            outline: self.outline,
+            outline_color: title_color(&self.outline_color).to_string(),
+            boxed: self.boxed,
+            bevel: self.bevel.clone(),
+            bevel_size: self.bevel_size,
+            soften: self.soften,
+            depth: self.depth,
+            angle: self.angle,
+            altitude: self.altitude,
+            hi_opacity: self.hi_opacity,
+            sh_opacity: self.sh_opacity,
+        }
+    }
 }
 
 /// The export fade's opacity at global time `t`, for the scrub preview.
@@ -1254,9 +1343,19 @@ fn Editor() -> Element {
             color: "White".to_string(),
             pos: "Middle".to_string(),
             bevel: "Cameo".to_string(),
-            bevel_size: 10.0,
+            bevel_size: 21.0,
             font: "Sans".to_string(),
+            // Transparent by default: the video shows through, and the relief
+            // plus an outline carry legibility without an opaque plate.
             boxed: false,
+            outline: 4.0,
+            outline_color: "Black".to_string(),
+            soften: 4.0,
+            depth: 100.0,
+            angle: 120.0,
+            altitude: 30.0,
+            hi_opacity: 0.75,
+            sh_opacity: 0.75,
             caption: false,
             png: String::new(),
             group: 0,
@@ -1553,9 +1652,17 @@ fn Editor() -> Element {
                                 color: "White".to_string(),
                                 pos: "Lower third".to_string(),
                                 bevel: "Off".to_string(),
-                                bevel_size: 10.0,
+                                bevel_size: 21.0,
                                 font: "Sans".to_string(),
                                 boxed: true, // backdrop keeps captions readable over busy video
+                                outline: 0.0,
+                                outline_color: "Black".to_string(),
+                                soften: 4.0,
+                                depth: 100.0,
+                                angle: 120.0,
+                                altitude: 30.0,
+                                hi_opacity: 0.75,
+                                sh_opacity: 0.75,
                                 caption: true,
                                 png: String::new(),
                                 group: 0,
@@ -2652,8 +2759,8 @@ fn Editor() -> Element {
                                     }
                                     MorSelect {
                                         label: "Backdrop".to_string(),
-                                        value: if t.boxed { "Box".to_string() } else { "None".to_string() },
-                                        options: vec!["None".to_string(), "Box".to_string()],
+                                        value: if t.boxed { "Box".to_string() } else { "Transparent".to_string() },
+                                        options: vec!["Transparent".to_string(), "Box".to_string()],
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.boxed = v == "Box";
@@ -2661,6 +2768,37 @@ fn Editor() -> Element {
                                             }
                                             rerender_title(k);
                                         },
+                                    }
+                                    // An outline is the transparent-friendly way to stay
+                                    // legible over busy video — no plate needed.
+                                    Slider {
+                                        label: Some("Outline"),
+                                        min: 0.0,
+                                        max: 20.0,
+                                        step: 1.0,
+                                        precision: 0,
+                                        value: t.outline,
+                                        oninput: Some(EventHandler::new(move |v: f64| {
+                                            if let Some(item) = titles.write().get_mut(k) {
+                                                item.outline = v;
+                                                item.png.clear();
+                                            }
+                                            rerender_title(k);
+                                        })),
+                                    }
+                                    if t.outline > 0.0 {
+                                        MorSelect {
+                                            label: "Outline colour".to_string(),
+                                            value: t.outline_color.clone(),
+                                            options: TITLE_COLORS.iter().map(|(n, _)| n.to_string()).collect::<Vec<_>>(),
+                                            onchange: move |v: String| {
+                                                if let Some(item) = titles.write().get_mut(k) {
+                                                    item.outline_color = v;
+                                                    item.png.clear();
+                                                }
+                                                rerender_title(k);
+                                            },
+                                        }
                                     }
                                     MorSelect {
                                         label: "Position".to_string(),
@@ -2675,32 +2813,39 @@ fn Editor() -> Element {
                                         },
                                     }
                                     MorSelect {
-                                        label: "Bevel (cameo emboss)".to_string(),
-                                        value: t.bevel.clone(),
-                                        options: BEVELS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                                        label: "Bevel".to_string(),
+                                        value: bevel_label(&t.bevel),
+                                        options: BEVELS.iter().map(|(_, l)| l.to_string()).collect::<Vec<_>>(),
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
-                                                item.bevel = v;
+                                                item.bevel = bevel_value(&v);
                                                 item.png.clear();
                                             }
                                             rerender_title(k);
                                         },
                                     }
                                     if t.bevel != "Off" {
-                                        Slider {
-                                            label: Some("Bevel size"),
-                                            min: 2.0,
-                                            max: 30.0,
-                                            step: 1.0,
-                                            precision: 0,
-                                            value: t.bevel_size,
-                                            oninput: Some(EventHandler::new(move |v: f64| {
-                                                if let Some(item) = titles.write().get_mut(k) {
-                                                    item.bevel_size = v;
-                                                    item.png.clear();
-                                                }
-                                                rerender_title(k);
-                                            })),
+                                        // The designer app's full control set, same
+                                        // ranges and same plain-English labels. Only
+                                        // shown once a bevel is actually on.
+                                        h4 { class: "mr-fx-cat", "Bevel — light and relief" }
+                                        for (label, value, max, step, set) in bevel_knobs(&t) {
+                                            Slider {
+                                                key: "{label}",
+                                                label: Some(label),
+                                                min: 0.0,
+                                                max,
+                                                step,
+                                                precision: if step < 1.0 { 2 } else { 0 },
+                                                value,
+                                                oninput: Some(EventHandler::new(move |v: f64| {
+                                                    if let Some(item) = titles.write().get_mut(k) {
+                                                        set(item, v);
+                                                        item.png.clear();
+                                                    }
+                                                    rerender_title(k);
+                                                })),
+                                            }
                                         }
                                     }
                                     div { class: "mr-toolbar",
@@ -3689,6 +3834,56 @@ mod tests {
         assert_eq!(snap.clips[0].speed, 1.0);
         assert_eq!(snap.clips[0].volume, 1.0);
         assert_eq!(snap.clips[0].trimmed(), 5.0);
+    }
+
+    /// A title as an older project file would have stored it — before outline
+    /// and the extra bevel knobs existed.
+    fn legacy_title_json() -> &'static str {
+        r#"{"text":"Hi","at":0.0,"dur":3.0,"font_size":110.0,"color":"White",
+            "pos":"Middle","bevel":"Cameo","bevel_size":21.0,"font":"Sans",
+            "boxed":false,"caption":false,"group":0}"#
+    }
+
+    #[test]
+    fn bevel_labels_round_trip() {
+        for (value, label) in BEVELS {
+            assert_eq!(bevel_label(value), *label);
+            assert_eq!(bevel_value(label), *value);
+        }
+        // Anything unrecognised falls back to Off rather than a broken render.
+        assert_eq!(bevel_value("nonsense"), "Off");
+        assert_eq!(bevel_label("nonsense"), "Off");
+    }
+
+    #[test]
+    fn bevel_knob_table_writes_each_field_once() {
+        let mut t: TitleItem = serde_json::from_str(legacy_title_json()).unwrap();
+        // Every setter must land on its own field — a table of seven near
+        // identical rows is exactly where a copy-paste lands on the wrong one.
+        for (i, (_, _, _, _, set)) in bevel_knobs(&t).into_iter().enumerate() {
+            set(&mut t, i as f64 + 1.0);
+        }
+        assert_eq!(
+            (t.bevel_size, t.soften, t.depth, t.angle, t.altitude, t.hi_opacity, t.sh_opacity),
+            (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)
+        );
+        assert_eq!(bevel_knobs(&t).len(), 7, "the bevel panel lost a control");
+    }
+
+    #[test]
+    fn older_titles_load_transparent_with_the_designer_defaults() {
+        let t: TitleItem = serde_json::from_str(legacy_title_json()).unwrap();
+        assert_eq!(t.outline, 0.0);
+        assert_eq!(t.outline_color, "Black");
+        assert_eq!((t.soften, t.depth, t.angle, t.altitude), (4.0, 100.0, 120.0, 30.0));
+        assert_eq!((t.hi_opacity, t.sh_opacity), (0.75, 0.75));
+
+        // The item's friendly choices map onto what ffmpeg and the bevel need.
+        let s = t.style();
+        assert_eq!((s.color.as_str(), s.outline_color.as_str()), ("white", "black"));
+        assert_eq!(s.bevel, "Cameo");
+        assert!((s.y_frac - 0.45).abs() < 1e-9);
+        assert!(!s.boxed, "a title is transparent unless a backdrop is asked for");
     }
 
     #[test]

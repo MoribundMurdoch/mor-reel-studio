@@ -17,8 +17,12 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   as long as you hold it, so the Motion effects become camera moves over a
   still. Same lanes, same effects, same export.
 - **V2 overlay track** — full-frame B-roll cutaways; main audio keeps playing.
-- **T title track** — drawtext-rasterized title cards with an optional
-  **cameo/intaglio bevel** (the Krita-derived mor_cameo_emboss algorithm).
+- **T title track** — drawtext-rasterized title cards on a transparent canvas,
+  with an optional outline and a **cameo/intaglio bevel** (the Krita-derived
+  mor_cameo_emboss algorithm). The bevel exposes the same controls as
+  [wearable-dictionary-designer](../wearable-dictionary-designer), which is
+  where it came from: size, softness, depth, light angle and height, and
+  highlight/shadow strength.
 - **A1 audio track** — music/VO mixed under with per-item trim and volume.
 - **Effects** — B&W, Sepia, Warm, Cool, Punch, Dreamy, Vignette, and the
   Motion set (Slow/Pulse zoom, Drift, Sway) ported from

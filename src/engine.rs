@@ -130,22 +130,108 @@ pub fn title_fade(dur: f64) -> f64 {
     (dur / 3.0).min(0.3)
 }
 
+/// Everything that decides what a title card looks like. One struct so the
+/// content-addressed cache can hash it wholesale and adding a knob doesn't grow
+/// `render_title`'s argument list.
+///
+/// The bevel half mirrors the control set (and the defaults) of
+/// wearable-dictionary-designer, which is where this bevel came from — there
+/// only `size` and the raised/sunken flip were ever exposed here, and the rest
+/// of the look was nailed shut at values nobody chose.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TitleStyle {
+    pub text: String,
+    pub font_size: u32,
+    pub color: String,
+    /// Vertical placement as a fraction of the free space; 0 = top.
+    pub y_frac: f64,
+    /// fontconfig family ("Sans", "Serif", "Mono"); "" = drawtext default.
+    pub font: String,
+    /// Outline width in px, 0 = none. Carries legibility over busy video
+    /// without the opaque plate a backdrop box needs.
+    pub outline: f64,
+    pub outline_color: String,
+    /// Semi-opaque backdrop box behind the text.
+    pub boxed: bool,
+    /// "Off" | "Cameo" (raised) | "Intaglio" (sunken).
+    pub bevel: String,
+    pub bevel_size: f64,
+    pub soften: f64,
+    pub depth: f64,
+    pub angle: f64,
+    pub altitude: f64,
+    pub hi_opacity: f64,
+    pub sh_opacity: f64,
+}
+
+impl Default for TitleStyle {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            font_size: 110,
+            color: "white".into(),
+            y_frac: 0.45,
+            font: "Sans".into(),
+            outline: 0.0,
+            outline_color: "black".into(),
+            boxed: false,
+            bevel: "Off".into(),
+            // The designer app's own bevel defaults, so a card struck here and
+            // a card struck there look like the same tool made them.
+            bevel_size: 21.0,
+            // The designer app defaults this to 0, which is right for the traced
+            // artwork it bevels. drawtext glyphs have antialiased diagonals that
+            // stair-step in the distance transform, and at 0 the relief combs
+            // into visible hatching along them; 4 is where that disappears.
+            soften: 4.0,
+            depth: 100.0,
+            angle: 120.0,
+            altitude: 30.0,
+            hi_opacity: 0.75,
+            sh_opacity: 0.75,
+        }
+    }
+}
+
+/// Hand-written because f64 isn't Hash: the float knobs go in by bit pattern,
+/// which is exactly the identity the cache wants.
+impl std::hash::Hash for TitleStyle {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.text.hash(h);
+        self.font_size.hash(h);
+        self.color.hash(h);
+        self.font.hash(h);
+        self.outline_color.hash(h);
+        self.boxed.hash(h);
+        self.bevel.hash(h);
+        for f in [
+            self.y_frac,
+            self.outline,
+            self.bevel_size,
+            self.soften,
+            self.depth,
+            self.angle,
+            self.altitude,
+            self.hi_opacity,
+            self.sh_opacity,
+        ] {
+            f.to_bits().hash(h);
+        }
+    }
+}
+
 /// Rasterize a title card: ffmpeg drawtext onto a transparent canvas, then an
 /// optional cameo/intaglio bevel (the mor_cameo_emboss algorithm) baked in.
 /// Content-addressed in the cache, so identical params never re-render.
-pub async fn render_title(
-    text: &str,
-    font_size: u32,
-    color: &str,
-    y_frac: f64,
-    bevel: &str, // "Off" | "Cameo" | "Intaglio"
-    bevel_size: u32,
-    font: &str,  // fontconfig family ("Sans", "Serif", "Mono"); "" = drawtext default
-    boxed: bool, // semi-opaque backdrop box (caption legibility over busy video)
-) -> Result<String, String> {
+pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
     use std::hash::{Hash, Hasher};
+    // Bump when the rendering changes, so cards cached by an older build are
+    // re-rendered instead of served stale. v3: transparent canvas, outline,
+    // full bevel parameter set, designer composite order.
+    const CACHE_VER: u32 = 3;
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (text, font_size, color, (y_frac * 1000.0) as u64, bevel, bevel_size, font, boxed).hash(&mut h);
+    CACHE_VER.hash(&mut h);
+    s.hash(&mut h);
     let dir = cache_dir("titles");
     let png = dir.join(format!("{:016x}.png", h.finish()));
     if png.exists() {
@@ -155,19 +241,33 @@ pub async fn render_title(
 
     // textfile= sidesteps drawtext's escaping rules entirely.
     let txt = png.with_extension("txt");
-    std::fs::write(&txt, text).map_err(|e| e.to_string())?;
-    // A backdrop box carries legibility on its own; otherwise plain titles get
-    // a drop shadow and beveled ones carry their own relief.
-    let shadow = if bevel == "Off" && !boxed { ":shadowcolor=black@0.5:shadowx=3:shadowy=3" } else { "" };
-    let boxp = if boxed { ":box=1:boxcolor=black@0.45:boxborderw=18" } else { "" };
-    let fontp = if font.is_empty() { String::new() } else { format!(":font='{font}'") };
+    std::fs::write(&txt, &s.text).map_err(|e| e.to_string())?;
+    // Anything that already carries legibility — a backdrop box, an outline,
+    // the bevel's own relief — makes the drop shadow redundant.
+    let plain = s.bevel == "Off" && !s.boxed && s.outline <= 0.0;
+    let shadow = if plain { ":shadowcolor=black@0.5:shadowx=3:shadowy=3" } else { "" };
+    let boxp = if s.boxed { ":box=1:boxcolor=black@0.45:boxborderw=18" } else { "" };
+    let border = if s.outline > 0.0 {
+        format!(":borderw={:.0}:bordercolor={}", s.outline, s.outline_color)
+    } else {
+        String::new()
+    };
+    let fontp = if s.font.is_empty() { String::new() } else { format!(":font='{}'", s.font) };
     let vf = format!(
-        "format=rgba,drawtext=textfile={}{fontp}:fontsize={font_size}:fontcolor={color}\
-         :x=(w-text_w)/2:y=(h-text_h)*{y_frac:.3}{shadow}{boxp}",
-        txt.display()
+        "drawtext=textfile={}{fontp}:fontsize={}:fontcolor={}\
+         :x=(w-text_w)/2:y=(h-text_h)*{:.3}{shadow}{boxp}{border}",
+        txt.display(),
+        s.font_size,
+        s.color,
+        s.y_frac
     );
     let out = Command::new("ffmpeg")
-        .args(["-y", "-v", "error", "-f", "lavfi", "-i", &format!("color=c=black@0.0:s={W}x{H}")])
+        // format=rgba has to be part of the *input* chain. Left to itself the
+        // lavfi color source negotiates an opaque pixel format, the @0.0 alpha
+        // is thrown away, and a later format=rgba refills alpha at 255 — which
+        // turns every title card into a black rectangle over the whole frame.
+        .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+        .arg(format!("color=c=black@0.0:s={W}x{H},format=rgba"))
         .args(["-vf", &vf, "-frames:v", "1", "-pix_fmt", "rgba"])
         .arg(&png)
         .stdin(Stdio::null())
@@ -179,7 +279,7 @@ pub async fn render_title(
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
 
-    if bevel != "Off" {
+    if s.bevel != "Off" {
         let img = image::open(&png).map_err(|e| e.to_string())?;
         let mut rgba = img.to_rgba8();
         let (w, h_px) = rgba.dimensions();
@@ -188,24 +288,27 @@ pub async fn render_title(
             w,
             h_px,
             &crate::bevel::BevelParams {
-                size: bevel_size.max(1),
-                soften: 2,
-                angle: 120.0,
-                altitude: 30.0,
-                depth: 60,
-                hi_opacity: 0.8,
-                sh_opacity: 0.7,
-                cameo: bevel == "Cameo",
+                size: s.bevel_size.max(1.0) as u32,
+                soften: s.soften.max(0.0) as u32,
+                angle: s.angle as f32,
+                altitude: s.altitude as f32,
+                depth: s.depth.max(1.0) as u32,
+                hi_opacity: s.hi_opacity as f32,
+                sh_opacity: s.sh_opacity as f32,
+                cameo: s.bevel == "Cameo",
             },
         );
-        // Screen the white highlight over the text, multiply the black shadow.
+        // Shadow first (multiply the black buffer), highlight second (screen the
+        // white one) — the layer order the designer app composites in, so the
+        // highlight is never dimmed by a shadow pass applied after it.
+        // Alpha is untouched: the bevel shades the glyphs, it never grows them.
         let buf = rgba.as_mut();
         for i in 0..(w * h_px) as usize {
             let hi_a = result.hi_rgba[i * 4 + 3] as f32 / 255.0;
             let sh_a = result.sh_rgba[i * 4 + 3] as f32 / 255.0;
             for c in 0..3 {
-                let v = buf[i * 4 + c] as f32;
-                buf[i * 4 + c] = ((v + hi_a * (255.0 - v)) * (1.0 - sh_a)) as u8;
+                let shadowed = buf[i * 4 + c] as f32 * (1.0 - sh_a);
+                buf[i * 4 + c] = (shadowed + hi_a * (255.0 - shadowed)) as u8;
             }
         }
         rgba.save(&png).map_err(|e| e.to_string())?;
@@ -1025,6 +1128,110 @@ mod tests {
         assert!((secs - 2.0).abs() < 0.25, "4 s at 2x should be ~2 s, got {secs}");
     }
 
+    // A title card is composited over video, so everything that is not glyph
+    // has to be genuinely transparent. An opaque canvas blacks out the frame
+    // for the title's whole duration, and it also feeds the bevel a mask that
+    // covers the entire card, so the relief lands on the frame border instead
+    // of on the letters.
+    #[tokio::test]
+    async fn title_card_is_transparent_outside_the_glyphs() {
+        let png = render_title(&TitleStyle { text: "Hi".into(), font_size: 120, ..Default::default() }).await.unwrap();
+        let img = image::open(&png).unwrap().to_rgba8();
+        let (w, h) = img.dimensions();
+        for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            assert_eq!(img.get_pixel(x, y).0[3], 0, "corner ({x},{y}) is not transparent");
+        }
+        let opaque = img.pixels().filter(|p| p.0[3] > 250).count();
+        assert!(opaque > 0, "nothing was drawn at all");
+        assert!(
+            (opaque as f64) < 0.2 * (w * h) as f64,
+            "two glyphs should cover a sliver of the card, not {opaque} px"
+        );
+
+        // The bevel composite writes RGB and must leave alpha alone.
+        let png = render_title(&TitleStyle { text: "Hi".into(), font_size: 120, bevel: "Cameo".into(), ..Default::default() }).await.unwrap();
+        let img = image::open(&png).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(0, 0).0[3], 0, "beveled card lost its transparency");
+        assert!(
+            img.pixels().filter(|p| p.0[3] > 250).count() < (0.2 * (w * h) as f64) as usize,
+            "beveled card went opaque"
+        );
+
+        // A boxed caption is opaque behind its text by design, but the rest of
+        // the frame still has to show the video through.
+        let png = render_title(&TitleStyle { text: "Hi".into(), font_size: 64, y_frac: 0.72, boxed: true, ..Default::default() }).await.unwrap();
+        let img = image::open(&png).unwrap().to_rgba8();
+        assert_eq!(img.get_pixel(0, 0).0[3], 0, "boxed card is opaque at the corner");
+    }
+
+    // The bevel shades the letters; it must never reshape them, and every knob
+    // the inspector now exposes has to actually reach the renderer.
+    #[tokio::test]
+    async fn bevel_shades_glyphs_and_every_knob_bites() {
+        let base = TitleStyle { text: "MM".into(), font_size: 200, ..Default::default() };
+        let load = |p: String| image::open(p).unwrap().to_rgba8();
+        let plain = load(render_title(&base).await.unwrap());
+        let raised =
+            load(render_title(&TitleStyle { bevel: "Cameo".into(), ..base.clone() }).await.unwrap());
+        let sunken = load(
+            render_title(&TitleStyle { bevel: "Intaglio".into(), ..base.clone() }).await.unwrap(),
+        );
+
+        // Shading only, never reshaping: raised and sunken run the same drawtext
+        // through the same bevel with one sign flipped, so their alpha must be
+        // byte-identical. (A bevel-off card is not comparable here — it also
+        // gets the drop shadow that relief makes redundant.)
+        let coverage = |i: &image::RgbaImage| i.pixels().map(|p| p.0[3] as u64).sum::<u64>();
+        assert_eq!(coverage(&raised), coverage(&sunken), "bevel altered the glyph shape");
+
+        // The point of the thing: white text comes out flat white, and a bevel
+        // has to leave a range of light across the glyph. A bevel computed from
+        // the wrong mask shades every letter uniformly and this spread stays 0.
+        let spread = |i: &image::RgbaImage| {
+            // Fully opaque only: antialiased edges blend text with the drop
+            // shadow and would show a spread that is not the bevel's doing.
+            let v: Vec<u8> = i.pixels().filter(|p| p.0[3] == 255).map(|p| p.0[0]).collect();
+            v.iter().max().unwrap() - v.iter().min().unwrap()
+        };
+        assert!(spread(&plain) <= 2, "unbevelled white text should be flat, got {}", spread(&plain));
+        assert!(spread(&raised) > 20, "raised bevel left the glyphs unshaded");
+        assert!(spread(&sunken) > 20, "sunken bevel left the glyphs unshaded");
+        // Raised vs sunken is a sign flip on the normals, so they cannot match.
+        assert_ne!(raised.as_raw(), sunken.as_raw(), "raised and sunken render identically");
+
+        for (what, tweak) in [
+            ("size", TitleStyle { bevel_size: 60.0, ..base.clone() }),
+            ("softness", TitleStyle { soften: 6.0, ..base.clone() }),
+            ("depth", TitleStyle { depth: 20.0, ..base.clone() }),
+            ("light angle", TitleStyle { angle: 300.0, ..base.clone() }),
+            ("light height", TitleStyle { altitude: 80.0, ..base.clone() }),
+            ("highlight strength", TitleStyle { hi_opacity: 0.1, ..base.clone() }),
+            ("shadow strength", TitleStyle { sh_opacity: 0.1, ..base.clone() }),
+        ] {
+            let png = render_title(&TitleStyle { bevel: "Cameo".into(), ..tweak }).await.unwrap();
+            assert_ne!(load(png).as_raw(), raised.as_raw(), "the {what} knob had no effect");
+        }
+    }
+
+    #[tokio::test]
+    async fn outline_thickens_the_text_without_a_backdrop() {
+        let base = TitleStyle { text: "Hi".into(), font_size: 120, ..Default::default() };
+        let load = |p: String| image::open(p).unwrap().to_rgba8();
+        let bare = load(render_title(&base).await.unwrap());
+        let outlined = load(
+            render_title(&TitleStyle { outline: 8.0, outline_color: "black".into(), ..base })
+                .await
+                .unwrap(),
+        );
+        let painted = |i: &image::RgbaImage| i.pixels().filter(|p| p.0[3] > 200).count();
+        assert!(
+            painted(&outlined) > painted(&bare),
+            "an outline should cover more of the card than bare text"
+        );
+        // Still a transparent card — an outline is not a backdrop.
+        assert_eq!(outlined.get_pixel(0, 0).0[3], 0, "outline made the card opaque");
+    }
+
     #[test]
     fn still_classification() {
         for p in ["a.png", "A.JPG", "/x/y/photo.jpeg", "shot.webp", "s.TIFF", "b.bmp"] {
@@ -1113,7 +1320,7 @@ mod tests {
 
         // Effect + title together: the clock shift must not desync the overlay,
         // so the composite has to differ from the same frame without a title.
-        let title = render_title("Hi", 90, "white", 0.45, "Off", 8, "Sans", false).await.unwrap();
+        let title = render_title(&TitleStyle { text: "Hi".into(), font_size: 90, ..Default::default() }).await.unwrap();
         let composed = frame_data_uri(&png, 2.5, 108, 192, "Crop", sway, Some((&title, 1.0)))
             .await
             .unwrap();
@@ -1199,12 +1406,12 @@ mod tests {
         let overlays = [OverlaySpec { path: b, in_s: 0.0, out_s: 0.5, at: 0.2, effect: "vignette".into(), ..Default::default() }];
         let audio = [AudioSpec { path: a, in_s: 0.0, out_s: 1.0, at: 0.5, volume: 0.6 }];
         // a beveled title card over the first second
-        let png = render_title("MorReel", 120, "white", 0.45, "Cameo", 8, "Sans", false).await.unwrap();
+        let png = render_title(&TitleStyle { text: "MorReel".into(), font_size: 120, bevel: "Cameo".into(), ..Default::default() }).await.unwrap();
         assert!(std::fs::metadata(&png).unwrap().len() > 0);
         // second call must be a cache hit
-        assert_eq!(render_title("MorReel", 120, "white", 0.45, "Cameo", 8, "Sans", false).await.unwrap(), png);
+        assert_eq!(render_title(&TitleStyle { text: "MorReel".into(), font_size: 120, bevel: "Cameo".into(), ..Default::default() }).await.unwrap(), png);
         // a boxed caption is a distinct render (backdrop baked in)
-        let boxed = render_title("MorReel", 120, "white", 0.45, "Off", 8, "Sans", true).await.unwrap();
+        let boxed = render_title(&TitleStyle { text: "MorReel".into(), font_size: 120, boxed: true, ..Default::default() }).await.unwrap();
         assert_ne!(boxed, png);
         assert!(std::fs::metadata(&boxed).unwrap().len() > 0);
         let titles = [TitleSpec { png, at: 0.0, dur: 1.0 }];
@@ -1234,3 +1441,5 @@ mod tests {
         assert_eq!(dims.trim(), "1080,1920");
     }
 }
+
+
