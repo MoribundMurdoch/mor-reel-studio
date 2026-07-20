@@ -37,6 +37,11 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   so a transform survives an export at a different size, and an untouched clip
   adds no filter at all. On V2 it composites, so scaling a cutaway below 1
   makes it a **picture-in-picture** with V1 showing through around it.
+- **Transitions** — cross dissolve, dip to black/white, slide, wipe, circle or
+  dissolve between V1 clips, with an adjustable length. A transition overlaps
+  the two clips it joins, so the reel gets shorter by exactly its length and
+  everything downstream moves with it — and scrubbing one shows the blend, not
+  a cut, because the monitor composites it the same way the export does.
 - **V2 overlay track** — B-roll cutaways with their own speed and transform;
   main audio keeps playing underneath.
 - **T title track** — drawtext-rasterized title cards on a transparent canvas,

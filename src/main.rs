@@ -449,6 +449,12 @@ struct Clip {
     /// Gain on this clip's own audio; 0.0 mutes it.
     #[serde(default = "unity")]
     volume: f64,
+    /// Transition *into* this clip. Stored on the incoming clip so it survives
+    /// reordering, and ignored on the first clip — nothing precedes it.
+    #[serde(default = "none_label")]
+    transition: String,
+    #[serde(default = "half")]
+    trans_dur: f64,
     #[serde(skip)]
     thumb: String,
     /// Full-source waveform data URI for this clip's own audio; empty until the
@@ -473,6 +479,8 @@ impl Clip {
             framing: self.framing.clone(),
             speed: self.speed,
             volume: self.volume,
+            transition: self.transition.clone(),
+            trans_dur: self.trans_dur,
         }
     }
 
@@ -602,6 +610,13 @@ fn wave_css(wave: &str, duration: f64, in_s: f64, scale: f64, speed: f64) -> Str
 fn unity() -> f64 {
     1.0
 }
+fn none_label() -> String {
+    "None".to_string()
+}
+/// Default transition length. Short, because a reel cut is quick.
+fn half() -> f64 {
+    0.5
+}
 
 /// A whole-timeline snapshot for undo/redo. Snapshotting every lane is cheaper
 /// to get *right* than per-action inverse operations — those silently miss a
@@ -636,12 +651,56 @@ enum Ctx {
     Title(usize),
 }
 
+/// The transition leading into clip `i`, clamped to something both it and the
+/// clip before it can accommodate. 0 for a cut, and always 0 for the first clip.
+fn fade_in(clips: &[Clip], i: usize) -> f64 {
+    if i == 0 || i >= clips.len() {
+        return 0.0;
+    }
+    if engine::xfade_name(&clips[i].transition).is_empty() {
+        return 0.0;
+    }
+    clips[i].trans_dur.clamp(0.0, clips[i].trimmed().min(clips[i - 1].trimmed()) * 0.9)
+}
+
+/// How much of the timeline each clip owns. A transition overlaps a clip's tail
+/// with the next clip's head, so a clip followed by one owns less than it runs
+/// for. These sum to the finished length, and every position on the timeline —
+/// the ruler, the playhead, the magnet, clip widths — is derived from them.
+fn extents(clips: &[Clip]) -> Vec<f64> {
+    (0..clips.len())
+        .map(|i| (clips[i].trimmed() - fade_in(clips, i + 1)).max(0.05))
+        .collect()
+}
+
+/// If `t` falls inside the transition leading into some clip, return that
+/// clip's index, how far the blend has run (0..1), and the source time to pull
+/// its frame from. The overlap sits at the end of the outgoing clip's extent,
+/// which is exactly where the next clip's own footage has already started.
+fn transition_at(clips: &[Clip], t: f64) -> Option<(usize, f64, f64)> {
+    let ext = extents(clips);
+    let mut start = 0.0;
+    for i in 0..clips.len() {
+        let end = start + ext[i];
+        let d = fade_in(clips, i + 1);
+        if d > 0.0 && t >= end - d && t < end {
+            let progress = ((t - (end - d)) / d).clamp(0.0, 1.0);
+            let next = &clips[i + 1];
+            // The incoming clip is already running during the overlap.
+            let into = (t - (end - d)) * next.speed.max(0.01);
+            return Some((i + 1, progress, next.in_s + into));
+        }
+        start = end;
+    }
+    None
+}
+
 /// Map a global timeline position to (clip index, source-file time) on V1.
 /// A retimed clip covers `speed` seconds of source per timeline second.
 fn locate(clips: &[Clip], t: f64) -> Option<(usize, f64)> {
     let mut acc = 0.0;
-    for (i, c) in clips.iter().enumerate() {
-        let d = c.trimmed();
+    for (i, d) in extents(clips).into_iter().enumerate() {
+        let c = &clips[i];
         if t < acc + d || i + 1 == clips.len() {
             return Some((i, c.in_s + (t - acc).clamp(0.0, d) * c.speed.max(0.01)));
         }
@@ -747,8 +806,7 @@ fn route_drop(kind: Kind, onto: Lane) -> Result<(Lane, Option<&'static str>), &'
 /// clips" — never "at 12.4s". Past the midpoint of a clip means after it.
 fn insert_index(clips: &[Clip], t: f64) -> usize {
     let mut acc = 0.0;
-    for (i, c) in clips.iter().enumerate() {
-        let d = c.trimmed();
+    for (i, d) in extents(clips).into_iter().enumerate() {
         if t < acc + d / 2.0 {
             return i;
         }
@@ -877,7 +935,7 @@ fn Editor() -> Element {
     let mut export_progress = use_signal(|| Option::<f64>::None);
     let mut importing = use_signal(|| false);
 
-    let total_of = move || clips.read().iter().map(Clip::trimmed).sum::<f64>();
+    let total_of = move || extents(&clips.read()).iter().sum::<f64>();
 
     // Right-click menu: (viewport x, y, what was clicked). One menu, many targets.
     let mut ctx_menu = use_signal(|| Option::<(f64, f64, Ctx)>::None);
@@ -889,12 +947,13 @@ fn Editor() -> Element {
     };
 
     // Preview extraction: latest-wins queue so slider drags don't stack ffmpeg runs.
-    // Title rides along as (png, opacity) so the scrub shows the export's fade.
-    let mut pending = use_signal(|| Option::<(String, f64, String, String, Option<(String, f64)>)>::None);
+    // Whatever is composited on top — a title's fade, the incoming half of a
+    // transition — rides along so the scrub shows what the export will.
+    let mut pending = use_signal(|| Option::<(String, f64, String, String, engine::Over)>::None);
     let mut preview_busy = use_signal(|| false);
     let mut request_preview =
-        move |path: String, t: f64, framing: String, effect: String, title: Option<(String, f64)>| {
-            pending.set(Some((path, t, framing, effect, title)));
+        move |path: String, t: f64, framing: String, effect: String, over: engine::Over| {
+            pending.set(Some((path, t, framing, effect, over)));
             if preview_busy() {
                 return;
             }
@@ -905,9 +964,8 @@ fn Editor() -> Element {
                     // borrowed across the await, and any scrub event's pending.set
                     // during extraction panics (AlreadyBorrowedMut → abort).
                     let next = pending.write().take();
-                    let Some((p, t, fr, e, ti)) = next else { break };
-                    let ti = ti.as_ref().map(|(png, a)| (png.as_str(), *a));
-                    if let Ok(uri) = engine::frame_data_uri(&p, t, 540, 960, &fr, &e, ti).await {
+                    let Some((p, t, fr, e, ov)) = next else { break };
+                    if let Ok(uri) = engine::frame_data_uri(&p, t, 540, 960, &fr, &e, ov).await {
                         preview.set(uri);
                     }
                 }
@@ -975,14 +1033,29 @@ fn Editor() -> Element {
                 selected.set(Some(Sel::Main(i)));
             }
         }
+        let mut layers = engine::Over { title: title_png, ..Default::default() };
         if let Some((path, local, fr, eff)) = over {
-            request_preview(path, local, fr, eff, title_png);
+            request_preview(path, local, fr, eff, layers);
         } else if let Some((i, local)) = loc {
             let (path, fr, eff) = {
                 let cl = clips.read();
                 (cl[i].scrub_path(), cl[i].framing.clone(), cl[i].look())
             };
-            request_preview(path, local, fr, eff, title_png);
+            // Inside a transition the export is showing both clips at once, so
+            // the monitor has to as well: the outgoing clip is the base and the
+            // incoming one fades up over it by however far the blend has run.
+            // Without this, scrubbing a dissolve would show a hard cut.
+            if let Some((next, alpha, ntime)) = transition_at(&clips.read(), t) {
+                let cl = clips.read();
+                layers.blend = Some((
+                    cl[next].scrub_path(),
+                    ntime,
+                    cl[next].framing.clone(),
+                    cl[next].look(),
+                    alpha,
+                ));
+            }
+            request_preview(path, local, fr, eff, layers);
         }
     };
 
@@ -1004,7 +1077,7 @@ fn Editor() -> Element {
     };
 
     let start_of = move |i: usize| -> f64 {
-        clips.read().iter().take(i).map(Clip::trimmed).sum()
+        extents(&clips.read()).iter().take(i).sum()
     };
 
     let mut select_clip = move |i: usize| {
@@ -1020,7 +1093,7 @@ fn Editor() -> Element {
     let mut magnet = use_signal(|| true);
     let spans = move || -> Vec<(f64, f64)> {
         let mut acc = 0.0;
-        clips.read().iter().map(|c| { let s = acc; acc += c.trimmed(); (s, acc) }).collect()
+        extents(&clips.read()).into_iter().map(|d| { let s = acc; acc += d; (s, acc) }).collect()
     };
     let mut ride = move |old: Vec<(f64, f64)>, new_start: &dyn Fn(usize) -> Option<f64>| {
         if !magnet() {
@@ -1072,7 +1145,7 @@ fn Editor() -> Element {
         // Indices just moved under us; a stale selection would edit the wrong item.
         selected.set(None);
         marked.write().clear();
-        seek_to(playhead().min(clips.read().iter().map(Clip::trimmed).sum()));
+        seek_to(playhead().min(extents(&clips.read()).iter().sum()));
     };
     let mut push_undo = move |tag: &str| {
         if !tag.is_empty() && undo_tag() == tag {
@@ -1356,7 +1429,7 @@ fn Editor() -> Element {
         // The right half's thumbnail still shows the left's frame — retake it
         // at the new in point so the two halves are tellable apart.
         spawn(async move {
-            if let Ok(thumb) = engine::frame_data_uri(&scrub, local, 108, 192, &fr, "", None).await {
+            if let Ok(thumb) = engine::frame_data_uri(&scrub, local, 108, 192, &fr, "", engine::Over::default()).await {
                 let mut cl = clips.write();
                 if let Some(c) = cl.get_mut(i + 1) {
                     if c.path == path && (c.in_s - local).abs() < 1e-6 {
@@ -1400,7 +1473,7 @@ fn Editor() -> Element {
         let name = file_name_of(&path);
         let (duration, has_audio) = engine::probe(&path).await.map_err(|e| format!("{name}: {e}"))?;
         let thumb =
-            engine::frame_data_uri(&path, (duration * 0.1).min(1.0), 108, 192, "", "", None)
+            engine::frame_data_uri(&path, (duration * 0.1).min(1.0), 108, 192, "", "", engine::Over::default())
                 .await
                 .unwrap_or_default();
         let clip = Clip {
@@ -1416,6 +1489,8 @@ fn Editor() -> Element {
             transform: engine::Transform::default(),
             speed: 1.0,
             volume: 1.0,
+            transition: "None".to_string(),
+            trans_dur: 0.5,
             thumb,
             wave: String::new(),
             proxy: String::new(),
@@ -1785,7 +1860,7 @@ fn Editor() -> Element {
             .collect();
         spawn(async move {
             for (i, path, t, fr) in posters {
-                if let Ok(thumb) = engine::frame_data_uri(&path, t, 108, 192, &fr, "", None).await {
+                if let Ok(thumb) = engine::frame_data_uri(&path, t, 108, 192, &fr, "", engine::Over::default()).await {
                     if let Some(c) = clips.write().get_mut(i) {
                         if c.path == path {
                             c.thumb = thumb;
@@ -2128,7 +2203,7 @@ fn Editor() -> Element {
             _ => None,
         };
         if let Some((path, at, fr, look)) = target {
-            request_preview(path, at, fr, look, None);
+            request_preview(path, at, fr, look, engine::Over::default());
         }
     };
 
@@ -2371,7 +2446,7 @@ fn Editor() -> Element {
                 if fx_key() != key {
                     return; // selection moved on — this batch is stale
                 }
-                if let Ok(uri) = engine::frame_data_uri(&path, t, 108, 192, &fr, filter, None).await {
+                if let Ok(uri) = engine::frame_data_uri(&path, t, 108, 192, &fr, filter, engine::Over::default()).await {
                     if fx_key() == key {
                         fx_thumbs.write().insert(name.to_string(), uri);
                     }
@@ -2389,7 +2464,7 @@ fn Editor() -> Element {
                     cl[i].effect = name.clone();
                     (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look())
                 };
-                request_preview(path, t, fr, look, None);
+                request_preview(path, t, fr, look, engine::Over::default());
             }
             Some(Sel::Over(j)) if j < overlays.read().len() => {
                 let (path, t, fr, look) = {
@@ -2397,7 +2472,7 @@ fn Editor() -> Element {
                     ov[j].effect = name.clone();
                     (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look())
                 };
-                request_preview(path, t, fr, look, None);
+                request_preview(path, t, fr, look, engine::Over::default());
             }
             _ => status.set("Select a V1 clip or V2 overlay to apply an effect.".to_string()),
         }
@@ -2413,7 +2488,7 @@ fn Editor() -> Element {
                     cl[i].effect_amount = v;
                     (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look())
                 };
-                request_preview(path, t, fr, eff, None);
+                request_preview(path, t, fr, eff, engine::Over::default());
             }
             Some(Sel::Over(j)) if j < overlays.read().len() => {
                 let (path, t, fr, eff) = {
@@ -2421,7 +2496,7 @@ fn Editor() -> Element {
                     ov[j].effect_amount = v;
                     (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look())
                 };
-                request_preview(path, t, fr, eff, None);
+                request_preview(path, t, fr, eff, engine::Over::default());
             }
             _ => {}
         }
@@ -2953,7 +3028,7 @@ fn Editor() -> Element {
                                                 };
                                                 ride(old, &|k| Some(start_of(k)));
                                                 playhead.set(start_of(i));
-                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), None);
+                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), engine::Over::default());
                                             }
                                         })),
                                     }
@@ -2978,7 +3053,7 @@ fn Editor() -> Element {
                                                 };
                                                 ride(old, &|k| Some(start_of(k)));
                                                 playhead.set(start_of(i + 1));
-                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), None);
+                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), engine::Over::default());
                                             }
                                         })),
                                     }
@@ -2996,7 +3071,7 @@ fn Editor() -> Element {
                                                     cl[i].effect = name.clone();
                                                     cl[i].in_s
                                                 };
-                                                request_preview(path.clone(), t, fr.clone(), effect_filter_amt(&name, amt), None);
+                                                request_preview(path.clone(), t, fr.clone(), effect_filter_amt(&name, amt), engine::Over::default());
                                             }
                                         },
                                     }
@@ -3024,7 +3099,7 @@ fn Editor() -> Element {
                                                     cl[i].framing = name.clone();
                                                     cl[i].in_s
                                                 };
-                                                request_preview(path.clone(), t, name, eff.clone(), None);
+                                                request_preview(path.clone(), t, name, eff.clone(), engine::Over::default());
                                             }
                                         },
                                     }
@@ -3061,6 +3136,41 @@ fn Editor() -> Element {
                                                 push_undo(&format!("cvol{i}"));
                                                 clips.write()[i].volume = v;
                                             })),
+                                        }
+                                    }
+                                    if i > 0 {
+                                        h4 { class: "mr-fx-cat", "Transition in" }
+                                        MorSelect {
+                                            label: "Transition".to_string(),
+                                            value: c.transition.clone(),
+                                            options: engine::TRANSITIONS.iter().map(|(l, _)| l.to_string()).collect::<Vec<_>>(),
+                                            onchange: move |v: String| {
+                                                push_undo("");
+                                                let old = spans();
+                                                clips.write()[i].transition = v;
+                                                ride(old, &|k| Some(start_of(k)));
+                                                seek_to(playhead().min(total_of()));
+                                            },
+                                        }
+                                        if !engine::xfade_name(&c.transition).is_empty() {
+                                            Slider {
+                                                label: Some("Transition length"),
+                                                min: 0.1,
+                                                max: 3.0,
+                                                step: 0.05,
+                                                precision: 2,
+                                                value: c.trans_dur,
+                                                oninput: Some(EventHandler::new(move |v: f64| {
+                                                    push_undo(&format!("tdur{i}"));
+                                                    let old = spans();
+                                                    clips.write()[i].trans_dur = v;
+                                                    ride(old, &|k| Some(start_of(k)));
+                                                    seek_to(playhead().min(total_of()));
+                                                })),
+                                            }
+                                            p { class: "mor-statusbar-muted mr-export-blurb",
+                                                "Overlaps the clip before it, so the reel gets shorter by this much."
+                                            }
                                         }
                                     }
                                     {transform_panel(false)}
@@ -3113,7 +3223,7 @@ fn Editor() -> Element {
                                                     ov[j].in_s = v.min(ov[j].out_s - 0.1).max(0.0);
                                                     ov[j].in_s
                                                 };
-                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), None);
+                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), engine::Over::default());
                                             }
                                         })),
                                     }
@@ -3134,7 +3244,7 @@ fn Editor() -> Element {
                                                     ov[j].out_s = v.max(ov[j].in_s + 0.1).min(ov[j].duration);
                                                     ov[j].out_s
                                                 };
-                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), None);
+                                                request_preview(path.clone(), t, fr.clone(), eff.clone(), engine::Over::default());
                                             }
                                         })),
                                     }
@@ -3152,7 +3262,7 @@ fn Editor() -> Element {
                                                     ov[j].effect = name.clone();
                                                     ov[j].in_s
                                                 };
-                                                request_preview(path.clone(), t, fr.clone(), effect_filter_amt(&name, amt), None);
+                                                request_preview(path.clone(), t, fr.clone(), effect_filter_amt(&name, amt), engine::Over::default());
                                             }
                                         },
                                     }
@@ -3180,7 +3290,7 @@ fn Editor() -> Element {
                                                     ov[j].framing = name.clone();
                                                     ov[j].in_s
                                                 };
-                                                request_preview(path.clone(), t, name, eff.clone(), None);
+                                                request_preview(path.clone(), t, name, eff.clone(), engine::Over::default());
                                             }
                                         },
                                     }
@@ -3580,6 +3690,7 @@ fn Editor() -> Element {
                     } else {
                         {
                             let scale = calc_scale();
+                            let ext = extents(&clips.read());
                             let track_end = total
                                 .max(overlays.read().iter().map(|o| o.at + o.trimmed()).fold(0.0, f64::max))
                                 .max(titles.read().iter().map(|t| t.at + t.dur).fold(0.0, f64::max))
@@ -3736,7 +3847,7 @@ fn Editor() -> Element {
                                             div {
                                                 key: "{i}-{c.path}",
                                                 class: item_class("mr-clip", selected() == Some(Sel::Main(i)), marked().contains(&Sel::Main(i))),
-                                                style: "width: {c.trimmed() * scale}px",
+                                                style: "width: {ext[i] * scale}px",
                                                 onmousedown: move |evt| {
                                                     if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
                                                         selected.set(Some(Sel::Main(i)));
@@ -3762,6 +3873,13 @@ fn Editor() -> Element {
                                                 },
                                                 if c.group != 0 {
                                                     span { class: "mr-group-dot", style: "background: hsl({(c.group * 67) % 360}, 70%, 60%)" }
+                                                }
+                                                if fade_in(&clips.read(), i) > 0.0 {
+                                                    span {
+                                                        class: "mr-xtrans",
+                                                        title: "{c.transition}",
+                                                        "><"
+                                                    }
                                                 }
                                                 if c.thumb.is_empty() {
                                                     div { class: "mr-thumb-missing" }
@@ -4238,6 +4356,9 @@ const APP_CSS: &str = r#"
 /* A clip's own audio, drawn under its thumbnail in the same teal A1 uses — a
    clip with no strip is a clip with no sound. */
 .mr-clip-wave { height: 18px; flex: none; border-radius: 3px; background-color: color-mix(in srgb, var(--mor-success) 10%, transparent); }
+/* Transition badge on the incoming clip's leading edge: the junction is where
+   the two clips overlap, so it belongs at the cut rather than inside a clip. */
+.mr-xtrans { position: absolute; top: 3px; left: 3px; z-index: 2; font-size: 8px; line-height: 12px; padding: 0 3px; border-radius: 3px; background: var(--mor-accent); color: #141417; letter-spacing: -1px; pointer-events: none; }
 .mr-clip-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .mr-clip-dur { font-size: 10px; color: var(--mor-text-muted); }
 
@@ -4321,11 +4442,93 @@ mod tests {
             transform: engine::Transform::default(),
             speed: 1.0,
             volume: 1.0,
+            transition: "None".to_string(),
+            trans_dur: 0.5,
             thumb: String::new(),
             wave: String::new(),
             proxy: String::new(),
             group: 0,
         }
+    }
+
+    /// `a` seconds, then `b` seconds joined by a `d`-second dissolve.
+    fn dissolved(a: f64, b: f64, d: f64) -> Vec<Clip> {
+        let mut second = clip(0.0, b);
+        second.transition = "Cross dissolve".to_string();
+        second.trans_dur = d;
+        vec![clip(0.0, a), second]
+    }
+
+    #[test]
+    fn a_transition_takes_its_length_off_the_timeline() {
+        // Cuts: each clip owns everything it runs for.
+        let cut = [clip(0.0, 5.0), clip(0.0, 4.0)];
+        assert_eq!(extents(&cut), vec![5.0, 4.0]);
+
+        // A 1 s dissolve overlaps the join, so the outgoing clip owns 1 s less
+        // and the reel is 1 s shorter. The extents still tile the timeline.
+        let fade = dissolved(5.0, 4.0, 1.0);
+        assert_eq!(extents(&fade), vec![4.0, 4.0]);
+        assert_eq!(extents(&fade).iter().sum::<f64>(), 8.0);
+
+        // The playhead maps through the shortened timeline: the second clip now
+        // starts at 4 s, and 4 s in is its first frame.
+        assert_eq!(locate(&fade, 3.9), Some((0, 3.9)));
+        assert_eq!(locate(&fade, 4.0), Some((1, 0.0)));
+        assert_eq!(locate(&fade, 6.0), Some((1, 2.0)));
+
+        // "None" is a cut no matter what length is stored against it.
+        let mut none = dissolved(5.0, 4.0, 1.0);
+        none[1].transition = "None".to_string();
+        assert_eq!(extents(&none), vec![5.0, 4.0]);
+
+        // Nothing precedes the first clip, so its transition is inert.
+        let mut lead = vec![clip(0.0, 5.0), clip(0.0, 4.0)];
+        lead[0].transition = "Cross dissolve".to_string();
+        lead[0].trans_dur = 1.0;
+        assert_eq!(extents(&lead), vec![5.0, 4.0]);
+        assert_eq!(fade_in(&lead, 0), 0.0);
+    }
+
+    #[test]
+    fn a_transition_longer_than_its_clips_is_clamped() {
+        // Left alone this would give a negative extent, and xfade would be
+        // handed an offset before the start of the stream.
+        let greedy = dissolved(1.0, 1.0, 30.0);
+        assert!(fade_in(&greedy, 1) < 1.0, "not clamped: {}", fade_in(&greedy, 1));
+        assert!(extents(&greedy).iter().all(|d| *d > 0.0), "{:?}", extents(&greedy));
+        assert!(extents(&greedy).iter().sum::<f64>() > 0.0);
+    }
+
+    #[test]
+    fn transition_at_reports_where_the_blend_has_got_to() {
+        // 5 s then 4 s with a 1 s dissolve: clip 0 owns 0..4, and the overlap
+        // runs across 3..4 — the last second of what clip 0 owns.
+        let fade = dissolved(5.0, 4.0, 1.0);
+        assert_eq!(transition_at(&fade, 2.0), None, "before the overlap");
+        let (idx, p, src) = transition_at(&fade, 3.0).unwrap();
+        assert_eq!(idx, 1, "the blend brings in the second clip");
+        assert!(p.abs() < 1e-9, "it has just started: {p}");
+        assert!(src.abs() < 1e-9, "from the incoming clip's first frame: {src}");
+
+        let (_, p, src) = transition_at(&fade, 3.5).unwrap();
+        assert!((p - 0.5).abs() < 1e-9, "halfway: {p}");
+        assert!((src - 0.5).abs() < 1e-9, "half a second into the incoming clip: {src}");
+
+        // Past the overlap the incoming clip is simply the clip under the head.
+        assert_eq!(transition_at(&fade, 4.5), None);
+        // A cut has no overlap to be inside of.
+        assert_eq!(transition_at(&[clip(0.0, 5.0), clip(0.0, 4.0)], 4.9), None);
+    }
+
+    #[test]
+    fn drops_land_between_clips_once_a_transition_has_moved_them() {
+        // The second clip starts at 4 s, not 5 s, so the midpoint that decides
+        // "before or after" has moved with it.
+        let fade = dissolved(5.0, 4.0, 1.0);
+        assert_eq!(insert_index(&fade, 1.0), 0);
+        assert_eq!(insert_index(&fade, 3.0), 1); // past clip 0's midpoint of 2 s
+        assert_eq!(insert_index(&fade, 7.0), 2); // past clip 1's midpoint of 6 s
     }
 
     #[test]
@@ -4412,7 +4615,7 @@ mod tests {
                 let look = look.clone();
                 let png = png.clone();
                 async move {
-                    engine::frame_data_uri(&png, t, 108, 192, "Crop", &look, None).await.unwrap()
+                    engine::frame_data_uri(&png, t, 108, 192, "Crop", &look, engine::Over::default()).await.unwrap()
                 }
             };
             assert_ne!(

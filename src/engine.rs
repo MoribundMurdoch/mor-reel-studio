@@ -147,6 +147,25 @@ pub fn is_still(path: &str) -> bool {
 pub const STILL_SOURCE: f64 = 60.0;
 pub const STILL_DEFAULT: f64 = 5.0;
 
+/// Transitions, as (what the menu says, what xfade calls it). A transition
+/// belongs to the clip it leads *into*, so it survives reordering and deleting
+/// the clip before it.
+pub const TRANSITIONS: &[(&str, &str)] = &[
+    ("None", ""),
+    ("Cross dissolve", "fade"),
+    ("Dip to black", "fadeblack"),
+    ("Dip to white", "fadewhite"),
+    ("Slide", "slideleft"),
+    ("Wipe", "wiperight"),
+    ("Circle", "circleopen"),
+    ("Dissolve", "dissolve"),
+];
+
+/// The xfade name for a menu label; "" for None or anything unrecognised.
+pub fn xfade_name(label: &str) -> &'static str {
+    TRANSITIONS.iter().find(|(l, _)| *l == label).map_or("", |(_, x)| x)
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct ClipSpec {
     pub path: String,
@@ -161,6 +180,11 @@ pub struct ClipSpec {
     pub speed: f64,
     /// Gain on this clip's own audio; 0.0 mutes it.
     pub volume: f64,
+    /// Transition *into* this clip, by menu label. Ignored on the first clip —
+    /// there is nothing before it to blend from.
+    pub transition: String,
+    /// How long that transition runs. 0 means a straight cut.
+    pub trans_dur: f64,
 }
 
 /// Hand-written so `..Default::default()` can never leave `speed` at 0.0 and
@@ -176,16 +200,47 @@ impl Default for ClipSpec {
             framing: String::new(),
             speed: 1.0,
             volume: 1.0,
+            transition: String::new(),
+            trans_dur: 0.0,
         }
     }
 }
 
 impl ClipSpec {
-    /// Seconds this clip occupies on the timeline — source span divided by the
-    /// speed, so a 4 s clip at 2× fills 2 s.
+    /// How long this clip runs for — source span divided by the speed, so a
+    /// 4 s clip at 2× runs 2 s.
     pub fn trimmed(&self) -> f64 {
         (self.out_s - self.in_s) / self.speed.max(0.01)
     }
+
+    /// The transition leading into this clip, in seconds, once it has been
+    /// clamped to something the clip can actually accommodate. 0 = a cut.
+    pub fn fade_in(&self, prev: Option<&ClipSpec>) -> f64 {
+        let Some(prev) = prev else { return 0.0 }; // nothing before the first clip
+        if xfade_name(&self.transition).is_empty() {
+            return 0.0;
+        }
+        // A transition cannot outlast either clip, or xfade has nothing left to
+        // blend and the offset maths goes negative.
+        self.trans_dur.clamp(0.0, self.trimmed().min(prev.trimmed()) * 0.9)
+    }
+}
+
+/// How much of the timeline each clip owns. A transition overlaps a clip's tail
+/// with the next clip's head, so a clip followed by one owns less of the
+/// timeline than it runs for. These sum to the finished length.
+pub fn extents(clips: &[ClipSpec]) -> Vec<f64> {
+    (0..clips.len())
+        .map(|i| {
+            let after = clips.get(i + 1).map_or(0.0, |n| n.fade_in(Some(&clips[i])));
+            (clips[i].trimmed() - after).max(0.05)
+        })
+        .collect()
+}
+
+/// The finished length of the timeline, transitions accounted for.
+pub fn timeline_len(clips: &[ClipSpec]) -> f64 {
+    extents(clips).iter().sum()
 }
 
 /// `atempo` only accepts 0.5–2.0 per instance, so anything outside that range
@@ -642,6 +697,19 @@ pub async fn probe(path: &str) -> Result<(f64, bool), String> {
 /// `effect` is the same filter snippet the export uses, and `title` (a rendered
 /// title PNG + its opacity at this instant, approximating the export's fade)
 /// is composited on top, so preview = export.
+/// What gets composited on top of the base frame, bottom to top. Bundled into
+/// one argument so a preview can gain a layer without the parameter list
+/// growing a tail of Options.
+#[derive(Clone, Default, Debug)]
+pub struct Over {
+    /// The incoming clip of a transition, and how far the blend has run
+    /// (0 = not yet visible, 1 = fully replaced the base).
+    /// (path, source time, framing, effect chain, alpha)
+    pub blend: Option<(String, f64, String, String, f64)>,
+    /// A rendered title card and its opacity at this instant.
+    pub title: Option<(String, f64)>,
+}
+
 pub async fn frame_data_uri(
     path: &str,
     t: f64,
@@ -649,7 +717,7 @@ pub async fn frame_data_uri(
     h: u32,
     framing: &str,
     effect: &str,
-    title: Option<(&str, f64)>,
+    over: Over,
 ) -> Result<String, String> {
     let mut chain = frame_chain(framing, w, h);
     if !effect.is_empty() {
@@ -671,18 +739,47 @@ pub async fn frame_data_uri(
         cmd.args(["-loop", "1"]); // a lone frame has nothing to seek to
     }
     cmd.args(["-ss", &format!("{t:.3}"), "-i", path]);
-    if let Some((png, alpha)) = title {
+
+    // Layer the extra inputs on in the order they will be composited, so the
+    // filter graph's input indices follow the stacking order.
+    let mut graph = format!("[0:v]{chain}[base];");
+    let mut top = "base".to_string();
+    let mut idx = 0;
+    if let Some((bpath, bt, bframing, beffect, alpha)) = &over.blend {
+        idx += 1;
+        if is_still(bpath) {
+            cmd.args(["-loop", "1"]);
+        }
+        cmd.args(["-ss", &format!("{bt:.3}"), "-i", bpath]);
+        let mut bchain = frame_chain(bframing, w, h);
+        if !beffect.is_empty() {
+            bchain = format!("{bchain},setpts=PTS+{bt:.3}/TB,{beffect},setpts=PTS-{bt:.3}/TB");
+        }
+        // The incoming clip fades up over the outgoing one — the same thing
+        // xfade does in the export, so a scrub inside a transition shows the
+        // blend rather than a hard cut.
+        graph += &format!(
+            "[{idx}:v]{bchain},format=rgba,colorchannelmixer=aa={:.3}[inc];\
+             [{top}][inc]overlay[x{idx}];",
+            alpha.clamp(0.0, 1.0)
+        );
+        top = format!("x{idx}");
+    }
+    if let Some((png, alpha)) = &over.title {
+        idx += 1;
         cmd.args(["-i", png]);
-        cmd.args([
-            "-filter_complex",
-            &format!(
-                "[0:v]{chain}[b];[1:v]scale={w}:{h},format=rgba,\
-                 colorchannelmixer=aa={:.3}[t];[b][t]overlay",
-                alpha.clamp(0.0, 1.0)
-            ),
-        ]);
-    } else {
+        graph += &format!(
+            "[{idx}:v]scale={w}:{h},format=rgba,colorchannelmixer=aa={:.3}[ttl];\
+             [{top}][ttl]overlay[x{idx}];",
+            alpha.clamp(0.0, 1.0)
+        );
+        top = format!("x{idx}");
+    }
+    if idx == 0 {
         cmd.args(["-vf", &chain]);
+    } else {
+        graph += &format!("[{top}]null[out]");
+        cmd.args(["-filter_complex", &graph, "-map", "[out]"]);
     }
     let out = cmd
         .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "mjpeg", "-"])
@@ -834,12 +931,56 @@ pub fn build_filter(
         );
         f += &clip_audio(i, c);
     }
-    for i in 0..clips.len() {
-        f += &format!("[v{i}][a{i}]");
+    // No transitions anywhere is the common case, and one concat of everything
+    // is both cheaper and exactly what shipped before, so it stays the path.
+    let fades: Vec<f64> = (0..clips.len())
+        .map(|i| if i == 0 { 0.0 } else { clips[i].fade_in(Some(&clips[i - 1])) })
+        .collect();
+    let cuts_only = fades.iter().all(|d| *d <= 0.0);
+    // The concat path hands on [vc]/[ac]; the pairwise path builds up from the
+    // first clip's own labels.
+    let (mut vhead, mut ahead) = if cuts_only {
+        ("vc".to_string(), "ac".to_string())
+    } else {
+        ("v0".to_string(), "a0".to_string())
+    };
+    if cuts_only {
+        for i in 0..clips.len() {
+            f += &format!("[v{i}][a{i}]");
+        }
+        f += &format!("concat=n={}:v=1:a=1[vc][ac];", clips.len());
+    } else {
+        // Otherwise join the clips a pair at a time: xfade where there is a
+        // transition, concat where there is a cut. xfade's offset is measured
+        // in the accumulated stream, which is exactly where the incoming clip
+        // starts on the finished timeline.
+        let mut acc = clips[0].trimmed();
+        for i in 1..clips.len() {
+            let d = fades[i];
+            if d > 0.0 {
+                f += &format!(
+                    "[{vhead}][v{i}]xfade=transition={}:duration={:.3}:offset={:.3}[vt{i}];",
+                    xfade_name(&clips[i].transition),
+                    d,
+                    acc - d
+                );
+                // The audio side crossfades at the join, which needs no offset —
+                // acrossfade overlaps the tail of one with the head of the next.
+                f += &format!("[{ahead}][a{i}]acrossfade=d={d:.3}:c1=tri:c2=tri[at{i}];");
+                acc += clips[i].trimmed() - d;
+            } else {
+                // concat hands on a 1/1000000 timebase and xfade refuses inputs
+                // whose timebases differ, so put it back on the frame clock.
+                f += &format!("[{vhead}][v{i}]concat=n=2:v=1:a=0,settb=1/{FPS}[vt{i}];");
+                f += &format!("[{ahead}][a{i}]concat=n=2:v=0:a=1[at{i}];");
+                acc += clips[i].trimmed();
+            }
+            vhead = format!("vt{i}");
+            ahead = format!("at{i}");
+        }
     }
-    f += &format!("concat=n={}:v=1:a=1[vc][ac];", clips.len());
 
-    let mut vl = "vc".to_string();
+    let mut vl = vhead;
     for (j, o) in overlays.iter().enumerate() {
         let idx = clips.len() + j;
         f += &format!(
@@ -882,7 +1023,7 @@ pub fn build_filter(
         vl = format!("vt{j}");
     }
 
-    let mut al = "ac".to_string();
+    let mut al = ahead;
     if !audio.is_empty() {
         for (k, a) in audio.iter().enumerate() {
             f += &a1_audio(clips.len() + overlays.len() + titles.len() + k, k, a);
@@ -1131,7 +1272,7 @@ pub async fn export(
     if clips.is_empty() {
         return Err("nothing to export".into());
     }
-    let total: f64 = clips.iter().map(ClipSpec::trimmed).sum();
+    let total = timeline_len(clips);
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-v", "error"]);
     for path in clips.iter().map(|c| &c.path).chain(overlays.iter().map(|o| &o.path)) {
@@ -1883,6 +2024,204 @@ mod tests {
     }
 
     #[test]
+    fn transitions_shorten_the_timeline_by_what_they_overlap() {
+        let c = |d: f64| ClipSpec { out_s: d, ..Default::default() };
+        let cut = [c(5.0), c(4.0)];
+        assert_eq!(timeline_len(&cut), 9.0, "a cut costs nothing");
+
+        // A 1 s dissolve overlaps the two clips, so the reel is 1 s shorter and
+        // the second clip starts 1 s earlier than it otherwise would.
+        let faded = [
+            c(5.0),
+            ClipSpec { transition: "Cross dissolve".into(), trans_dur: 1.0, ..c(4.0) },
+        ];
+        assert_eq!(timeline_len(&faded), 8.0);
+        assert_eq!(extents(&faded), vec![4.0, 4.0], "the outgoing clip owns less");
+
+        // The first clip has nothing to blend from, so its transition is inert.
+        let lead = [ClipSpec { transition: "Cross dissolve".into(), trans_dur: 1.0, ..c(5.0) }, c(4.0)];
+        assert_eq!(timeline_len(&lead), 9.0);
+
+        // "None" is a cut however long its duration says.
+        let none = [c(5.0), ClipSpec { transition: "None".into(), trans_dur: 2.0, ..c(4.0) }];
+        assert_eq!(timeline_len(&none), 9.0);
+
+        // A transition longer than the clips it joins is clamped, never
+        // negative — xfade's offset would go backwards and the render fail.
+        let greedy = [c(1.0), ClipSpec { transition: "Wipe".into(), trans_dur: 30.0, ..c(1.0) }];
+        assert!(timeline_len(&greedy) > 1.0, "clamped to something renderable");
+        assert!(extents(&greedy).iter().all(|d| *d > 0.0));
+    }
+
+    #[test]
+    fn the_filter_graph_only_changes_shape_when_a_transition_exists() {
+        let c = |d: f64| ClipSpec { path: "a.mp4".into(), out_s: d, has_audio: true, ..Default::default() };
+        // No transitions: the single concat that shipped before, untouched.
+        let plain = build_filter(&[c(2.0), c(3.0)], &[], &[], &[], ExportOpts::default());
+        assert!(plain.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vc][ac]"), "{plain}");
+        assert!(!plain.contains("xfade"));
+
+        // With one: pairwise, xfade for video and acrossfade for audio, and the
+        // offset is where the incoming clip starts on the finished timeline.
+        let faded = build_filter(
+            &[c(2.0), ClipSpec { transition: "Cross dissolve".into(), trans_dur: 0.5, ..c(3.0) }],
+            &[],
+            &[],
+            &[],
+            ExportOpts::default(),
+        );
+        assert!(faded.contains("xfade=transition=fade:duration=0.500:offset=1.500"), "{faded}");
+        assert!(faded.contains("acrossfade=d=0.500"), "{faded}");
+        assert!(!faded.contains("concat=n=2:v=1:a=1"), "should not also concat: {faded}");
+
+        // Mixed: a cut then a transition. The concat side has to be put back on
+        // the frame clock or xfade rejects the mismatched timebase.
+        let mixed = build_filter(
+            &[c(2.0), c(2.0), ClipSpec { transition: "Wipe".into(), trans_dur: 0.5, ..c(2.0) }],
+            &[],
+            &[],
+            &[],
+            ExportOpts::default(),
+        );
+        assert!(mixed.contains("concat=n=2:v=1:a=0,settb=1/30"), "{mixed}");
+        assert!(mixed.contains("xfade=transition=wiperight:duration=0.500:offset=3.500"), "{mixed}");
+    }
+
+    // Transitions have to survive a real encode, in the right length, with the
+    // picture genuinely blended at the join.
+    #[tokio::test]
+    async fn a_crossfade_renders_blended_and_shortens_the_reel() {
+        let dir = std::env::temp_dir().join("morreel-xfade-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = Vec::new();
+        for colour in ["red", "lime"] {
+            let p = dir.join(format!("{colour}.mp4")).display().to_string();
+            capture("ffmpeg", &[
+                "-y", "-v", "error", "-f", "lavfi",
+                "-i", &format!("color=c={colour}:size=320x568:duration=3:rate=30"),
+                "-f", "lavfi", "-i", "sine=duration=3",
+                "-c:v", "libx264", "-c:a", "aac", "-shortest", &p,
+            ]).await.unwrap();
+            paths.push(p);
+        }
+        let clips = [
+            ClipSpec { path: paths[0].clone(), out_s: 3.0, has_audio: true, ..Default::default() },
+            ClipSpec {
+                path: paths[1].clone(),
+                out_s: 3.0,
+                has_audio: true,
+                transition: "Cross dissolve".into(),
+                trans_dur: 1.0,
+                ..Default::default()
+            },
+        ];
+        let out = dir.join("xf.mp4");
+        let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
+        export(&clips, &[], &[], &[], &out, opts, |_| {}).await.unwrap();
+
+        let d: f64 = capture("ffprobe", &[
+            "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+            &out.display().to_string(),
+        ]).await.unwrap().trim().parse().unwrap();
+        assert!((d - 5.0).abs() < 0.2, "3 s + 3 s with a 1 s dissolve should be 5 s, got {d}");
+
+        // Halfway through the dissolve both colours must be present at once.
+        let png = dir.join("mid.png");
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-ss", "2.5", "-i", &out.display().to_string(),
+            "-frames:v", "1", &png.display().to_string(),
+        ]).await.unwrap();
+        let px = image::open(&png).unwrap().to_rgb8();
+        let mid = px.get_pixel(px.width() / 2, px.height() / 2).0;
+        assert!(mid[0] > 30 && mid[1] > 30, "mid-dissolve pixel is not a blend: {mid:?}");
+    }
+
+    // The app's whole promise is that a scrub shows what the export will. A
+    // preview inside a transition therefore has to blend, not cut.
+    #[tokio::test]
+    async fn the_preview_blends_a_transition_like_the_export_does() {
+        let dir = std::env::temp_dir().join("morreel-blendpreview-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut src = Vec::new();
+        for colour in ["red", "lime"] {
+            let p = dir.join(format!("{colour}.png")).display().to_string();
+            capture("ffmpeg", &[
+                "-y", "-v", "error", "-f", "lavfi",
+                "-i", &format!("color=c={colour}:size=320x568:duration=1:rate=1"),
+                "-frames:v", "1", &p,
+            ]).await.unwrap();
+            src.push(p);
+        }
+        let sample = |uri: String| -> [u8; 3] {
+            let raw = uri.split_once(",").unwrap().1.to_string();
+            let bytes = b64_decode(&raw);
+            let img = image::load_from_memory(&bytes).unwrap().to_rgb8();
+            img.get_pixel(img.width() / 2, img.height() / 2).0
+        };
+
+        // No blend: the base clip, unmixed.
+        let base = frame_data_uri(&src[0], 0.0, 108, 192, "Crop", "", Over::default()).await.unwrap();
+        let px = sample(base);
+        assert!(px[0] > 200 && px[1] < 60, "base should be red, got {px:?}");
+
+        // Halfway through, both colours are present — the same blend the
+        // exported dissolve produced.
+        let mixed = frame_data_uri(
+            &src[0],
+            0.0,
+            108,
+            192,
+            "Crop",
+            "",
+            Over {
+                blend: Some((src[1].clone(), 0.0, "Crop".into(), String::new(), 0.5)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let px = sample(mixed);
+        assert!(px[0] > 40 && px[1] > 40, "mid-blend preview is not mixed: {px:?}");
+
+        // Fully across, the incoming clip has replaced the outgoing one.
+        let done = frame_data_uri(
+            &src[0],
+            0.0,
+            108,
+            192,
+            "Crop",
+            "",
+            Over {
+                blend: Some((src[1].clone(), 0.0, "Crop".into(), String::new(), 1.0)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let px = sample(done);
+        assert!(px[1] > 200 && px[0] < 60, "end of blend should be the incoming clip: {px:?}");
+    }
+
+    /// Minimal base64 decode, for reading back what `b64` wrote in tests.
+    fn b64_decode(s: &str) -> Vec<u8> {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut bits = Vec::new();
+        for c in s.bytes().filter(|c| *c != b'=') {
+            bits.push(T.iter().position(|t| *t == c).unwrap() as u32);
+        }
+        let mut out = Vec::new();
+        for chunk in bits.chunks(4) {
+            let mut n = 0u32;
+            for (i, v) in chunk.iter().enumerate() {
+                n |= v << (18 - 6 * i);
+            }
+            let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+            out.extend_from_slice(&bytes[..chunk.len() - 1]);
+        }
+        out
+    }
+
+    #[test]
     fn still_classification() {
         for p in ["a.png", "A.JPG", "/x/y/photo.jpeg", "shot.webp", "s.TIFF", "b.bmp"] {
             assert!(is_still(p), "{p} should be a still");
@@ -1911,7 +2250,7 @@ mod tests {
         // Proxying a still would just be a slower copy of it.
         assert_eq!(ensure_proxy(&png).await.unwrap(), png);
         // Seeking past the single frame still yields a frame (-loop 1).
-        let uri = frame_data_uri(&png, 2.5, 108, 192, "Crop", "", None).await.unwrap();
+        let uri = frame_data_uri(&png, 2.5, 108, 192, "Crop", "", Over::default()).await.unwrap();
         assert!(uri.starts_with("data:image/jpeg;base64,") && uri.len() > 100);
 
         let drift = "scale=1210:2150,crop=1080:1920:x='65+54*sin(0.628*t)':y='115+58*cos(0.408*t)',setsar=1";
@@ -1962,19 +2301,19 @@ mod tests {
         ]).await.unwrap();
 
         let sway = "scale=1188:2112,rotate=0.035*sin(0.628*t):ow=1080:oh=1920,setsar=1";
-        let early = frame_data_uri(&png, 0.0, 108, 192, "Crop", sway, None).await.unwrap();
-        let later = frame_data_uri(&png, 2.5, 108, 192, "Crop", sway, None).await.unwrap();
+        let early = frame_data_uri(&png, 0.0, 108, 192, "Crop", sway, Over::default()).await.unwrap();
+        let later = frame_data_uri(&png, 2.5, 108, 192, "Crop", sway, Over::default()).await.unwrap();
         assert_ne!(early, later, "Sway froze at its opening pose");
 
         // With no effect the still is genuinely the same frame at any time.
-        let plain_a = frame_data_uri(&png, 0.0, 108, 192, "Crop", "", None).await.unwrap();
-        let plain_b = frame_data_uri(&png, 2.5, 108, 192, "Crop", "", None).await.unwrap();
+        let plain_a = frame_data_uri(&png, 0.0, 108, 192, "Crop", "", Over::default()).await.unwrap();
+        let plain_b = frame_data_uri(&png, 2.5, 108, 192, "Crop", "", Over::default()).await.unwrap();
         assert_eq!(plain_a, plain_b);
 
         // Effect + title together: the clock shift must not desync the overlay,
         // so the composite has to differ from the same frame without a title.
         let title = render_title(&TitleStyle { text: "Hi".into(), font_size: 90, ..Default::default() }).await.unwrap();
-        let composed = frame_data_uri(&png, 2.5, 108, 192, "Crop", sway, Some((&title, 1.0)))
+        let composed = frame_data_uri(&png, 2.5, 108, 192, "Crop", sway, Over { title: Some((title.clone(), 1.0)), ..Default::default() })
             .await
             .unwrap();
         assert!(composed.starts_with("data:image/jpeg;base64,"));
