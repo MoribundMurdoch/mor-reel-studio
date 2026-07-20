@@ -10,8 +10,33 @@ use dioxus::prelude::*;
 use engine::{AudioSpec, ClipSpec, OverlaySpec, TitleSpec};
 use mor_rust_dioxus_ui_kit::{
     use_shortcut, MenuItem, MenuSeparator, Modal, MorAppFrame, MorMenuDropdown, MorSelect,
-    MorShortcutRoot, MorStyleProvider, Slider, UiMode, GTK4_DARK_TOML,
+    MorShortcutRoot, MorStyleProvider, Slider, UiMode,
 };
+
+/// MorReel look: near-black neutral surround (color judgment happens against it),
+/// with the UI palette derived from the app's own title colors — tungsten amber
+/// for video, teal for audio, gold for titles, record-red for the playhead.
+const MORREEL_TOML: &str = r##"
+bg            = "#141417"
+panel         = "#1b1b20"
+header        = "#0f0f12"
+text          = "#eae7e0"
+text_muted    = "#8f8d97"
+border        = "#26262d"
+border_light  = "#37363f"
+accent        = "#e6a23d"
+accent_hover  = "#f2b755"
+btn           = "#2a2a31"
+btn_hover     = "#34343d"
+font_family   = "Cantarell, 'Segoe UI', system-ui, sans-serif"
+font_size_base= "13px"
+font_size_h1  = "20px"
+padding_base  = "8px"
+border_radius = "6px"
+destructive   = "#e5484d"
+success       = "#3dd6d0"
+warning       = "#e8c060"
+"##;
 
 fn main() {
     let cfg = UiMode::launch_config("MorReel Studio");
@@ -55,6 +80,19 @@ fn title_color(name: &str) -> &'static str {
 
 fn title_y(name: &str) -> f64 {
     TITLE_POS.iter().find(|(n, _)| *n == name).map_or(0.45, |(_, y)| *y)
+}
+
+/// Rasterize a title card from its item's params.
+async fn render_one(t: &TitleItem) -> Result<String, String> {
+    engine::render_title(
+        &t.text,
+        t.font_size as u32,
+        title_color(&t.color),
+        title_y(&t.pos),
+        &t.bevel,
+        t.bevel_size as u32,
+    )
+    .await
 }
 
 #[derive(Clone, PartialEq)]
@@ -144,6 +182,17 @@ enum Sel {
     Title(usize),
 }
 
+/// What was right-clicked; picks the context menu's contents.
+#[derive(Clone, Copy, PartialEq)]
+enum Ctx {
+    Monitor,
+    Timeline,
+    Clip(usize),
+    Over(usize),
+    Aud(usize),
+    Title(usize),
+}
+
 /// Map a global timeline position to (clip index, source-file time) on V1.
 fn locate(clips: &[Clip], t: f64) -> Option<(usize, f64)> {
     let mut acc = 0.0;
@@ -161,18 +210,79 @@ fn fmt_t(s: f64) -> String {
     format!("{}:{:04.1}", (s / 60.0) as u32, s % 60.0)
 }
 
-// ponytail: env override previews the mobile layout on desktop — no emulator needed.
-fn is_mobile() -> bool {
-    cfg!(any(target_os = "android", target_os = "ios"))
-        || std::env::var_os("MORREEL_MOBILE").is_some()
+/// A cut at source-time `local` is valid only if both halves keep at least
+/// `min` seconds; returns the cut point when it is.
+fn cut_local(in_s: f64, out_s: f64, local: f64, min: f64) -> Option<f64> {
+    (local >= in_s + min && local <= out_s - min).then_some(local)
+}
+
+/// Magnetic timeline: how far an item anchored at `at` moves when a V1 edit
+/// rearranges the clips. `old` is each clip's (start, end) span before the
+/// edit; `new_start` maps an old clip index to its start after the edit
+/// (None = clip deleted). Unattached or orphaned items hold position.
+fn magnet_delta(at: f64, old: &[(f64, f64)], new_start: impl Fn(usize) -> Option<f64>) -> f64 {
+    old.iter()
+        .position(|&(s, e)| at >= s && at < e)
+        .and_then(|k| new_start(k).map(|ns| ns - old[k].0))
+        .unwrap_or(0.0)
 }
 
 #[component]
 fn App() -> Element {
     rsx! {
-        MorStyleProvider { theme_toml: Some(GTK4_DARK_TOML.to_string()) }
+        MorStyleProvider { theme_toml: Some(MORREEL_TOML.to_string()) }
         style { {APP_CSS} }
         MorShortcutRoot { Editor {} }
+    }
+}
+
+/// Program monitor window: just the phone, fed by the editor's preview signal.
+/// Runs in its own VirtualDom, so it gets its own style provider.
+#[component]
+fn Monitor(preview: Signal<String>) -> Element {
+    rsx! {
+        MorStyleProvider { theme_toml: Some(MORREEL_TOML.to_string()) }
+        style { {APP_CSS} }
+        div { class: "mr-monitor",
+            // The webview's default menu (Reload/Inspect) is noise in a monitor.
+            oncontextmenu: move |evt| evt.prevent_default(),
+            div { class: "mr-phone",
+                if preview().is_empty() {
+                    span { "Portrait preview" }
+                } else {
+                    img { src: "{preview}" }
+                }
+            }
+        }
+    }
+}
+
+/// One row of the right-click menu: kit menu styling, runs the action; the
+/// click bubbles to the backdrop, which closes the menu. Shortcuts are
+/// display-only — the live binds stay on the app menu.
+#[component]
+fn CtxItem(
+    label: String,
+    #[props(default = None)] shortcut: Option<String>,
+    #[props(default = false)] disabled: bool,
+    #[props(default = false)] danger: bool,
+    on_action: EventHandler<()>,
+) -> Element {
+    let class = match (disabled, danger) {
+        (true, _) => "mor-menu-item mor-menu-action disabled",
+        (false, true) => "mor-menu-item mor-menu-action mr-danger",
+        (false, false) => "mor-menu-item mor-menu-action",
+    };
+    rsx! {
+        button {
+            class,
+            disabled,
+            onclick: move |_| on_action.call(()),
+            span { class: "mor-menu-action-label", "{label}" }
+            if let Some(sc) = shortcut {
+                span { class: "shortcut", "{sc}" }
+            }
+        }
     }
 }
 
@@ -191,6 +301,15 @@ fn Editor() -> Element {
 
     let total_of = move || clips.read().iter().map(Clip::trimmed).sum::<f64>();
 
+    // Right-click menu: (viewport x, y, what was clicked). One menu, many targets.
+    let mut ctx_menu = use_signal(|| Option::<(f64, f64, Ctx)>::None);
+    let mut open_ctx = move |evt: Event<MouseData>, target: Ctx| {
+        evt.prevent_default(); // replaces the webview's Reload/Inspect menu
+        evt.stop_propagation();
+        let p = evt.client_coordinates();
+        ctx_menu.set(Some((p.x, p.y, target)));
+    };
+
     // Preview extraction: latest-wins queue so slider drags don't stack ffmpeg runs.
     let mut pending = use_signal(|| Option::<(String, f64, String, Option<String>)>::None);
     let mut preview_busy = use_signal(|| false);
@@ -201,7 +320,12 @@ fn Editor() -> Element {
         }
         preview_busy.set(true);
         spawn(async move {
-            while let Some((p, t, e, ti)) = pending.write().take() {
+            loop {
+                // Take-then-drop: a `while let` scrutinee guard would stay
+                // borrowed across the await, and any scrub event's pending.set
+                // during extraction panics (AlreadyBorrowedMut → abort).
+                let next = pending.write().take();
+                let Some((p, t, e, ti)) = next else { break };
                 if let Ok(uri) = engine::frame_data_uri(&p, t, 540, 960, &e, ti.as_deref()).await {
                     preview.set(uri);
                 }
@@ -281,16 +405,7 @@ fn Editor() -> Element {
     let rerender_title = move |k: usize| {
         let Some(t) = titles.read().get(k).cloned() else { return };
         spawn(async move {
-            match engine::render_title(
-                &t.text,
-                t.font_size as u32,
-                title_color(&t.color),
-                title_y(&t.pos),
-                &t.bevel,
-                t.bevel_size as u32,
-            )
-            .await
-            {
+            match render_one(&t).await {
                 Ok(png) => {
                     if let Some(item) = titles.write().get_mut(k) {
                         item.png = png;
@@ -310,41 +425,143 @@ fn Editor() -> Element {
         seek_to(start_of(i));
     };
 
-    let mut split_at_playhead = move |_: ()| {
-        let loc = locate(&clips.read(), playhead());
-        let Some((i, local)) = loc else { return };
-        let (in_s, out_s) = {
-            let c = &clips.read()[i];
-            (c.in_s, c.out_s)
-        };
-        if local < in_s + 0.1 || local > out_s - 0.1 {
-            status.set("Playhead is too close to a cut to split.".to_string());
+    // Magnetic timeline: V2/A1/T items anchor to the V1 clip under their start
+    // point, so trims, moves and ripple deletes carry them along. ~ toggles it
+    // off to edit V1 while attached items hold position (this timeline has no
+    // dragging, so "hold ~ while dragging" becomes a toggle).
+    // ponytail: anchors are positional, not content ids — an item re-anchors if
+    // an edit puts a different clip under it.
+    let mut magnet = use_signal(|| true);
+    let spans = move || -> Vec<(f64, f64)> {
+        let mut acc = 0.0;
+        clips.read().iter().map(|c| { let s = acc; acc += c.trimmed(); (s, acc) }).collect()
+    };
+    let mut ride = move |old: Vec<(f64, f64)>, new_start: &dyn Fn(usize) -> Option<f64>| {
+        if !magnet() {
             return;
         }
-        {
+        for o in overlays.write().iter_mut() {
+            o.at = (o.at + magnet_delta(o.at, &old, new_start)).max(0.0);
+        }
+        for a in audios.write().iter_mut() {
+            a.at = (a.at + magnet_delta(a.at, &old, new_start)).max(0.0);
+        }
+        for t in titles.write().iter_mut() {
+            t.at = (t.at + magnet_delta(t.at, &old, new_start)).max(0.0);
+        }
+    };
+    let mut toggle_magnet = move |_: ()| {
+        magnet.toggle();
+        status.set(if magnet() {
+            "Magnetic timeline on — attached V2/A1/T items ride V1 edits."
+        } else {
+            "Magnetic timeline off — V1 edits leave attached items in place."
+        }
+        .to_string());
+    };
+
+    // Split at playhead: a selected V2/A1 item splits if the playhead is inside
+    // its span; otherwise the V1 clip under the playhead splits. Selection lands
+    // on the right half — where the playhead is — matching seek behavior.
+    let mut split_at_playhead = move |_: ()| {
+        const MIN: f64 = 0.1;
+        let t = playhead();
+        let mut too_close = move || status.set("Playhead is too close to an edge to split.".to_string());
+
+        if let Some(Sel::Over(j)) = selected() {
+            let Some(o) = overlays.read().get(j).cloned() else { return };
+            match cut_local(o.in_s, o.out_s, o.in_s + (t - o.at), MIN) {
+                Some(local) => {
+                    {
+                        let mut ov = overlays.write();
+                        let mut right = ov[j].clone();
+                        ov[j].out_s = local;
+                        right.in_s = local;
+                        right.at = t;
+                        ov.insert(j + 1, right);
+                    }
+                    selected.set(Some(Sel::Over(j + 1)));
+                    status.set(format!("Split overlay {} at {}.", o.name, fmt_t(t)));
+                }
+                None => too_close(),
+            }
+            return;
+        }
+        if let Some(Sel::Aud(k)) = selected() {
+            let Some(a) = audios.read().get(k).cloned() else { return };
+            match cut_local(a.in_s, a.out_s, a.in_s + (t - a.at), MIN) {
+                Some(local) => {
+                    {
+                        let mut au = audios.write();
+                        let mut right = au[k].clone();
+                        au[k].out_s = local;
+                        right.in_s = local;
+                        right.at = t;
+                        au.insert(k + 1, right);
+                    }
+                    selected.set(Some(Sel::Aud(k + 1)));
+                    status.set(format!("Split audio {} at {}.", a.name, fmt_t(t)));
+                }
+                None => too_close(),
+            }
+            return;
+        }
+
+        let loc = locate(&clips.read(), t);
+        let Some((i, local)) = loc else { return };
+        let (name, in_s, out_s) = {
+            let c = &clips.read()[i];
+            (c.name.clone(), c.in_s, c.out_s)
+        };
+        let Some(local) = cut_local(in_s, out_s, local, MIN) else {
+            too_close();
+            return;
+        };
+        let (scrub, path) = {
             let mut cl = clips.write();
             let mut right = cl[i].clone();
             cl[i].out_s = local;
             right.in_s = local;
             cl.insert(i + 1, right);
-        }
-        selected.set(Some(Sel::Main(i)));
-        status.set("Split clip — both halves are on the timeline.".to_string());
+            (cl[i + 1].scrub_path(), cl[i + 1].path.clone())
+        };
+        selected.set(Some(Sel::Main(i + 1)));
+        status.set(format!("Split {} at {}.", name, fmt_t(t)));
+        // The right half's thumbnail still shows the left's frame — retake it
+        // at the new in point so the two halves are tellable apart.
+        spawn(async move {
+            if let Ok(thumb) = engine::frame_data_uri(&scrub, local, 108, 192, "", None).await {
+                let mut cl = clips.write();
+                if let Some(c) = cl.get_mut(i + 1) {
+                    if c.path == path && (c.in_s - local).abs() < 1e-6 {
+                        c.thumb = thumb;
+                    }
+                }
+            }
+        });
     };
 
     // I/O: trim the V1 clip under the playhead to the playhead.
     let mut set_in_here = move |_: ()| {
         let loc = locate(&clips.read(), playhead());
         if let Some((i, local)) = loc {
-            let mut cl = clips.write();
-            cl[i].in_s = local.min(cl[i].out_s - 0.1).max(0.0);
+            let old = spans();
+            {
+                let mut cl = clips.write();
+                cl[i].in_s = local.min(cl[i].out_s - 0.1).max(0.0);
+            }
+            ride(old, &|k| Some(start_of(k)));
         }
     };
     let mut set_out_here = move |_: ()| {
         let loc = locate(&clips.read(), playhead());
         if let Some((i, local)) = loc {
-            let mut cl = clips.write();
-            cl[i].out_s = local.max(cl[i].in_s + 0.1).min(cl[i].duration);
+            let old = spans();
+            {
+                let mut cl = clips.write();
+                cl[i].out_s = local.max(cl[i].in_s + 0.1).min(cl[i].duration);
+            }
+            ride(old, &|k| Some(start_of(k)));
         }
     };
 
@@ -525,16 +742,7 @@ fn Editor() -> Element {
             .map(|(k, t)| (k, t.clone()))
             .collect();
         for (k, t) in missing {
-            if let Ok(png) = engine::render_title(
-                &t.text,
-                t.font_size as u32,
-                title_color(&t.color),
-                title_y(&t.pos),
-                &t.bevel,
-                t.bevel_size as u32,
-            )
-            .await
-            {
+            if let Ok(png) = render_one(&t).await {
                 if let Some(item) = titles.write().get_mut(k) {
                     item.png = png;
                 }
@@ -638,8 +846,11 @@ fn Editor() -> Element {
         if let Some(Sel::Main(i)) = selected() {
             let j = i as i64 + delta;
             if j >= 0 && (j as usize) < clips.read().len() {
-                clips.write().swap(i, j as usize);
-                selected.set(Some(Sel::Main(j as usize)));
+                let j = j as usize;
+                let old = spans();
+                clips.write().swap(i, j);
+                selected.set(Some(Sel::Main(j)));
+                ride(old, &|k| Some(start_of(if k == i { j } else if k == j { i } else { k })));
             }
         }
     };
@@ -647,7 +858,9 @@ fn Editor() -> Element {
     let mut delete_sel = move |_: ()| {
         match selected() {
             Some(Sel::Main(i)) => {
+                let old = spans();
                 clips.write().remove(i); // ripple by construction — the gap closes
+                ride(old, &|k| (k != i).then(|| start_of(if k > i { k - 1 } else { k })));
                 let len = clips.read().len();
                 if len == 0 {
                     selected.set(None);
@@ -700,6 +913,8 @@ fn Editor() -> Element {
     use_shortcut(Some("END".into()), Some(EventHandler::new(move |()| seek_to(total_of()))));
     use_shortcut(Some("[".into()), Some(EventHandler::new(move |()| step_sel(-1))));
     use_shortcut(Some("]".into()), Some(EventHandler::new(move |()| step_sel(1))));
+    use_shortcut(Some("ESCAPE".into()), Some(EventHandler::new(move |()| ctx_menu.set(None))));
+    use_shortcut(Some("~".into()), Some(EventHandler::new(move |()| toggle_magnet(()))));
 
     // Window chrome preference (frameless / native / tiling), persisted like
     // the blogger theme editor; takes effect on next launch.
@@ -714,6 +929,21 @@ fn Editor() -> Element {
     };
     let radio = move |m: UiMode| if preferred_mode() == m { "●" } else { "○" };
 
+    // Pop-out program monitor: a second OS window sharing the same preview
+    // signal — closing it is how you "dock" it back.
+    let open_monitor = move || {
+        use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
+        let dom = VirtualDom::new_with_props(Monitor, MonitorProps { preview });
+        let cfg = Config::new()
+            .with_menu(None::<dioxus::desktop::muda::Menu>)
+            .with_window(
+                WindowBuilder::new()
+                    .with_title("MorReel Monitor")
+                    .with_inner_size(LogicalSize::new(414.0, 764.0)),
+            );
+        let _ = dioxus::desktop::window().new_window(dom, cfg);
+    };
+
     let total = total_of();
     let exporting = export_progress().is_some();
     let no_clips = clips.read().is_empty();
@@ -724,7 +954,7 @@ fn Editor() -> Element {
             title: "MorReel Studio".to_string(),
             subtitle: Some("portrait 9:16".to_string()),
             app_name: "MorReel Studio".to_string(),
-            menu: if is_mobile() { None } else { Some(rsx! {
+            menu: Some(rsx! {
                 MorMenuDropdown { label: "File".to_string(),
                     MenuItem {
                         label: "Add clips…".to_string(),
@@ -798,6 +1028,12 @@ fn Editor() -> Element {
                         disabled: !matches!(selected(), Some(Sel::Main(_))),
                         on_action: move |_| move_sel(1),
                     }
+                    MenuSeparator {}
+                    MenuItem {
+                        label: format!("{} Magnetic timeline", if magnet() { "●" } else { "○" }),
+                        shortcut: Some("~".to_string()),
+                        on_action: move |_| toggle_magnet(()),
+                    }
                 }
                 MorMenuDropdown { label: "Playback".to_string(),
                     MenuItem {
@@ -814,6 +1050,11 @@ fn Editor() -> Element {
                     }
                 }
                 MorMenuDropdown { label: "View".to_string(),
+                    MenuItem {
+                        label: "Pop out monitor".to_string(),
+                        on_action: move |_| open_monitor(),
+                    }
+                    MenuSeparator {}
                     MenuItem {
                         label: format!("{} Frameless window", radio(UiMode::Frameless)),
                         on_action: move |_| set_mode(UiMode::Frameless),
@@ -837,9 +1078,12 @@ fn Editor() -> Element {
                         on_action: move |_| show_about.set(true),
                     }
                 }
-            }) },
+            }),
             status_left: rsx! { span { class: "mor-statusbar-muted", "{status}" } },
             status_right: rsx! {
+                if !magnet() {
+                    span { class: "mor-statusbar-chip mor-statusbar-warn", "magnet off" }
+                }
                 if preferred_mode() != active_mode {
                     span { class: "mor-statusbar-chip mor-statusbar-warn", "window mode: restart to apply" }
                 }
@@ -851,6 +1095,7 @@ fn Editor() -> Element {
                 div { class: "mr-work",
                     div { class: "mr-preview-col",
                         div { class: "mr-phone",
+                            oncontextmenu: move |evt| open_ctx(evt, Ctx::Monitor),
                             if preview().is_empty() {
                                 span { "Portrait preview" }
                             } else {
@@ -881,6 +1126,12 @@ fn Editor() -> Element {
                                         onclick: move |_| play_preview(()),
                                         "🎬 Full preview"
                                     }
+                                    button {
+                                        class: "mor-btn",
+                                        title: "Open the monitor in its own window — edit on one screen, watch on another",
+                                        onclick: move |_| open_monitor(),
+                                        "⧉ Pop out"
+                                    }
                                 }
                             }
                         }
@@ -894,25 +1145,23 @@ fn Editor() -> Element {
                                 onclick: move |_| import_clips(()),
                                 "＋ Add clips"
                             }
-                            if !is_mobile() {
-                                button {
-                                    class: "mor-btn",
-                                    disabled: clips.read().is_empty() || exporting,
-                                    onclick: move |_| add_overlay(()),
-                                    "＋ Overlay (V2)"
-                                }
-                                button {
-                                    class: "mor-btn",
-                                    disabled: clips.read().is_empty() || exporting,
-                                    onclick: move |_| add_audio(()),
-                                    "＋ Audio (A1)"
-                                }
-                                button {
-                                    class: "mor-btn",
-                                    disabled: clips.read().is_empty() || exporting,
-                                    onclick: move |_| add_title(()),
-                                    "＋ Title"
-                                }
+                            button {
+                                class: "mor-btn",
+                                disabled: clips.read().is_empty() || exporting,
+                                onclick: move |_| add_overlay(()),
+                                "＋ Overlay (V2)"
+                            }
+                            button {
+                                class: "mor-btn",
+                                disabled: clips.read().is_empty() || exporting,
+                                onclick: move |_| add_audio(()),
+                                "＋ Audio (A1)"
+                            }
+                            button {
+                                class: "mor-btn",
+                                disabled: clips.read().is_empty() || exporting,
+                                onclick: move |_| add_title(()),
+                                "＋ Title"
                             }
                             button {
                                 class: "mor-btn",
@@ -951,11 +1200,13 @@ fn Editor() -> Element {
                                             let path = c.scrub_path();
                                             let eff = effect_filter(&c.effect).to_string();
                                             move |v: f64| {
+                                                let old = spans();
                                                 let t = {
                                                     let mut cl = clips.write();
                                                     cl[i].in_s = v.min(cl[i].out_s - 0.1).max(0.0);
                                                     cl[i].in_s
                                                 };
+                                                ride(old, &|k| Some(start_of(k)));
                                                 playhead.set(start_of(i));
                                                 request_preview(path.clone(), t, eff.clone(), None);
                                             }
@@ -972,11 +1223,13 @@ fn Editor() -> Element {
                                             let path = c.scrub_path();
                                             let eff = effect_filter(&c.effect).to_string();
                                             move |v: f64| {
+                                                let old = spans();
                                                 let t = {
                                                     let mut cl = clips.write();
                                                     cl[i].out_s = v.max(cl[i].in_s + 0.1).min(cl[i].duration);
                                                     cl[i].out_s
                                                 };
+                                                ride(old, &|k| Some(start_of(k)));
                                                 playhead.set(start_of(i + 1));
                                                 request_preview(path.clone(), t, eff.clone(), None);
                                             }
@@ -1271,146 +1524,305 @@ fn Editor() -> Element {
                             },
                         }}
 
-                        if !is_mobile() {
-                            p { class: "mor-statusbar-muted mr-keys",
-                                "I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · [ ] select clip · Ctrl+O add · Ctrl+E export"
-                            }
+                        p { class: "mor-statusbar-muted mr-keys",
+                            "I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · [ ] select clip · ~ magnet · Ctrl+O add · Ctrl+E export"
                         }
                     }
                 }
 
-                if is_mobile() {
-                    // Mobile: no timeline strip — a pager steps through clips instead.
-                    div { class: "mr-pager",
-                        button {
-                            class: "mor-btn",
-                            disabled: !matches!(selected(), Some(Sel::Main(i)) if i > 0),
-                            onclick: move |_| {
-                                if let Some(Sel::Main(i)) = selected() { select_clip(i - 1); }
-                            },
-                            "◀"
-                        }
-                        span { class: "mr-pager-label",
-                            match selected() {
-                                Some(Sel::Main(i)) => format!("Clip {} of {}", i + 1, clips.read().len()),
-                                _ => "No clips".to_string(),
-                            }
-                        }
-                        button {
-                            class: "mor-btn",
-                            disabled: !matches!(selected(), Some(Sel::Main(i)) if i + 1 < clips.read().len()),
-                            onclick: move |_| {
-                                if let Some(Sel::Main(i)) = selected() { select_clip(i + 1); }
-                            },
-                            "▶"
-                        }
-                    }
-                } else {
-                    div { class: "mr-timeline",
-                        if clips.read().is_empty() {
-                            span { class: "mor-statusbar-muted mr-timeline-hint", "Timeline — clips play left to right" }
-                        } else {
-                            {
-                                // ponytail: scale keyed to shortest clip (min 48px wide) — no
-                                // per-clip min-width, so ruler/playhead geometry stays exact.
-                                let min_dur = clips.read().iter().map(Clip::trimmed).fold(f64::MAX, f64::min);
-                                let scale = (48.0 / min_dur).clamp(14.0, 240.0);
-                                let track_end = total
-                                    .max(overlays.read().iter().map(|o| o.at + o.out_s - o.in_s).fold(0.0, f64::max))
-                                    .max(titles.read().iter().map(|t| t.at + t.dur).fold(0.0, f64::max))
-                                    .max(audios.read().iter().map(|a| a.at + a.out_s - a.in_s).fold(0.0, f64::max));
-                                let tick_s = if track_end <= 30.0 { 5.0 } else if track_end <= 120.0 { 10.0 } else { 30.0 };
-                                let ph = playhead().min(total);
-                                rsx! {
-                                    div { class: "mr-track", style: "width: {track_end * scale}px",
-                                        div {
-                                            class: "mr-ruler",
-                                            onclick: move |evt: Event<MouseData>| {
-                                                seek_to((evt.element_coordinates().x / scale).clamp(0.0, total_of()));
-                                            },
-                                            for k in 0..=((track_end / tick_s) as usize) {
-                                                span {
-                                                    class: "mr-tick",
-                                                    style: "left: {k as f64 * tick_s * scale}px",
-                                                    "{fmt_t(k as f64 * tick_s)}"
-                                                }
+                div { class: "mr-timeline",
+                    oncontextmenu: move |evt| open_ctx(evt, Ctx::Timeline),
+                    if clips.read().is_empty() {
+                        span { class: "mor-statusbar-muted mr-timeline-hint", "Timeline — clips play left to right" }
+                    } else {
+                        {
+                            // ponytail: scale keyed to shortest clip (min 48px wide) — no
+                            // per-clip min-width, so ruler/playhead geometry stays exact.
+                            let min_dur = clips.read().iter().map(Clip::trimmed).fold(f64::MAX, f64::min);
+                            let scale = (48.0 / min_dur).clamp(14.0, 240.0);
+                            let track_end = total
+                                .max(overlays.read().iter().map(|o| o.at + o.out_s - o.in_s).fold(0.0, f64::max))
+                                .max(titles.read().iter().map(|t| t.at + t.dur).fold(0.0, f64::max))
+                                .max(audios.read().iter().map(|a| a.at + a.out_s - a.in_s).fold(0.0, f64::max));
+                            let tick_s = if track_end <= 30.0 { 5.0 } else if track_end <= 120.0 { 10.0 } else { 30.0 };
+                            let ph = playhead().min(total);
+                            rsx! {
+                                div { class: "mr-track", style: "width: {track_end * scale}px",
+                                    div {
+                                        class: "mr-ruler",
+                                        onclick: move |evt: Event<MouseData>| {
+                                            seek_to((evt.element_coordinates().x / scale).clamp(0.0, total_of()));
+                                        },
+                                        for k in 0..=((track_end / tick_s) as usize) {
+                                            span {
+                                                class: "mr-tick",
+                                                style: "left: {k as f64 * tick_s * scale}px",
+                                                "{fmt_t(k as f64 * tick_s)}"
                                             }
                                         }
-                                        div { class: "mr-lane",
-                                            span { class: "mr-lane-tag title", "T" }
-                                            for (k, t) in titles().into_iter().enumerate() {
-                                                div {
-                                                    key: "title-{k}",
-                                                    class: if selected() == Some(Sel::Title(k)) { "mr-lane-item title selected" } else { "mr-lane-item title" },
-                                                    style: "left: {t.at * scale}px; width: {t.dur * scale}px",
-                                                    onclick: move |_| {
-                                                        let at = titles.read()[k].at;
-                                                        seek_to(at);
-                                                        selected.set(Some(Sel::Title(k)));
-                                                    },
-                                                    "𝐓 {t.text}"
-                                                }
-                                            }
-                                        }
-                                        div { class: "mr-lane",
-                                            span { class: "mr-lane-tag", "V2" }
-                                            for (j, o) in overlays().into_iter().enumerate() {
-                                                div {
-                                                    key: "{j}-{o.path}",
-                                                    class: if selected() == Some(Sel::Over(j)) { "mr-lane-item selected" } else { "mr-lane-item" },
-                                                    style: "left: {o.at * scale}px; width: {(o.out_s - o.in_s) * scale}px",
-                                                    onclick: move |_| {
-                                                        let at = overlays.read()[j].at;
-                                                        seek_to(at);
-                                                        selected.set(Some(Sel::Over(j)));
-                                                    },
-                                                    "{o.name}"
-                                                }
-                                            }
-                                        }
-                                        div { class: "mr-clips",
-                                            span { class: "mr-lane-tag", "V1" }
-                                            for (i, c) in clips().into_iter().enumerate() {
-                                                div {
-                                                    key: "{i}-{c.path}",
-                                                    class: if selected() == Some(Sel::Main(i)) { "mr-clip selected" } else { "mr-clip" },
-                                                    style: "width: {c.trimmed() * scale}px",
-                                                    onclick: move |_| select_clip(i),
-                                                    if c.thumb.is_empty() {
-                                                        div { class: "mr-thumb-missing" }
-                                                    } else {
-                                                        img { src: "{c.thumb}" }
-                                                    }
-                                                    span { class: "mr-clip-name",
-                                                        if c.effect != "None" { "✨ " }
-                                                        "{c.name}"
-                                                    }
-                                                    span { class: "mr-clip-dur", "{fmt_t(c.trimmed())}" }
-                                                }
-                                            }
-                                        }
-                                        div { class: "mr-lane mr-lane-a1",
-                                            span { class: "mr-lane-tag", "A1" }
-                                            for (k, a) in audios().into_iter().enumerate() {
-                                                div {
-                                                    key: "{k}-{a.path}",
-                                                    class: if selected() == Some(Sel::Aud(k)) { "mr-lane-item audio selected" } else { "mr-lane-item audio" },
-                                                    style: "left: {a.at * scale}px; width: {(a.out_s - a.in_s) * scale}px",
-                                                    onclick: move |_| {
-                                                        let at = audios.read()[k].at;
-                                                        seek_to(at);
-                                                        selected.set(Some(Sel::Aud(k)));
-                                                    },
-                                                    "♪ {a.name}"
-                                                }
-                                            }
-                                        }
-                                        div { class: "mr-playhead", style: "left: {ph * scale}px" }
                                     }
+                                    div { class: "mr-lane",
+                                        span { class: "mr-lane-tag title", "T" }
+                                        for (k, t) in titles().into_iter().enumerate() {
+                                            div {
+                                                key: "title-{k}",
+                                                class: if selected() == Some(Sel::Title(k)) { "mr-lane-item title selected" } else { "mr-lane-item title" },
+                                                style: "left: {t.at * scale}px; width: {t.dur * scale}px",
+                                                onclick: move |_| {
+                                                    let at = titles.read()[k].at;
+                                                    seek_to(at);
+                                                    selected.set(Some(Sel::Title(k)));
+                                                },
+                                                oncontextmenu: move |evt| {
+                                                    selected.set(Some(Sel::Title(k)));
+                                                    open_ctx(evt, Ctx::Title(k));
+                                                },
+                                                "𝐓 {t.text}"
+                                            }
+                                        }
+                                    }
+                                    div { class: "mr-lane",
+                                        span { class: "mr-lane-tag", "V2" }
+                                        for (j, o) in overlays().into_iter().enumerate() {
+                                            div {
+                                                key: "{j}-{o.path}",
+                                                class: if selected() == Some(Sel::Over(j)) { "mr-lane-item selected" } else { "mr-lane-item" },
+                                                style: "left: {o.at * scale}px; width: {(o.out_s - o.in_s) * scale}px",
+                                                onclick: move |_| {
+                                                    let at = overlays.read()[j].at;
+                                                    seek_to(at);
+                                                    selected.set(Some(Sel::Over(j)));
+                                                },
+                                                oncontextmenu: move |evt| {
+                                                    selected.set(Some(Sel::Over(j)));
+                                                    open_ctx(evt, Ctx::Over(j));
+                                                },
+                                                "{o.name}"
+                                            }
+                                        }
+                                    }
+                                    div { class: "mr-clips",
+                                        span { class: "mr-lane-tag", "V1" }
+                                        for (i, c) in clips().into_iter().enumerate() {
+                                            div {
+                                                key: "{i}-{c.path}",
+                                                class: if selected() == Some(Sel::Main(i)) { "mr-clip selected" } else { "mr-clip" },
+                                                style: "width: {c.trimmed() * scale}px",
+                                                onclick: move |_| select_clip(i),
+                                                // Right-click selects without moving the playhead.
+                                                oncontextmenu: move |evt| {
+                                                    selected.set(Some(Sel::Main(i)));
+                                                    open_ctx(evt, Ctx::Clip(i));
+                                                },
+                                                if c.thumb.is_empty() {
+                                                    div { class: "mr-thumb-missing" }
+                                                } else {
+                                                    img { src: "{c.thumb}" }
+                                                }
+                                                span { class: "mr-clip-name",
+                                                    if c.effect != "None" { "✨ " }
+                                                    "{c.name}"
+                                                }
+                                                span { class: "mr-clip-dur", "{fmt_t(c.trimmed())}" }
+                                            }
+                                        }
+                                    }
+                                    div { class: "mr-lane mr-lane-a1",
+                                        span { class: "mr-lane-tag", "A1" }
+                                        for (k, a) in audios().into_iter().enumerate() {
+                                            div {
+                                                key: "{k}-{a.path}",
+                                                class: if selected() == Some(Sel::Aud(k)) { "mr-lane-item audio selected" } else { "mr-lane-item audio" },
+                                                style: "left: {a.at * scale}px; width: {(a.out_s - a.in_s) * scale}px",
+                                                onclick: move |_| {
+                                                    let at = audios.read()[k].at;
+                                                    seek_to(at);
+                                                    selected.set(Some(Sel::Aud(k)));
+                                                },
+                                                oncontextmenu: move |evt| {
+                                                    selected.set(Some(Sel::Aud(k)));
+                                                    open_ctx(evt, Ctx::Aud(k));
+                                                },
+                                                "♪ {a.name}"
+                                            }
+                                        }
+                                    }
+                                    div { class: "mr-playhead", style: "left: {ph * scale}px" }
                                 }
                             }
                         }
                     }
+                }
+            }
+        }
+
+        if let Some((cx, cy, target)) = ctx_menu() {
+            // Invisible backdrop: any click or second right-click dismisses.
+            div {
+                class: "mr-ctx-backdrop",
+                onclick: move |_| ctx_menu.set(None),
+                oncontextmenu: move |evt| {
+                    evt.prevent_default();
+                    ctx_menu.set(None);
+                },
+                div {
+                    class: "mor-menu-dropdown mr-ctx",
+                    // transform % resolves against the menu's own box, so it slides
+                    // on screen exactly — no estimated heights to keep in sync.
+                    style: "left: {cx}px; top: {cy}px; transform: translate(min(0px, calc(100vw - {cx}px - 100%)), min(0px, calc(100vh - {cy}px - 100%)));",
+                    {match target {
+                        Ctx::Monitor => rsx! {
+                            div { class: "mr-ctx-head",
+                                span { class: "mr-ctx-tag", "MON" }
+                                span { class: "mr-ctx-name", "Program monitor" }
+                            }
+                            CtxItem {
+                                label: if playing() { "Pause".to_string() } else { "Play".to_string() },
+                                shortcut: Some("Space".to_string()),
+                                disabled: no_clips,
+                                on_action: move |_| toggle_play(()),
+                            }
+                            CtxItem {
+                                label: "Full preview with audio…".to_string(),
+                                shortcut: Some("Ctrl+P".to_string()),
+                                disabled: no_clips || exporting,
+                                on_action: move |_| play_preview(()),
+                            }
+                            MenuSeparator {}
+                            CtxItem {
+                                label: "Open monitor in new window".to_string(),
+                                on_action: move |_| open_monitor(),
+                            }
+                        },
+                        Ctx::Timeline => rsx! {
+                            CtxItem {
+                                label: "Add clips…".to_string(),
+                                shortcut: Some("Ctrl+O".to_string()),
+                                disabled: importing() || exporting,
+                                on_action: move |_| import_clips(()),
+                            }
+                            CtxItem {
+                                label: "Add overlay (V2)…".to_string(),
+                                disabled: no_clips || exporting,
+                                on_action: move |_| add_overlay(()),
+                            }
+                            CtxItem {
+                                label: "Add audio (A1)…".to_string(),
+                                disabled: no_clips || exporting,
+                                on_action: move |_| add_audio(()),
+                            }
+                            CtxItem {
+                                label: "Add title (T)".to_string(),
+                                shortcut: Some("Ctrl+T".to_string()),
+                                disabled: no_clips || exporting,
+                                on_action: move |_| add_title(()),
+                            }
+                            MenuSeparator {}
+                            CtxItem {
+                                label: "Export MP4…".to_string(),
+                                shortcut: Some("Ctrl+E".to_string()),
+                                disabled: no_clips || exporting,
+                                on_action: move |_| do_export(()),
+                            }
+                        },
+                        Ctx::Clip(i) => {
+                            let len = clips.read().len();
+                            let name = clips.read().get(i).map(|c| c.name.clone()).unwrap_or_default();
+                            rsx! {
+                                div { class: "mr-ctx-head",
+                                    span { class: "mr-ctx-tag", "V1" }
+                                    span { class: "mr-ctx-name", "{name}" }
+                                }
+                                CtxItem {
+                                    label: "Split at playhead".to_string(),
+                                    shortcut: Some("S".to_string()),
+                                    on_action: move |_| split_at_playhead(()),
+                                }
+                                CtxItem {
+                                    label: "Set in point at playhead".to_string(),
+                                    shortcut: Some("I".to_string()),
+                                    on_action: move |_| set_in_here(()),
+                                }
+                                CtxItem {
+                                    label: "Set out point at playhead".to_string(),
+                                    shortcut: Some("O".to_string()),
+                                    on_action: move |_| set_out_here(()),
+                                }
+                                MenuSeparator {}
+                                CtxItem {
+                                    label: "Move clip left".to_string(),
+                                    disabled: i == 0,
+                                    on_action: move |_| move_sel(-1),
+                                }
+                                CtxItem {
+                                    label: "Move clip right".to_string(),
+                                    disabled: i + 1 >= len,
+                                    on_action: move |_| move_sel(1),
+                                }
+                                MenuSeparator {}
+                                CtxItem {
+                                    label: "Ripple delete".to_string(),
+                                    shortcut: Some("Delete".to_string()),
+                                    danger: true,
+                                    on_action: move |_| delete_sel(()),
+                                }
+                            }
+                        }
+                        Ctx::Over(j) => {
+                            let name = overlays.read().get(j).map(|o| o.name.clone()).unwrap_or_default();
+                            rsx! {
+                                div { class: "mr-ctx-head",
+                                    span { class: "mr-ctx-tag", "V2" }
+                                    span { class: "mr-ctx-name", "{name}" }
+                                }
+                                CtxItem {
+                                    label: "Split at playhead".to_string(),
+                                    shortcut: Some("S".to_string()),
+                                    on_action: move |_| split_at_playhead(()),
+                                }
+                                MenuSeparator {}
+                                CtxItem {
+                                    label: "Remove overlay".to_string(),
+                                    danger: true,
+                                    on_action: move |_| delete_sel(()),
+                                }
+                            }
+                        }
+                        Ctx::Aud(k) => {
+                            let name = audios.read().get(k).map(|a| a.name.clone()).unwrap_or_default();
+                            rsx! {
+                                div { class: "mr-ctx-head",
+                                    span { class: "mr-ctx-tag audio", "A1" }
+                                    span { class: "mr-ctx-name", "{name}" }
+                                }
+                                CtxItem {
+                                    label: "Split at playhead".to_string(),
+                                    shortcut: Some("S".to_string()),
+                                    on_action: move |_| split_at_playhead(()),
+                                }
+                                MenuSeparator {}
+                                CtxItem {
+                                    label: "Remove audio".to_string(),
+                                    danger: true,
+                                    on_action: move |_| delete_sel(()),
+                                }
+                            }
+                        }
+                        Ctx::Title(k) => {
+                            let text = titles.read().get(k).map(|t| t.text.clone()).unwrap_or_default();
+                            rsx! {
+                                div { class: "mr-ctx-head",
+                                    span { class: "mr-ctx-tag title", "T" }
+                                    span { class: "mr-ctx-name", "{text}" }
+                                }
+                                CtxItem {
+                                    label: "Remove title".to_string(),
+                                    danger: true,
+                                    on_action: move |_| delete_sel(()),
+                                }
+                            }
+                        }
+                    }}
                 }
             }
         }
@@ -1427,6 +1839,7 @@ fn Editor() -> Element {
                     ("Delete / Backspace", "Ripple delete selection"),
                     ("← / →", "Nudge playhead 0.1s (Shift = 1s)"),
                     ("[ / ]", "Select previous / next clip"),
+                    ("~", "Toggle magnetic timeline (V2/A1/T ride V1 edits)"),
                     ("Home / End", "Jump to start / end"),
                     ("Ctrl+O", "Add clips"),
                     ("Ctrl+T", "Add title at playhead"),
@@ -1455,10 +1868,19 @@ fn Editor() -> Element {
 
 const APP_CSS: &str = r#"
 .mr-root { display: flex; flex-direction: column; gap: 12px; height: 100%; min-height: 0; padding: 12px; box-sizing: border-box; }
-.mr-work { display: flex; gap: 14px; flex: 1; min-height: 0; }
-.mr-preview-col { display: flex; flex-direction: column; gap: 10px; align-items: center; min-height: 0; }
-.mr-phone { flex: 1; min-height: 0; aspect-ratio: 9 / 16; background: #000; border: 1px solid var(--mor-border); border-radius: 16px; overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--mor-text-muted); font-size: 13px; }
+.mr-work { display: flex; gap: 16px; flex: 1; min-height: 0; }
+.mr-preview-col { display: flex; flex-direction: column; gap: 10px; align-items: center; min-height: 0; padding-top: 4px; }
+
+/* Signature: the preview is a phone — bezel and faint tungsten glow. */
+/* Width-driven: aspect-ratio height doesn't feed the flex column's intrinsic width
+   in WebKit, so a flex-sized phone overflows the column. 400px ≈ vertical chrome. */
+.mr-phone { position: relative; flex: none; width: calc((100vh - 400px) * 9 / 16); min-width: 140px; max-height: 100%; aspect-ratio: 9 / 16; background: #000; border: 5px solid #060608; box-shadow: 0 0 0 1px var(--mor-border-light), 0 14px 40px rgba(0, 0, 0, 0.55), 0 0 70px color-mix(in srgb, var(--mor-accent) 7%, transparent); border-radius: 24px; overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--mor-text-muted); font-size: 13px; }
 .mr-phone img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* Pop-out monitor window: the phone alone, sized to the window. */
+.mr-monitor { height: 100vh; display: flex; align-items: center; justify-content: center; padding: 14px; box-sizing: border-box; background: var(--mor-bg); }
+.mr-monitor .mr-phone { width: auto; height: 100%; max-width: 100%; min-width: 0; }
+
 .mr-scrub { width: 100%; }
 .mr-play-row { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
 .mr-inspector { flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 12px; background: var(--mor-panel); border: 1px solid var(--mor-border); border-radius: var(--mor-radius); padding: 14px; overflow-y: auto; }
@@ -1469,34 +1891,65 @@ const APP_CSS: &str = r#"
 .mr-keys { margin-top: auto; font-size: 11px; }
 .mr-progress { height: 6px; background: var(--mor-border); border-radius: 3px; overflow: hidden; }
 .mr-progress > div { height: 100%; background: var(--mor-accent); transition: width 0.3s; }
-.mr-timeline { display: flex; overflow-x: auto; padding: 10px; background: var(--mor-panel); border: 1px solid var(--mor-border); border-radius: var(--mor-radius); min-height: 216px; align-items: flex-start; flex: none; }
+
+/* Timeline sits on the darkest surface — the bench under the work. */
+.mr-timeline { display: flex; overflow-x: auto; padding: 12px 10px 8px; background: var(--mor-header); border: 1px solid var(--mor-border); border-radius: var(--mor-radius); min-height: 216px; align-items: flex-start; flex: none; }
 .mr-timeline-hint { align-self: center; margin: auto; }
 .mr-track { position: relative; flex: none; min-width: 100%; }
-.mr-ruler { position: relative; height: 18px; margin-bottom: 6px; border-bottom: 1px solid var(--mor-border); cursor: pointer; }
-.mr-tick { position: absolute; top: 0; height: 100%; border-left: 1px solid var(--mor-border); padding-left: 3px; font-size: 9px; color: var(--mor-text-muted); pointer-events: none; }
-.mr-lane { position: relative; height: 30px; margin-bottom: 6px; background: rgba(127, 127, 127, 0.07); border-radius: 4px; }
-.mr-lane-tag { position: absolute; top: 4px; left: 4px; z-index: 2; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: var(--mor-success, #2a2); color: #fff; pointer-events: none; }
-.mr-lane-item { position: absolute; top: 2px; bottom: 2px; box-sizing: border-box; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 10px; line-height: 24px; padding: 0 6px 0 30px; border-radius: 4px; border: 2px solid transparent; background: color-mix(in srgb, var(--mor-accent) 35%, transparent); cursor: pointer; }
-.mr-lane-item.audio { background: color-mix(in srgb, var(--mor-success, #2a2) 35%, transparent); }
-.mr-lane-item.title { background: color-mix(in srgb, var(--mor-warning, #ca2) 40%, transparent); }
-.mr-lane-tag.title { background: var(--mor-warning, #ca2); }
-.mr-lane-item.selected { border-color: var(--mor-accent); }
+
+/* Timecodes are instrument readouts: monospace, tabular. */
+.mr-tick, .mr-clip-dur, .mr-key { font-family: ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', monospace; font-variant-numeric: tabular-nums; }
+
+.mr-ruler { position: relative; height: 18px; margin-bottom: 6px; border-bottom: 1px solid var(--mor-border-light); cursor: pointer; }
+.mr-tick { position: absolute; top: 0; height: 100%; border-left: 1px solid var(--mor-border-light); padding-left: 3px; font-size: 9px; color: var(--mor-text-muted); pointer-events: none; }
+
+.mr-lane { position: relative; height: 30px; margin-bottom: 6px; background: rgba(127, 127, 127, 0.06); border-radius: 4px; }
+.mr-lane-tag { position: absolute; top: 4px; left: 4px; z-index: 2; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: var(--mor-accent); color: #141417; pointer-events: none; }
+.mr-lane-tag.title { background: var(--mor-warning); }
+.mr-lane-a1 .mr-lane-tag { background: var(--mor-success); }
+
+.mr-lane-item { position: absolute; top: 2px; bottom: 2px; box-sizing: border-box; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 10px; line-height: 22px; padding: 0 6px 0 30px; border-radius: 4px; border: 2px solid color-mix(in srgb, var(--mor-accent) 40%, transparent); background: color-mix(in srgb, var(--mor-accent) 24%, transparent); cursor: pointer; }
+.mr-lane-item.audio { border-color: color-mix(in srgb, var(--mor-success) 40%, transparent); background: color-mix(in srgb, var(--mor-success) 22%, transparent); }
+.mr-lane-item.title { border-color: color-mix(in srgb, var(--mor-warning) 45%, transparent); background: color-mix(in srgb, var(--mor-warning) 26%, transparent); }
+.mr-lane-item.selected { border-color: var(--mor-accent); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-accent) 35%, transparent); }
+.mr-lane-item.audio.selected { border-color: var(--mor-success); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-success) 35%, transparent); }
+.mr-lane-item.title.selected { border-color: var(--mor-warning); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-warning) 35%, transparent); }
+
 .mr-clips { position: relative; display: flex; margin-bottom: 6px; }
-.mr-clip { flex: none; box-sizing: border-box; overflow: hidden; cursor: pointer; border: 2px solid transparent; border-radius: 6px; padding: 3px; background: var(--mor-header); display: flex; flex-direction: column; gap: 2px; }
-.mr-clip.selected { border-color: var(--mor-accent); }
+.mr-clip { flex: none; box-sizing: border-box; overflow: hidden; cursor: pointer; border: 2px solid transparent; border-radius: 6px; padding: 3px; background: var(--mor-panel); display: flex; flex-direction: column; gap: 2px; transition: border-color 0.12s; }
+.mr-clip:hover { border-color: var(--mor-border-light); }
+.mr-clip.selected { border-color: var(--mor-accent); box-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 30%, transparent); }
 .mr-clip img, .mr-thumb-missing { width: 100%; height: 72px; object-fit: cover; border-radius: 4px; display: block; background: #000; }
 .mr-clip-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .mr-clip-dur { font-size: 10px; color: var(--mor-text-muted); }
-.mr-playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--mor-accent); pointer-events: none; }
-.mr-pager { display: flex; gap: 12px; align-items: center; justify-content: center; padding: 10px; background: var(--mor-panel); border: 1px solid var(--mor-border); border-radius: var(--mor-radius); flex: none; }
-.mr-pager-label { font-size: 13px; min-width: 90px; text-align: center; }
+
+/* Record-red playhead with a head cap — reads at a glance against amber/teal/gold. */
+.mr-playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--mor-destructive); box-shadow: 0 0 6px color-mix(in srgb, var(--mor-destructive) 60%, transparent); pointer-events: none; }
+.mr-playhead::before { content: ""; position: absolute; top: 0; left: -4px; border: 5px solid transparent; border-top: 6px solid var(--mor-destructive); }
+
+/* Right-click menu: the kit's dropdown chrome, summoned at the pointer.
+   Header chip names the lane the actions apply to, same colors as the timeline. */
+.mr-ctx-backdrop { position: fixed; inset: 0; z-index: 400; }
+.mr-ctx { display: block; position: fixed; margin: 0; width: 228px; z-index: 401; }
+.mr-ctx-head { display: flex; align-items: center; gap: 6px; padding: 4px 10px 7px; border-bottom: 1px solid var(--mor-border-light); margin-bottom: 4px; }
+.mr-ctx-tag { flex: none; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 3px; background: var(--mor-accent); color: #141417; }
+.mr-ctx-tag.audio { background: var(--mor-success); }
+.mr-ctx-tag.title { background: var(--mor-warning); }
+.mr-ctx-name { font-size: 11px; color: var(--mor-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Destructive rows read record-red at rest and hover red, not accent. */
+.mr-ctx .mor-menu-action.mr-danger { color: var(--mor-destructive); }
+.mr-ctx .mor-menu-action.mr-danger:hover:not(:disabled) { background-color: var(--mor-destructive); color: #fff; }
+
 .mr-shortcut-table { border-collapse: collapse; width: 100%; font-size: 13px; }
 .mr-shortcut-table td { padding: 4px 10px 4px 0; }
-.mr-key { font-family: monospace; color: var(--mor-accent-hover); white-space: nowrap; }
+.mr-key { color: var(--mor-accent-hover); white-space: nowrap; }
 @media (max-width: 700px) {
     .mr-work { flex-direction: column; }
-    .mr-phone { flex: none; height: 45vh; }
+    .mr-phone { flex: none; width: auto; height: 45vh; }
     .mr-inspector { min-width: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .mr-clip, .mr-progress > div { transition: none; }
 }
 "#;
 
@@ -1528,6 +1981,35 @@ mod tests {
         assert_eq!(locate(&clips, 6.0), Some((1, 4.0)));
         assert_eq!(locate(&clips, 99.0), Some((1, 5.0))); // past the end clamps to last frame
         assert_eq!(locate(&[], 0.0), None);
+    }
+
+    #[test]
+    fn cut_local_requires_min_on_both_sides() {
+        assert_eq!(cut_local(1.0, 5.0, 3.0, 0.1), Some(3.0));
+        assert_eq!(cut_local(1.0, 5.0, 1.05, 0.1), None); // left sliver
+        assert_eq!(cut_local(1.0, 5.0, 4.95, 0.1), None); // right sliver
+        assert_eq!(cut_local(1.0, 5.0, 1.1, 0.1), Some(1.1)); // exactly min is fine
+        assert_eq!(cut_local(1.0, 5.0, 0.0, 0.1), None); // before span (overlay math)
+        assert_eq!(cut_local(1.0, 5.0, 9.0, 0.1), None); // after span
+    }
+
+    #[test]
+    fn magnet_delta_rides_v1_edits() {
+        // two clips on the timeline: [0,2) and [2,5)
+        let old = [(0.0, 2.0), (2.0, 5.0)];
+        // swap: clip 0 now starts at 3.0, clip 1 at 0.0
+        let swapped = |k: usize| Some(if k == 0 { 3.0 } else { 0.0 });
+        assert_eq!(magnet_delta(1.0, &old, swapped), 3.0); // rider on clip 0
+        assert_eq!(magnet_delta(2.5, &old, swapped), -2.0); // rider on clip 1
+        assert_eq!(magnet_delta(7.0, &old, swapped), 0.0); // past V1: unattached
+        // delete clip 0 (2s): clip 1 slides to 0; clip 0's riders hold position
+        let deleted = |k: usize| (k != 0).then_some(0.0);
+        assert_eq!(magnet_delta(1.0, &old, deleted), 0.0);
+        assert_eq!(magnet_delta(3.0, &old, deleted), -2.0);
+        // out-trim clip 0 to [0,1.5): clip 1 slides left 0.5, clip 0 riders stay
+        let trimmed = |k: usize| Some(if k == 0 { 0.0 } else { 1.5 });
+        assert_eq!(magnet_delta(1.0, &old, trimmed), 0.0);
+        assert_eq!(magnet_delta(2.0, &old, trimmed), -0.5);
     }
 
     #[test]

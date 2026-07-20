@@ -8,9 +8,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 /// Portrait-only output. Every clip is center-cropped to fill this frame.
-pub const W: u32 = 1080;
-pub const H: u32 = 1920;
-pub const FPS: u32 = 30;
+const W: u32 = 1080;
+const H: u32 = 1920;
+const FPS: u32 = 30;
 
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct ClipSpec {
@@ -215,7 +215,7 @@ fn cache_dir(sub: &str) -> std::path::PathBuf {
 
 /// Cache path for a source's scrub proxy, keyed by path + mtime + size so an
 /// edited/replaced source gets a fresh proxy.
-pub fn proxy_path(src: &str) -> std::path::PathBuf {
+fn proxy_path(src: &str) -> std::path::PathBuf {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     src.hash(&mut h);
