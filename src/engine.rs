@@ -8,9 +8,103 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 /// Portrait-only output. Every clip is center-cropped to fill this frame.
-const W: u32 = 1080;
-const H: u32 = 1920;
+pub const W: u32 = 1080;
+pub const H: u32 = 1920;
 const FPS: u32 = 30;
+
+/// Where the picture sits inside the frame, how big it is, and how it is
+/// turned — the Final Cut "Transform" set, which kdenlive calls Position,
+/// scale and opacity. Applied after the framing that fills 9:16 and before the
+/// look effects, so it composes with both.
+// ponytail: no anchor point. It only earns its keep once rotation can be
+// keyframed, and nothing here animates yet.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Transform {
+    /// 1.0 fills the frame, 0.5 is half size.
+    #[serde(default = "unit")]
+    pub scale: f64,
+    /// Offset as a fraction of the frame: 0 is centred, 0.5 is half a frame
+    /// right (or down). Fractions rather than pixels so a transform survives an
+    /// export at a different size.
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    /// Degrees clockwise.
+    #[serde(default)]
+    pub rotation: f64,
+    /// Only means anything where the layer composites over something else — a
+    /// V2 cutaway over V1. On V1 there is nothing underneath but black.
+    #[serde(default = "unit")]
+    pub opacity: f64,
+}
+
+fn unit() -> f64 {
+    1.0
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self { scale: 1.0, x: 0.0, y: 0.0, rotation: 0.0, opacity: 1.0 }
+    }
+}
+
+impl Transform {
+    /// Untouched: emit no filter at all rather than a chain that scales by 1.
+    pub fn is_identity(&self) -> bool {
+        (self.scale - 1.0).abs() < 1e-6
+            && self.x.abs() < 1e-6
+            && self.y.abs() < 1e-6
+            && self.rotation.abs() < 1e-6
+            && (self.opacity - 1.0).abs() < 1e-6
+    }
+}
+
+/// ffmpeg chain for a transform, or "" when it is the identity.
+///
+/// `alpha` builds it for a layer that composites over something else: the area
+/// the picture no longer covers has to be transparent, not black, or a
+/// scaled-down V2 cutaway would black out the V1 clip it is supposed to sit on
+/// top of. That is what makes picture-in-picture work.
+pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
+    if t.is_identity() {
+        return String::new();
+    }
+    // Every dimension is computed here rather than as an ffmpeg expression, so
+    // the crop window is provably inside the padded picture.
+    let even = |v: f64| ((v.round().max(2.0)) as u32) & !1u32;
+    let sw = even(w as f64 * t.scale);
+    let sh = even(h as f64 * t.scale);
+    let dx = (t.x * w as f64).round() as i64;
+    let dy = (t.y * h as f64).round() as i64;
+    // Pad out to whatever the offset crop needs, so the picture can be moved
+    // clean off the edge of the frame instead of jamming against it.
+    let pw = even((sw as f64).max(w as f64 + 2.0 * dx.abs() as f64)).max(sw).max(w);
+    let ph = even((sh as f64).max(h as f64 + 2.0 * dy.abs() as f64)).max(sh).max(h);
+    let fill = if alpha { "black@0" } else { "black" };
+
+    let mut c = String::new();
+    if alpha {
+        c += "format=rgba,";
+    }
+    c += &format!("scale={sw}:{sh}");
+    if t.rotation.abs() > 1e-6 {
+        // rotate keeps the input size, so the corners it opens up take the fill.
+        c += &format!(",rotate={:.5}:c={fill}", t.rotation.to_radians());
+    }
+    c += &format!(",pad={pw}:{ph}:{}:{}:color={fill}", (pw - sw) / 2, (ph - sh) / 2);
+    // Positive x moves the picture right, so the window it is seen through
+    // moves left by the same amount.
+    c += &format!(
+        ",crop={w}:{h}:{}:{}",
+        (pw as i64 - w as i64) / 2 - dx,
+        (ph as i64 - h as i64) / 2 - dy
+    );
+    if alpha && t.opacity < 0.999 {
+        c += &format!(",colorchannelmixer=aa={:.3}", t.opacity.clamp(0.0, 1.0));
+    }
+    c + ",setsar=1"
+}
 
 /// What the file dialogs offer, and the single source of truth for what counts
 /// as what. These are only a convenience filter — ffmpeg reads far more than
@@ -1611,6 +1705,128 @@ mod tests {
             assert!(!AUDIO_EXT.contains(e), "{e} is listed as both image and audio");
             assert!(is_still(&format!("x.{e}")), "{e} should take the still path");
         }
+    }
+
+    #[test]
+    fn identity_transform_emits_nothing() {
+        let t = Transform::default();
+        assert!(t.is_identity());
+        assert_eq!(transform_chain(&t, W, H, false), "", "an untouched clip must add no filter");
+        assert_eq!(transform_chain(&t, W, H, true), "");
+        // Any one knob off the default is no longer the identity.
+        for t in [
+            Transform { scale: 0.5, ..Default::default() },
+            Transform { x: 0.1, ..Default::default() },
+            Transform { y: -0.1, ..Default::default() },
+            Transform { rotation: 90.0, ..Default::default() },
+            Transform { opacity: 0.5, ..Default::default() },
+        ] {
+            assert!(!t.is_identity());
+            assert!(!transform_chain(&t, W, H, false).is_empty());
+        }
+    }
+
+    #[test]
+    fn transform_crop_window_always_lands_inside_the_padding() {
+        // The crop offsets are computed in Rust, not as ffmpeg expressions, so
+        // this is the invariant that keeps ffmpeg from erroring at render time:
+        // the window must sit fully inside the padded picture.
+        for scale in [0.1, 0.25, 0.5, 1.0, 1.7, 4.0] {
+            for x in [-1.0, -0.4, 0.0, 0.33, 1.0] {
+                for y in [-1.0, 0.0, 0.75] {
+                    let t = Transform { scale, x, y, ..Default::default() };
+                    if t.is_identity() {
+                        continue; // no chain to check
+                    }
+                    let chain = transform_chain(&t, W, H, false);
+                    let pad = chain.split("pad=").nth(1).unwrap();
+                    let (pw, ph): (i64, i64) = {
+                        let mut it = pad.split(':');
+                        (it.next().unwrap().parse().unwrap(), it.next().unwrap().parse().unwrap())
+                    };
+                    let crop = chain.split("crop=").nth(1).unwrap();
+                    let n: Vec<i64> = crop
+                        .split(',')
+                        .next()
+                        .unwrap()
+                        .split(':')
+                        .map(|v| v.parse().unwrap())
+                        .collect();
+                    let (cw, ch, cx, cy) = (n[0], n[1], n[2], n[3]);
+                    assert_eq!((cw, ch), (W as i64, H as i64), "crop must end at frame size");
+                    assert!(cx >= 0 && cy >= 0, "negative crop offset at {scale}/{x}/{y}: {chain}");
+                    assert!(
+                        cx + cw <= pw && cy + ch <= ph,
+                        "crop runs off the padding at {scale}/{x}/{y}: {chain}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transform_composites_only_where_it_has_something_to_composite_over() {
+        let t = Transform { scale: 0.5, opacity: 0.5, ..Default::default() };
+        // V1 sits on nothing, so it fills with black and ignores opacity.
+        let v1 = transform_chain(&t, W, H, false);
+        assert!(v1.contains("color=black") && !v1.contains("black@0"), "{v1}");
+        assert!(!v1.contains("colorchannelmixer"), "opacity is meaningless on V1: {v1}");
+        // V2 composites over V1, so it vacates to transparent — that is what
+        // makes a scaled-down cutaway a picture-in-picture instead of a mask.
+        let v2 = transform_chain(&t, W, H, true);
+        assert!(v2.starts_with("format=rgba,"), "{v2}");
+        assert!(v2.contains("color=black@0"), "{v2}");
+        assert!(v2.contains("colorchannelmixer=aa=0.500"), "{v2}");
+    }
+
+    // The chains have to survive ffmpeg, not just look right.
+    #[tokio::test]
+    async fn transformed_overlay_renders_as_picture_in_picture() {
+        let dir = std::env::temp_dir().join("morreel-transform-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.mp4").display().to_string();
+        let b = dir.join("b.mp4").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-f", "lavfi",
+            "-i", "color=c=red:size=320x568:duration=1:rate=30", "-c:v", "libx264", &a,
+        ]).await.unwrap();
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-f", "lavfi",
+            "-i", "color=c=lime:size=320x568:duration=1:rate=30", "-c:v", "libx264", &b,
+        ]).await.unwrap();
+
+        // A green cutaway shrunk into the corner over a red main track.
+        let pip = Transform { scale: 0.4, x: 0.25, y: -0.3, rotation: 8.0, ..Default::default() };
+        let clips = [ClipSpec { path: a, in_s: 0.0, out_s: 1.0, ..Default::default() }];
+        let overlays = [OverlaySpec {
+            path: b,
+            in_s: 0.0,
+            out_s: 1.0,
+            at: 0.0,
+            effect: transform_chain(&pip, W, H, true),
+            framing: "Crop".into(),
+        }];
+        let out = dir.join("pip.mp4");
+        let opts = ExportOpts { quality: Quality::Draft, ..Default::default() };
+        export(&clips, &overlays, &[], &[], &out, opts, |_| {}).await.unwrap();
+
+        // Pull the middle frame and check both colours are on screen: the
+        // cutaway is inset, so the main track must still be visible around it.
+        let png = dir.join("frame.png");
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-ss", "0.5", "-i", &out.display().to_string(),
+            "-frames:v", "1", &png.display().to_string(),
+        ]).await.unwrap();
+        let img = image::open(&png).unwrap().to_rgb8();
+        let reddish = img.pixels().filter(|p| p.0[0] > 120 && p.0[1] < 90).count();
+        let greenish = img.pixels().filter(|p| p.0[1] > 120 && p.0[0] < 90).count();
+        assert!(greenish > 0, "the cutaway never made it into the frame");
+        assert!(reddish > 0, "the cutaway covered everything — it did not shrink");
+        // Scaled to 0.4, the cutaway should occupy well under half the frame.
+        assert!(
+            greenish < reddish,
+            "inset cutaway should cover less than the main track: green={greenish} red={reddish}"
+        );
     }
 
     #[test]

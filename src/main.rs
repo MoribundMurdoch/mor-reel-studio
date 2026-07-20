@@ -284,6 +284,26 @@ fn bevel_opacity() -> f64 {
     0.75
 }
 
+/// One row of the Transform panel: label, value, min, max, step, and how to
+/// write it back. Both lanes carry the same struct, so one table serves both.
+type XformKnob = (&'static str, f64, f64, f64, f64, fn(&mut engine::Transform, f64));
+
+/// Opacity is only offered where it composites over something — on V1 there is
+/// nothing underneath it but black.
+fn transform_knobs(t: &engine::Transform, with_opacity: bool) -> Vec<XformKnob> {
+    let set_scale: fn(&mut engine::Transform, f64) = |x, v| x.scale = v;
+    let mut knobs: Vec<XformKnob> = vec![
+        ("Scale", t.scale, 0.1, 4.0, 0.01, set_scale),
+        ("Position X", t.x, -1.0, 1.0, 0.005, |x, v| x.x = v),
+        ("Position Y", t.y, -1.0, 1.0, 0.005, |x, v| x.y = v),
+        ("Rotation", t.rotation, -180.0, 180.0, 1.0, |x, v| x.rotation = v),
+    ];
+    if with_opacity {
+        knobs.push(("Opacity", t.opacity, 0.0, 1.0, 0.01, |x, v| x.opacity = v));
+    }
+    knobs
+}
+
 /// One row of the bevel panel: label, current value, max, step, and how to
 /// write it back. A table beats seven near-identical slider blocks, and the
 /// ranges are the designer app's.
@@ -346,6 +366,9 @@ struct Clip {
     /// Effect strength 0..=1 (parameter interpolation, not a crossfade).
     effect_amount: f64,
     framing: String,
+    /// Where the picture sits in the frame — scale, position, rotation.
+    #[serde(default)]
+    transform: engine::Transform,
     /// Playback rate: 0.5 is slow motion, 2.0 is double speed.
     #[serde(default = "unity")]
     speed: f64,
@@ -372,11 +395,21 @@ impl Clip {
             in_s: self.in_s,
             out_s: self.out_s,
             has_audio: self.has_audio,
-            effect: effect_filter_amt(&self.effect, self.effect_amount),
+            effect: self.look(),
             framing: self.framing.clone(),
             speed: self.speed,
             volume: self.volume,
         }
+    }
+
+    /// The whole video chain for this clip: geometry first, then the look.
+    /// Every preview, thumbnail and export goes through here, so they cannot
+    /// drift apart.
+    fn look(&self) -> String {
+        join_chain(
+            engine::transform_chain(&self.transform, engine::W, engine::H, false),
+            effect_filter_amt(&self.effect, self.effect_amount),
+        )
     }
 
     /// Seconds on the timeline — the source span retimed by the speed.
@@ -421,6 +454,10 @@ struct OverlayItem {
     /// Effect strength 0..=1 (parameter interpolation, not a crossfade).
     effect_amount: f64,
     framing: String,
+    /// Where the picture sits in the frame. A scaled-down overlay is a
+    /// picture-in-picture, since V2 composites over V1.
+    #[serde(default)]
+    transform: engine::Transform,
     #[serde(skip)]
     proxy: String,
     /// Drag-together group id; 0 = ungrouped.
@@ -428,6 +465,15 @@ struct OverlayItem {
 }
 
 impl OverlayItem {
+    /// Same as a clip's, but built for a layer that composites: the area the
+    /// picture vacates is transparent, so V1 shows through around it.
+    fn look(&self) -> String {
+        join_chain(
+            engine::transform_chain(&self.transform, engine::W, engine::H, true),
+            effect_filter_amt(&self.effect, self.effect_amount),
+        )
+    }
+
     fn scrub_path(&self) -> String {
         if self.proxy.is_empty() { self.path.clone() } else { self.proxy.clone() }
     }
@@ -579,6 +625,15 @@ fn kind_of(path: &str) -> Kind {
         Kind::Still
     } else {
         Kind::Video
+    }
+}
+
+/// Comma-join two filter chains, either of which may be empty.
+fn join_chain(a: String, b: String) -> String {
+    match (a.is_empty(), b.is_empty()) {
+        (true, _) => b,
+        (_, true) => a,
+        _ => format!("{a},{b}"),
     }
 }
 
@@ -828,7 +883,7 @@ fn Editor() -> Element {
                     o.scrub_path(),
                     o.in_s + (t - o.at),
                     o.framing.clone(),
-                    effect_filter_amt(&o.effect, o.effect_amount),
+                    o.look(),
                 )
             },
         );
@@ -843,7 +898,7 @@ fn Editor() -> Element {
         } else if let Some((i, local)) = loc {
             let (path, fr, eff) = {
                 let cl = clips.read();
-                (cl[i].scrub_path(), cl[i].framing.clone(), effect_filter_amt(&cl[i].effect, cl[i].effect_amount))
+                (cl[i].scrub_path(), cl[i].framing.clone(), cl[i].look())
             };
             request_preview(path, local, fr, eff, title_png);
         }
@@ -1273,6 +1328,7 @@ fn Editor() -> Element {
             effect: "None".to_string(),
             effect_amount: 1.0,
             framing: "Crop".to_string(),
+            transform: engine::Transform::default(),
             speed: 1.0,
             volume: 1.0,
             thumb,
@@ -1366,6 +1422,7 @@ fn Editor() -> Element {
                         effect: "None".to_string(),
                         effect_amount: 1.0,
                         framing: "Crop".to_string(),
+                        transform: engine::Transform::default(),
                         proxy: String::new(),
                         group: 0,
                     });
@@ -1494,7 +1551,7 @@ fn Editor() -> Element {
                 in_s: o.in_s,
                 out_s: o.out_s,
                 at: o.at,
-                effect: effect_filter_amt(&o.effect, o.effect_amount),
+                effect: o.look(),
                 framing: o.framing.clone(),
             })
             .collect();
@@ -2129,20 +2186,20 @@ fn Editor() -> Element {
         push_undo("");
         match selected() {
             Some(Sel::Main(i)) if i < clips.read().len() => {
-                let (path, t, fr, amt) = {
+                let (path, t, fr, look) = {
                     let mut cl = clips.write();
                     cl[i].effect = name.clone();
-                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].effect_amount)
+                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look())
                 };
-                request_preview(path, t, fr, effect_filter_amt(&name, amt), None);
+                request_preview(path, t, fr, look, None);
             }
             Some(Sel::Over(j)) if j < overlays.read().len() => {
-                let (path, t, fr, amt) = {
+                let (path, t, fr, look) = {
                     let mut ov = overlays.write();
                     ov[j].effect = name.clone();
-                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].effect_amount)
+                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look())
                 };
-                request_preview(path, t, fr, effect_filter_amt(&name, amt), None);
+                request_preview(path, t, fr, look, None);
             }
             _ => status.set("Select a V1 clip or V2 overlay to apply an effect.".to_string()),
         }
@@ -2156,7 +2213,7 @@ fn Editor() -> Element {
                 let (path, t, fr, eff) = {
                     let mut cl = clips.write();
                     cl[i].effect_amount = v;
-                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), effect_filter_amt(&cl[i].effect, v))
+                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look())
                 };
                 request_preview(path, t, fr, eff, None);
             }
@@ -2164,7 +2221,7 @@ fn Editor() -> Element {
                 let (path, t, fr, eff) = {
                     let mut ov = overlays.write();
                     ov[j].effect_amount = v;
-                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), effect_filter_amt(&ov[j].effect, v))
+                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look())
                 };
                 request_preview(path, t, fr, eff, None);
             }
@@ -2621,7 +2678,7 @@ fn Editor() -> Element {
                                         oninput: Some(EventHandler::new({
                                             let path = c.scrub_path();
                                             let fr = c.framing.clone();
-                                            let eff = effect_filter_amt(&c.effect, c.effect_amount);
+                                            let eff = c.look();
                                             move |v: f64| {
                                                 push_undo(&format!("in{i}"));
                                                 let old = spans();
@@ -2646,7 +2703,7 @@ fn Editor() -> Element {
                                         oninput: Some(EventHandler::new({
                                             let path = c.scrub_path();
                                             let fr = c.framing.clone();
-                                            let eff = effect_filter_amt(&c.effect, c.effect_amount);
+                                            let eff = c.look();
                                             move |v: f64| {
                                                 push_undo(&format!("out{i}"));
                                                 let old = spans();
@@ -2696,7 +2753,7 @@ fn Editor() -> Element {
                                         options: FRAMINGS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                                         onchange: {
                                             let path = c.scrub_path();
-                                            let eff = effect_filter_amt(&c.effect, c.effect_amount);
+                                            let eff = c.look();
                                             move |name: String| {
                                                 let t = {
                                                     let mut cl = clips.write();
@@ -2742,6 +2799,40 @@ fn Editor() -> Element {
                                             })),
                                         }
                                     }
+                                    h4 { class: "mr-fx-cat", "Transform" }
+                                    for (label, value, min, max, step, set) in transform_knobs(&c.transform, false) {
+                                        Slider {
+                                            key: "{label}",
+                                            label: Some(label),
+                                            min, max, step,
+                                            precision: if step < 0.1 { 3 } else { 0 },
+                                            value,
+                                            oninput: Some(EventHandler::new(move |v: f64| {
+                                                push_undo(&format!("xf{label}{i}"));
+                                                let (path, t, fr, look) = {
+                                                    let mut cl = clips.write();
+                                                    set(&mut cl[i].transform, v);
+                                                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look())
+                                                };
+                                                request_preview(path, t, fr, look, None);
+                                            })),
+                                        }
+                                    }
+                                    if !c.transform.is_identity() {
+                                        button {
+                                            class: "mor-btn mr-reset",
+                                            onclick: move |_| {
+                                                push_undo("");
+                                                let (path, t, fr, look) = {
+                                                    let mut cl = clips.write();
+                                                    cl[i].transform = engine::Transform::default();
+                                                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look())
+                                                };
+                                                request_preview(path, t, fr, look, None);
+                                            },
+                                            "↺ Reset transform"
+                                        }
+                                    }
                                     div { class: "mr-toolbar",
                                         button { class: "mor-btn", onclick: move |_| move_sel(-1), "◀ Move left" }
                                         button { class: "mor-btn", onclick: move |_| move_sel(1), "Move right ▶" }
@@ -2784,7 +2875,7 @@ fn Editor() -> Element {
                                         oninput: Some(EventHandler::new({
                                             let path = o.scrub_path();
                                             let fr = o.framing.clone();
-                                            let eff = effect_filter_amt(&o.effect, o.effect_amount);
+                                            let eff = o.look();
                                             move |v: f64| {
                                                 let t = {
                                                     let mut ov = overlays.write();
@@ -2805,7 +2896,7 @@ fn Editor() -> Element {
                                         oninput: Some(EventHandler::new({
                                             let path = o.scrub_path();
                                             let fr = o.framing.clone();
-                                            let eff = effect_filter_amt(&o.effect, o.effect_amount);
+                                            let eff = o.look();
                                             move |v: f64| {
                                                 let t = {
                                                     let mut ov = overlays.write();
@@ -2851,7 +2942,7 @@ fn Editor() -> Element {
                                         options: FRAMINGS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                                         onchange: {
                                             let path = o.scrub_path();
-                                            let eff = effect_filter_amt(&o.effect, o.effect_amount);
+                                            let eff = o.look();
                                             move |name: String| {
                                                 let t = {
                                                     let mut ov = overlays.write();
@@ -2861,6 +2952,43 @@ fn Editor() -> Element {
                                                 request_preview(path.clone(), t, name, eff.clone(), None);
                                             }
                                         },
+                                    }
+                                    h4 { class: "mr-fx-cat", "Transform" }
+                                    p { class: "mor-statusbar-muted mr-export-blurb",
+                                        "Scale below 1 makes this a picture-in-picture — V1 shows through around it."
+                                    }
+                                    for (label, value, min, max, step, set) in transform_knobs(&o.transform, true) {
+                                        Slider {
+                                            key: "{label}",
+                                            label: Some(label),
+                                            min, max, step,
+                                            precision: if step < 0.1 { 3 } else { 0 },
+                                            value,
+                                            oninput: Some(EventHandler::new(move |v: f64| {
+                                                push_undo(&format!("xo{label}{j}"));
+                                                let (path, t, fr, look) = {
+                                                    let mut ov = overlays.write();
+                                                    set(&mut ov[j].transform, v);
+                                                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look())
+                                                };
+                                                request_preview(path, t, fr, look, None);
+                                            })),
+                                        }
+                                    }
+                                    if !o.transform.is_identity() {
+                                        button {
+                                            class: "mor-btn mr-reset",
+                                            onclick: move |_| {
+                                                push_undo("");
+                                                let (path, t, fr, look) = {
+                                                    let mut ov = overlays.write();
+                                                    ov[j].transform = engine::Transform::default();
+                                                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look())
+                                                };
+                                                request_preview(path, t, fr, look, None);
+                                            },
+                                            "↺ Reset transform"
+                                        }
                                     }
                                     div { class: "mr-toolbar",
                                         button { class: "mor-btn mr-danger", onclick: move |_| delete_sel(()), "✕ Remove overlay" }
@@ -3843,6 +3971,9 @@ const APP_CSS: &str = r#"
 .mr-clip-info .mr-ctx-tag { vertical-align: 2px; }
 .mr-clip-info p { margin: 0; font-size: 12px; }
 .mr-danger { color: var(--mor-destructive); }
+/* Reset only appears once a transform is off its default, so its presence
+   doubles as the signal that a clip has been moved at all. */
+.mr-reset { align-self: flex-start; font-size: 11px; }
 .mr-keys { margin-top: auto; font-size: 11px; }
 .mr-progress { height: 6px; background: var(--mor-border); border-radius: 3px; overflow: hidden; }
 .mr-progress > div { height: 100%; background: var(--mor-accent); transition: width 0.3s; }
@@ -3969,6 +4100,7 @@ mod tests {
             effect: "None".to_string(),
             effect_amount: 1.0,
             framing: "Crop".to_string(),
+            transform: engine::Transform::default(),
             speed: 1.0,
             volume: 1.0,
             thumb: String::new(),
@@ -4241,6 +4373,42 @@ mod tests {
         // Anything unrecognised falls back to Off rather than a broken render.
         assert_eq!(bevel_value("nonsense"), "Off");
         assert_eq!(bevel_label("nonsense"), "Off");
+    }
+
+    #[test]
+    fn transform_knob_table_writes_each_field_once() {
+        let mut t = engine::Transform::default();
+        for (i, (_, _, _, _, _, set)) in transform_knobs(&t, true).into_iter().enumerate() {
+            set(&mut t, i as f64 + 1.0);
+        }
+        assert_eq!((t.scale, t.x, t.y, t.rotation, t.opacity), (1.0, 2.0, 3.0, 4.0, 5.0));
+        // V1 has nothing underneath it, so opacity is not offered there.
+        assert_eq!(transform_knobs(&t, false).len(), 4);
+        assert_eq!(transform_knobs(&t, true).len(), 5);
+        assert!(!transform_knobs(&t, false).iter().any(|k| k.0 == "Opacity"));
+
+        // Every slider's range must contain the value it starts at, or the
+        // control would jump the moment it is touched.
+        let d = engine::Transform::default();
+        for (label, value, min, max, _, _) in transform_knobs(&d, true) {
+            assert!(value >= min && value <= max, "{label} default {value} is outside {min}..{max}");
+        }
+    }
+
+    #[test]
+    fn a_clips_look_is_geometry_then_grade() {
+        let mut c = clip(0.0, 2.0);
+        // Untouched: no transform filter at all, just the effect.
+        c.effect = "B&W".to_string();
+        assert_eq!(c.look(), "hue=s=0");
+        // Transformed: geometry first, then the look, comma-joined.
+        c.transform.scale = 0.5;
+        let look = c.look();
+        assert!(look.starts_with("scale="), "geometry should come first: {look}");
+        assert!(look.ends_with(",hue=s=0"), "grade should come last: {look}");
+        // Neither set: nothing at all, so an untouched clip adds no filters.
+        let plain = clip(0.0, 2.0);
+        assert_eq!(plain.look(), "");
     }
 
     #[test]
