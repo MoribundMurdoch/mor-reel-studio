@@ -284,6 +284,74 @@ fn bevel_opacity() -> f64 {
     0.75
 }
 
+/// Which part of the on-screen transform box is being dragged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum XfGrab {
+    Move,
+    Scale,
+    Rotate,
+}
+
+/// The four corners of the transform box, as fractions across the monitor
+/// (0,0 = top left, 1,1 = bottom right).
+///
+/// The rotation has to be applied in *pixel* space and converted back, or on a
+/// 9:16 frame a rotated box comes out sheared: one fraction of width is not the
+/// same distance as one fraction of height.
+fn xf_corners(t: &engine::Transform) -> [(f64, f64); 4] {
+    let half = t.scale / 2.0;
+    let (sin, cos) = t.rotation.to_radians().sin_cos();
+    let ar = engine::W as f64 / engine::H as f64;
+    // The box turns about its own centre, and that centre is where the
+    // position offset put it.
+    let (cx, cy) = (0.5 + t.x, 0.5 + t.y);
+    [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(sx, sy)| {
+        let (fx, fy) = (sx * half, sy * half);
+        (cx + (fx * cos - fy * sin / ar), cy + (fx * sin * ar + fy * cos))
+    })
+}
+
+/// A dragged handle updates the transform from where the pointer is now,
+/// relative to where it went down and to the centre of the frame on screen.
+/// `rect` is the monitor's on-screen box: (left, top, width, height).
+fn xf_apply(
+    grab: XfGrab,
+    start: engine::Transform,
+    from: (f64, f64),
+    to: (f64, f64),
+    rect: (f64, f64, f64, f64),
+) -> engine::Transform {
+    let (rl, rt, rw, rh) = rect;
+    if rw < 1.0 || rh < 1.0 {
+        return start;
+    }
+    let (cx, cy) = (rl + rw / 2.0, rt + rh / 2.0);
+    let mut t = start;
+    match grab {
+        XfGrab::Move => {
+            t.x = start.x + (to.0 - from.0) / rw;
+            t.y = start.y + (to.1 - from.1) / rh;
+        }
+        XfGrab::Scale => {
+            // Ratio of distances from the centre, so grabbing any corner (or a
+            // corner clamped back into view) scales the same way.
+            let d0 = ((from.0 - cx).powi(2) + (from.1 - cy).powi(2)).sqrt();
+            let d1 = ((to.0 - cx).powi(2) + (to.1 - cy).powi(2)).sqrt();
+            if d0 > 2.0 {
+                t.scale = (start.scale * d1 / d0).clamp(0.1, 4.0);
+            }
+        }
+        XfGrab::Rotate => {
+            let a0 = (from.1 - cy).atan2(from.0 - cx);
+            let a1 = (to.1 - cy).atan2(to.0 - cx);
+            // Keep it in the -180..180 the slider shows.
+            let deg = start.rotation + (a1 - a0).to_degrees();
+            t.rotation = (deg + 180.0).rem_euclid(360.0) - 180.0;
+        }
+    }
+    t
+}
+
 /// One row of the Transform panel: label, value, min, max, step, and how to
 /// write it back. Both lanes carry the same struct, so one table serves both.
 type XformKnob = (&'static str, f64, f64, f64, f64, fn(&mut engine::Transform, f64));
@@ -2008,6 +2076,61 @@ fn Editor() -> Element {
         seek_to((playhead() + d).clamp(0.0, total_of()));
     };
 
+    // On-screen transform handles over the monitor. The sliders in the
+    // inspector stay the precise way in; this is the direct way.
+    let mut show_handles = use_signal(|| true);
+    // The monitor's box on screen, measured when a drag starts rather than
+    // tracked, so a resized window can never leave stale geometry behind.
+    let mut xf_drag =
+        use_signal(|| Option::<(XfGrab, (f64, f64), engine::Transform, (f64, f64, f64, f64))>::None);
+    let mut phone_el = use_signal(|| Option::<std::rc::Rc<MountedData>>::None);
+
+    // The transform of whatever is selected, if it has one.
+    let selected_xf = move || -> Option<engine::Transform> {
+        match selected() {
+            Some(Sel::Main(i)) => clips.read().get(i).map(|c| c.transform),
+            Some(Sel::Over(j)) => overlays.read().get(j).map(|o| o.transform),
+            _ => None,
+        }
+    };
+    // Write it back and refresh the monitor, whichever lane it came from.
+    let mut set_selected_xf = move |t: engine::Transform| {
+        let target = match selected() {
+            Some(Sel::Main(i)) if i < clips.read().len() => {
+                let mut cl = clips.write();
+                cl[i].transform = t;
+                Some((cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look()))
+            }
+            Some(Sel::Over(j)) if j < overlays.read().len() => {
+                let mut ov = overlays.write();
+                ov[j].transform = t;
+                Some((ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look()))
+            }
+            _ => None,
+        };
+        if let Some((path, at, fr, look)) = target {
+            request_preview(path, at, fr, look, None);
+        }
+    };
+
+    // Grabbing a handle measures the monitor first, so the very first pointer
+    // move already has real geometry to work against.
+    let mut begin_xf = move |grab: XfGrab, from: (f64, f64)| {
+        let Some(start) = selected_xf() else { return };
+        let Some(el) = phone_el() else { return };
+        push_undo("xf-handle"); // one undo step for the whole drag
+        spawn(async move {
+            if let Ok(r) = el.get_client_rect().await {
+                xf_drag.set(Some((
+                    grab,
+                    from,
+                    start,
+                    (r.origin.x, r.origin.y, r.size.width, r.size.height),
+                )));
+            }
+        });
+    };
+
     // Safe-area guides over the monitor — the portrait editor's ruler for
     // "will this caption survive the app's own buttons".
     let mut safe_area = use_signal(|| false);
@@ -2017,6 +2140,16 @@ fn Editor() -> Element {
             "Safe areas on — keep titles out of the shaded bands.".to_string()
         } else {
             "Safe areas off.".to_string()
+        });
+    };
+
+    let mut toggle_handles = move |_: ()| {
+        show_handles.toggle();
+        status.set(if show_handles() {
+            "Transform handles on — drag the picture, a corner to scale, the knob to rotate."
+                .to_string()
+        } else {
+            "Transform handles off.".to_string()
         });
     };
 
@@ -2034,6 +2167,7 @@ fn Editor() -> Element {
     use_shortcut(Some("]".into()), Some(EventHandler::new(move |()| step_sel(1))));
     use_shortcut(Some("ESCAPE".into()), Some(EventHandler::new(move |()| ctx_menu.set(None))));
     use_shortcut(Some("G".into()), Some(EventHandler::new(move |()| toggle_safe(()))));
+    use_shortcut(Some("T".into()), Some(EventHandler::new(move |()| toggle_handles(()))));
     // The menu item binds "~"; this covers layouts where ~ is Shift+` and the
     // combo therefore arrives as SHIFT+~.
     use_shortcut(Some("SHIFT+~".into()), Some(EventHandler::new(move |()| toggle_magnet(()))));
@@ -2394,6 +2528,11 @@ fn Editor() -> Element {
                         shortcut: Some("G".to_string()),
                         on_action: move |_| toggle_safe(()),
                     }
+                    MenuItem {
+                        label: format!("{} Transform handles", if show_handles() { "●" } else { "○" }),
+                        shortcut: Some("T".to_string()),
+                        on_action: move |_| toggle_handles(()),
+                    }
                     MenuSeparator {}
                     MenuItem {
                         label: format!("{} Frameless window", radio(UiMode::Frameless)),
@@ -2478,6 +2617,7 @@ fn Editor() -> Element {
                         if !monitor_out() {
                             div {
                                 class: if drop_hover() == Some(Lane::V2) { "mr-phone mr-drop" } else { "mr-phone" },
+                                onmounted: move |evt| phone_el.set(Some(evt.data())),
                                 oncontextmenu: move |evt| open_ctx(evt, Ctx::Monitor),
                                 // Dropping on the picture means "show me this" —
                                 // append to the end of the main track.
@@ -2498,6 +2638,66 @@ fn Editor() -> Element {
                                 }
                                 if safe_area() {
                                     SafeArea {}
+                                }
+                                if let Some(xf) = selected_xf().filter(|_| show_handles()) {
+                                    {
+                                        let corners = xf_corners(&xf);
+                                        // A box bigger than the frame has its corners
+                                        // off screen, and the monitor clips. Pull the
+                                        // handles back to the edge so they stay
+                                        // grabbable — the maths is distance-based, so
+                                        // a clamped handle still scales correctly.
+                                        let clamp = |v: f64| (v * 100.0).clamp(1.5, 98.5);
+                                        let (bw, bh) = (xf.scale * 100.0, xf.scale * 100.0);
+                                        let bl = 50.0 + xf.x * 100.0 - bw / 2.0;
+                                        let bt = 50.0 + xf.y * 100.0 - bh / 2.0;
+                                        rsx! {
+                                            div {
+                                                class: "mr-xf",
+                                                // Only swallow the pointer mid-drag, so a
+                                                // right-click still reaches the monitor.
+                                                style: if xf_drag().is_some() { "pointer-events:auto" } else { "pointer-events:none" },
+                                                onmousemove: move |evt| {
+                                                    let Some((grab, from, start, rect)) = xf_drag() else { return };
+                                                    let p = evt.client_coordinates();
+                                                    set_selected_xf(xf_apply(grab, start, from, (p.x, p.y), rect));
+                                                },
+                                                onmouseup: move |_| xf_drag.set(None),
+                                                onmouseleave: move |_| xf_drag.set(None),
+                                                div {
+                                                    class: "mr-xf-box",
+                                                    style: "left:{bl}%;top:{bt}%;width:{bw}%;height:{bh}%;transform:rotate({xf.rotation}deg)",
+                                                    onmousedown: move |evt| {
+                                                        evt.stop_propagation();
+                                                        let p = evt.client_coordinates();
+                                                        begin_xf(XfGrab::Move, (p.x, p.y));
+                                                    },
+                                                }
+                                                for (n, (fx, fy)) in corners.into_iter().enumerate() {
+                                                    div {
+                                                        key: "h{n}",
+                                                        class: "mr-xf-h",
+                                                        style: "left:{clamp(fx)}%;top:{clamp(fy)}%",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            let p = evt.client_coordinates();
+                                                            begin_xf(XfGrab::Scale, (p.x, p.y));
+                                                        },
+                                                    }
+                                                }
+                                                div {
+                                                    class: "mr-xf-rot",
+                                                    style: "left:{clamp(50.0 + xf.x * 100.0)}%;top:{clamp((50.0 + xf.y * 100.0 - bh / 2.0) - 4.0)}%",
+                                                    title: "Drag to rotate",
+                                                    onmousedown: move |evt| {
+                                                        evt.stop_propagation();
+                                                        let p = evt.client_coordinates();
+                                                        begin_xf(XfGrab::Rotate, (p.x, p.y));
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3253,7 +3453,7 @@ fn Editor() -> Element {
                         }
 
                         p { class: "mor-statusbar-muted mr-keys",
-                            "Drop files onto a lane · Ctrl+Z undo · I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · drag to move (snaps) · Ctrl+G group · ~ magnet · G safe areas · Ctrl+E export"
+                            "T transform handles · Drop files onto a lane · Ctrl+Z undo · I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · drag to move (snaps) · Ctrl+G group · ~ magnet · G safe areas · Ctrl+E export"
                         }
                     }
                 }
@@ -3838,6 +4038,7 @@ fn Editor() -> Element {
                     ("Ctrl+G / Ctrl+Shift+G", "Group marked items / ungroup"),
                     ("~", "Toggle magnetic timeline (V2/A1/T ride V1 edits)"),
                     ("G", "Toggle safe-area guides (phone UI zones)"),
+                    ("T", "Toggle on-screen transform handles"),
                     ("Home / End", "Jump to start / end"),
                     ("Ctrl+O", "Add clips"),
                     ("Ctrl+Shift+O / Ctrl+S", "Open / save project"),
@@ -3938,6 +4139,16 @@ const APP_CSS: &str = r#"
    lane geometry stays ruler-exact. */
 .mr-drop { box-shadow: inset 0 0 0 2px var(--mor-accent), 0 0 12px color-mix(in srgb, var(--mor-accent) 30%, transparent); background-color: color-mix(in srgb, var(--mor-accent) 12%, transparent); }
 .mr-timeline.mr-drop { border-radius: var(--mor-radius); }
+
+/* On-screen transform handles, Final Cut style: drag inside the box to move,
+   a corner to scale, the knob above it to rotate. The box is the picture's
+   footprint, so it can sit partly outside the frame; the handles are pulled
+   back to the edge when it does, since the monitor clips. */
+.mr-xf { position: absolute; inset: 0; z-index: 4; }
+.mr-xf-box { position: absolute; box-sizing: border-box; border: 1px dashed var(--mor-accent); background: color-mix(in srgb, var(--mor-accent) 6%, transparent); pointer-events: auto; cursor: move; }
+.mr-xf-h { position: absolute; width: 13px; height: 13px; margin: -7px 0 0 -7px; box-sizing: border-box; background: var(--mor-accent); border: 1px solid #0f0f12; border-radius: 2px; pointer-events: auto; cursor: nwse-resize; box-shadow: 0 1px 3px rgba(0,0,0,0.6); }
+.mr-xf-rot { position: absolute; width: 13px; height: 13px; margin: -22px 0 0 -7px; box-sizing: border-box; background: var(--mor-warning); border: 1px solid #0f0f12; border-radius: 50%; pointer-events: auto; cursor: grab; box-shadow: 0 1px 3px rgba(0,0,0,0.6); }
+.mr-xf-rot::after { content: ""; position: absolute; left: 50%; top: 100%; width: 1px; height: 14px; background: var(--mor-warning); opacity: 0.7; }
 
 /* Safe-area guides: shaded bands where the phone app's own chrome sits over a
    9:16 feed. Worst case across TikTok / Reels / Shorts, so clearing these
@@ -4373,6 +4584,96 @@ mod tests {
         // Anything unrecognised falls back to Off rather than a broken render.
         assert_eq!(bevel_value("nonsense"), "Off");
         assert_eq!(bevel_label("nonsense"), "Off");
+    }
+
+    /// A 270x480 monitor at the top-left of the screen: centre is (135, 240).
+    const RECT: (f64, f64, f64, f64) = (0.0, 0.0, 270.0, 480.0);
+
+    #[test]
+    fn dragging_the_box_moves_by_the_fraction_of_the_frame_crossed() {
+        let start = engine::Transform::default();
+        // Half the monitor's width to the right is x = 0.5, whatever the
+        // monitor's pixel size — the transform is stored in frame fractions.
+        let t = xf_apply(XfGrab::Move, start, (135.0, 240.0), (270.0, 240.0), RECT);
+        assert!((t.x - 0.5).abs() < 1e-9, "x = {}", t.x);
+        assert_eq!(t.y, 0.0);
+        // Up a quarter of the height is negative y.
+        let t = xf_apply(XfGrab::Move, start, (135.0, 240.0), (135.0, 120.0), RECT);
+        assert!((t.y + 0.25).abs() < 1e-9, "y = {}", t.y);
+        // Moving does not disturb the other knobs.
+        assert_eq!((t.scale, t.rotation, t.opacity), (1.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn dragging_a_corner_scales_by_the_distance_from_the_centre() {
+        let start = engine::Transform::default();
+        // Twice as far from the centre is twice the size.
+        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (335.0, 240.0), RECT);
+        assert!((t.scale - 2.0).abs() < 1e-9, "scale = {}", t.scale);
+        // Half as far is half the size.
+        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (185.0, 240.0), RECT);
+        assert!((t.scale - 0.5).abs() < 1e-9, "scale = {}", t.scale);
+        // Clamped to the slider's range rather than collapsing to nothing.
+        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (135.5, 240.0), RECT);
+        assert!(t.scale >= 0.1, "scale should not collapse: {}", t.scale);
+        // A grab that starts on the centre has no distance to work from.
+        assert_eq!(xf_apply(XfGrab::Scale, start, (135.0, 240.0), (200.0, 240.0), RECT).scale, 1.0);
+    }
+
+    #[test]
+    fn dragging_the_knob_rotates_and_stays_in_slider_range() {
+        let start = engine::Transform::default();
+        // From straight up to straight right is a quarter turn clockwise.
+        let t = xf_apply(XfGrab::Rotate, start, (135.0, 40.0), (235.0, 240.0), RECT);
+        assert!((t.rotation - 90.0).abs() < 1e-6, "rotation = {}", t.rotation);
+        // Rotation always lands inside what the slider can show.
+        for (to_x, to_y) in [(35.0, 240.0), (135.0, 440.0), (200.0, 100.0), (60.0, 300.0)] {
+            let r = xf_apply(XfGrab::Rotate, start, (135.0, 40.0), (to_x, to_y), RECT).rotation;
+            assert!((-180.0..=180.0).contains(&r), "rotation {r} is outside the slider");
+        }
+    }
+
+    #[test]
+    fn a_zero_sized_monitor_never_produces_nonsense() {
+        // The rect is measured asynchronously; a drag must degrade to a no-op
+        // rather than divide by zero if it somehow arrives empty.
+        let start = engine::Transform { scale: 1.5, x: 0.2, ..Default::default() };
+        for grab in [XfGrab::Move, XfGrab::Scale, XfGrab::Rotate] {
+            let t = xf_apply(grab, start, (10.0, 10.0), (99.0, 99.0), (0.0, 0.0, 0.0, 0.0));
+            assert_eq!(t, start, "{grab:?} on an unmeasured monitor should change nothing");
+        }
+    }
+
+    #[test]
+    fn handle_corners_track_scale_and_rotation() {
+        // Unrotated and full size: the corners are the corners of the frame.
+        let c = xf_corners(&engine::Transform::default());
+        assert_eq!(c[0], (0.0, 0.0));
+        assert_eq!(c[2], (1.0, 1.0));
+
+        // Half size, centred: an inset box.
+        let c = xf_corners(&engine::Transform { scale: 0.5, ..Default::default() });
+        assert_eq!(c[0], (0.25, 0.25));
+        assert_eq!(c[2], (0.75, 0.75));
+
+        // Offset moves every corner by the same amount.
+        let c = xf_corners(&engine::Transform { scale: 0.5, x: 0.1, y: -0.2, ..Default::default() });
+        assert!((c[0].0 - 0.35).abs() < 1e-9 && (c[0].1 - 0.05).abs() < 1e-9, "{c:?}");
+
+        // Rotated: corners must stay equidistant from the centre in *pixel*
+        // space, or the box is being sheared by the 9:16 aspect.
+        let t = engine::Transform { scale: 0.5, rotation: 37.0, ..Default::default() };
+        let ar = engine::W as f64 / engine::H as f64;
+        let radii: Vec<f64> = xf_corners(&t)
+            .iter()
+            .map(|(x, y)| {
+                let (px, py) = ((x - 0.5) * ar, y - 0.5); // back to pixel proportions
+                (px * px + py * py).sqrt()
+            })
+            .collect();
+        for r in &radii {
+            assert!((r - radii[0]).abs() < 1e-9, "rotated box is sheared: {radii:?}");
+        }
     }
 
     #[test]

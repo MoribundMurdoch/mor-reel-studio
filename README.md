@@ -31,7 +31,9 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   composed at 1080×1920 and scaled once at the end of the graph, so a smaller
   export is a smaller file, not a different render.
 - **Transform** — per-clip scale, position, rotation (and opacity on V2), the
-  same set Final Cut and kdenlive expose. Position is a fraction of the frame,
+  same set Final Cut and kdenlive expose. Drag it directly in the monitor
+  (`T` toggles the handles: drag the picture to move, a corner to scale, the
+  knob to rotate) or type exact numbers in the inspector. Position is a fraction of the frame,
   so a transform survives an export at a different size, and an untouched clip
   adds no filter at all. On V2 it composites, so scaling a cutaway below 1
   makes it a **picture-in-picture** with V1 showing through around it.
