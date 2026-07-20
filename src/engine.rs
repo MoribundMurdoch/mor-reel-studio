@@ -147,6 +147,56 @@ pub fn is_still(path: &str) -> bool {
 pub const STILL_SOURCE: f64 = 60.0;
 pub const STILL_DEFAULT: f64 = 5.0;
 
+/// Colour emoji faces are bitmap strikes rather than outlines: drawtext cannot
+/// set a pixel size on them and fails the entire render with "invalid library
+/// handle". Keep them out of the picker rather than offering a font that can
+/// only break.
+// ponytail: matched by name, which is crude but catches every colour emoji
+// face shipped by the usual distributions. Probing each of 600 fonts with a
+// trial render would cost seconds of startup to catch a handful more.
+fn font_is_unusable(family: &str) -> bool {
+    family.to_ascii_lowercase().contains("emoji")
+}
+
+/// Every font family fontconfig can see, for the title picker. The three
+/// generics stay pinned at the top because they resolve on any machine — a
+/// project naming "Impact" opens fine on a box that has never had it, but the
+/// card renders in whatever fontconfig substitutes.
+///
+/// Enumerated once: fonts do not appear mid-session and spawning `fc-list` per
+/// render would be silly.
+pub fn font_families() -> &'static [String] {
+    static FONTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut out = vec!["Sans".to_string(), "Serif".to_string(), "Mono".to_string()];
+        let listed = std::process::Command::new("fc-list").args([":", "family"]).output();
+        if let Ok(listed) = listed {
+            let mut families: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+                .lines()
+                .flat_map(|line| line.split(','))
+                .map(|f| f.trim().to_string())
+                .filter(|f| !f.is_empty() && !font_is_unusable(f))
+                .collect();
+            families.sort_by_key(|f| f.to_ascii_lowercase());
+            families.dedup();
+            out.extend(families);
+        }
+        out.dedup();
+        out
+    })
+}
+
+/// How multi-line title text lines up within its block.
+pub const ALIGNMENTS: &[(&str, &str)] = &[
+    ("Centre", "center"),
+    ("Left", "left"),
+    ("Right", "right"),
+];
+
+pub fn align_flag(label: &str) -> &'static str {
+    ALIGNMENTS.iter().find(|(l, _)| *l == label).map_or("center", |(_, f)| f)
+}
+
 /// Transitions, as (what the menu says, what xfade calls it). A transition
 /// belongs to the clip it leads *into*, so it survives reordering and deleting
 /// the clip before it.
@@ -486,12 +536,60 @@ fn mix_audio(main: &str, audio: &[AudioSpec], out: &str) -> String {
     f
 }
 
+/// How a title card arrives and leaves. Kinetic text is most of what a reel
+/// title *is*, and the card is composited with `overlay`, whose x and y accept
+/// time expressions — so sliding one on costs nothing but arithmetic.
+// ponytail: no scale-based pop. overlay can move a card but not resize it, and
+// scale takes no per-frame expression; that one needs the card re-rasterized
+// per frame or a real keyframe system.
+pub const TITLE_ANIMS: &[&str] =
+    &["None", "Slide up", "Slide down", "Slide in left", "Slide in right"];
+
 /// T: a pre-rendered 1080×1920 transparent PNG shown from `at` for `dur`.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct TitleSpec {
     pub png: String,
     pub at: f64,
     pub dur: f64,
+    /// One of TITLE_ANIMS. Anything unrecognised sits still.
+    pub anim: String,
+}
+
+impl TitleSpec {
+    /// How long the card takes to arrive, and to leave again. Tied to the
+    /// alpha fade so the movement and the fade finish together rather than
+    /// fighting each other.
+    fn anim_len(&self) -> f64 {
+        title_fade(self.dur)
+    }
+
+    /// `overlay` x/y options that carry the card on and off, trailing colon
+    /// included so they splice in front of the next option. Empty when the card
+    /// should just sit where it was rasterized.
+    ///
+    /// `p` runs 0..1 while arriving and 1..0 while leaving; the offset is eased
+    /// with p*p so it decelerates into place instead of arriving at full tilt.
+    fn overlay_xy(&self) -> String {
+        let travel = match self.anim.as_str() {
+            "Slide up" => (0.0, H as f64 * 0.25),
+            "Slide down" => (0.0, -(H as f64) * 0.25),
+            "Slide in left" => (-(W as f64) * 0.5, 0.0),
+            "Slide in right" => (W as f64 * 0.5, 0.0),
+            _ => return String::new(),
+        };
+        let (a, d, len) = (self.at, self.dur, self.anim_len().max(0.01));
+        // 1 while off-position, 0 once settled. The two ramps are "how much
+        // arrival is left" and "how much departure has begun"; only one is
+        // positive at a time, so it is their max — a min would clamp to 0 for
+        // the whole card and nothing would ever move.
+        let away = format!(
+            "pow(clip(max(({a:.3}+{len:.3}-t)/{len:.3},(t-({a:.3}+{d:.3}-{len:.3}))/{len:.3}),0,1),2)"
+        );
+        let axis = |v: f64| {
+            if v.abs() < 0.01 { "0".to_string() } else { format!("{v:.1}*{away}") }
+        };
+        format!("x='{}':y='{}':", axis(travel.0), axis(travel.1))
+    }
 }
 
 /// Alpha fade length for a title of `dur` seconds — one definition feeds both
@@ -515,8 +613,11 @@ pub struct TitleStyle {
     pub color: String,
     /// Vertical placement as a fraction of the free space; 0 = top.
     pub y_frac: f64,
-    /// fontconfig family ("Sans", "Serif", "Mono"); "" = drawtext default.
+    /// fontconfig family; "" = drawtext default. Any installed family works,
+    /// not just the generics.
     pub font: String,
+    /// How multiple lines line up against each other: "Centre" | "Left" | "Right".
+    pub align: String,
     /// Outline width in px, 0 = none. Carries legibility over busy video
     /// without the opaque plate a backdrop box needs.
     pub outline: f64,
@@ -542,6 +643,7 @@ impl Default for TitleStyle {
             color: "white".into(),
             y_frac: 0.45,
             font: "Sans".into(),
+            align: "Centre".into(),
             outline: 0.0,
             outline_color: "black".into(),
             boxed: false,
@@ -571,6 +673,7 @@ impl std::hash::Hash for TitleStyle {
         self.font_size.hash(h);
         self.color.hash(h);
         self.font.hash(h);
+        self.align.hash(h);
         self.outline_color.hash(h);
         self.boxed.hash(h);
         self.bevel.hash(h);
@@ -596,9 +699,8 @@ impl std::hash::Hash for TitleStyle {
 pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
     use std::hash::{Hash, Hasher};
     // Bump when the rendering changes, so cards cached by an older build are
-    // re-rendered instead of served stale. v3: transparent canvas, outline,
-    // full bevel parameter set, designer composite order.
-    const CACHE_VER: u32 = 3;
+    // re-rendered instead of served stale. v4: adds text alignment.
+    const CACHE_VER: u32 = 4;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     CACHE_VER.hash(&mut h);
     s.hash(&mut h);
@@ -611,7 +713,10 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
 
     // textfile= sidesteps drawtext's escaping rules entirely.
     let txt = png.with_extension("txt");
-    std::fs::write(&txt, &s.text).map_err(|e| e.to_string())?;
+    // A literal \n in the text box is a line break. The kit's text input is a
+    // single line, so this is the only way to type one, and drawtext reads the
+    // file verbatim.
+    std::fs::write(&txt, s.text.replace("\\n", "\n")).map_err(|e| e.to_string())?;
     // Anything that already carries legibility — a backdrop box, an outline,
     // the bevel's own relief — makes the drop shadow redundant.
     let plain = s.bevel == "Off" && !s.boxed && s.outline <= 0.0;
@@ -624,11 +729,12 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
     };
     let fontp = if s.font.is_empty() { String::new() } else { format!(":font='{}'", s.font) };
     let vf = format!(
-        "drawtext=textfile={}{fontp}:fontsize={}:fontcolor={}\
+        "drawtext=textfile={}{fontp}:fontsize={}:fontcolor={}:text_align={}\
          :x=(w-text_w)/2:y=(h-text_h)*{:.3}{shadow}{boxp}{border}",
         txt.display(),
         s.font_size,
         s.color,
+        align_flag(&s.align),
         s.y_frac
     );
     let out = Command::new("ffmpeg")
@@ -843,6 +949,17 @@ pub async fn frame_data_uri(
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(format!("data:image/jpeg;base64,{}", b64(&out.stdout)))
+}
+
+/// Where a user's own settings live, as opposed to things that can be
+/// regenerated. Presets belong here: losing the cache costs a re-render,
+/// losing this costs work.
+pub fn config_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("morreel")
 }
 
 fn cache_dir(sub: &str) -> std::path::PathBuf {
@@ -1068,7 +1185,8 @@ pub fn build_filter(
             t.at
         );
         f += &format!(
-            "[{vl}][ti{j}]overlay=enable='between(t,{:.3},{:.3})'[vt{j}];",
+            "[{vl}][ti{j}]overlay={}enable='between(t,{:.3},{:.3})'[vt{j}];",
+            t.overlay_xy(),
             t.at,
             t.at + t.dur
         );
@@ -1457,7 +1575,7 @@ mod tests {
             ClipSpec { path: "b.mp4".into(), in_s: 0.0, out_s: 1.0, has_audio: false, ..Default::default() },
         ];
         let overlays = [OverlaySpec { path: "c.mp4".into(), in_s: 0.0, out_s: 1.0, at: 0.5, ..Default::default() }];
-        let titles = [TitleSpec { png: "t.png".into(), at: 0.2, dur: 2.0 }];
+        let titles = [TitleSpec { png: "t.png".into(), at: 0.2, dur: 2.0, ..Default::default() }];
         let audio = [AudioSpec { path: "m.mp3".into(), in_s: 0.0, out_s: 2.0, at: 1.0, volume: 0.5, duck: 0.0 }];
         let f = build_filter(&clips, &overlays, &titles, &audio, ExportOpts::default());
         assert!(f.contains("[0:v]trim=start=0.500:end=2.000"));
@@ -2355,6 +2473,90 @@ mod tests {
     }
 
     #[test]
+    fn only_an_animated_title_gets_overlay_coordinates() {
+        let still = TitleSpec { png: "t.png".into(), at: 1.0, dur: 3.0, anim: "None".into() };
+        assert_eq!(still.overlay_xy(), "", "a still card needs no x/y at all");
+        // An unknown name sits still rather than breaking the graph.
+        assert_eq!(TitleSpec { anim: "wat".into(), ..still.clone() }.overlay_xy(), "");
+
+        // Vertical slides move y and leave x alone, and vice versa.
+        let up = TitleSpec { anim: "Slide up".into(), ..still.clone() }.overlay_xy();
+        assert!(up.starts_with("x='0':y='") && up.ends_with(':'), "{up}");
+        let left = TitleSpec { anim: "Slide in left".into(), ..still.clone() }.overlay_xy();
+        assert!(left.contains("y='0'") && !left.contains("x='0'"), "{left}");
+
+        // Up and down travel in opposite directions.
+        let down = TitleSpec { anim: "Slide down".into(), ..still }.overlay_xy();
+        assert!(up.contains("480.0*") && down.contains("-480.0*"), "up={up} down={down}");
+    }
+
+    // The expressions have to survive ffmpeg and actually move the card.
+    #[tokio::test]
+    async fn a_sliding_title_is_somewhere_else_at_the_start() {
+        let dir = std::env::temp_dir().join("morreel-anim-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bg = dir.join("bg.mp4").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-f", "lavfi",
+            "-i", "color=c=black:size=320x568:duration=3:rate=30", "-c:v", "libx264", &bg,
+        ]).await.unwrap();
+        let png = render_title(&TitleStyle {
+            text: "SLIDE".into(),
+            font_size: 150,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let clips = [ClipSpec { path: bg, out_s: 3.0, ..Default::default() }];
+        let mut frames = Vec::new();
+        for anim in ["None", "Slide up"] {
+            let titles = [TitleSpec { png: png.clone(), at: 0.0, dur: 3.0, anim: anim.into() }];
+            let out = dir.join(format!("{}.mp4", anim.replace(' ', "_")));
+            let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
+            export(&clips, &[], &titles, &[], &out, opts, |_| {}).await.unwrap();
+            // Early in the card, where the slide has not yet settled.
+            let f = dir.join(format!("{}.png", anim.replace(' ', "_")));
+            capture("ffmpeg", &[
+                "-y", "-v", "error", "-ss", "0.20", "-i", &out.display().to_string(),
+                "-frames:v", "1", &f.display().to_string(),
+            ]).await.unwrap();
+            frames.push(image::open(&f).unwrap().to_rgb8());
+        }
+        // Text is white on black: the row it occupies tells us where it sits.
+        let row_of_text = |img: &image::RgbImage| -> Option<u32> {
+            (0..img.height()).find(|y| (0..img.width()).any(|x| img.get_pixel(x, *y).0[0] > 100))
+        };
+        let (fixed, slid) = (row_of_text(&frames[0]), row_of_text(&frames[1]));
+        assert!(fixed.is_some(), "the still title never drew");
+        assert_ne!(fixed, slid, "the sliding title is in the same place as the still one");
+    }
+
+    #[test]
+    fn the_font_picker_offers_real_families_and_no_broken_ones() {
+        let fams = font_families();
+        // The generics stay first: they resolve on any machine.
+        assert_eq!(&fams[..3], &["Sans".to_string(), "Serif".to_string(), "Mono".to_string()]);
+        // Colour emoji faces are bitmap strikes drawtext cannot size, and
+        // offering one would fail the whole render.
+        assert!(font_is_unusable("Noto Color Emoji"));
+        assert!(!font_is_unusable("DejaVu Sans"));
+        assert!(
+            !fams.iter().any(|f| font_is_unusable(f)),
+            "an unusable face reached the picker"
+        );
+        assert!(fams.iter().all(|f| !f.trim().is_empty()));
+    }
+
+    #[test]
+    fn alignment_maps_to_drawtext_flags() {
+        assert_eq!(align_flag("Centre"), "center");
+        assert_eq!(align_flag("Left"), "left");
+        assert_eq!(align_flag("Right"), "right");
+        assert_eq!(align_flag("nonsense"), "center", "fall back rather than break the render");
+    }
+
+    #[test]
     fn still_classification() {
         for p in ["a.png", "A.JPG", "/x/y/photo.jpeg", "shot.webp", "s.TIFF", "b.bmp"] {
             assert!(is_still(p), "{p} should be a still");
@@ -2539,7 +2741,7 @@ mod tests {
         let boxed = render_title(&TitleStyle { text: "MorReel".into(), font_size: 120, boxed: true, ..Default::default() }).await.unwrap();
         assert_ne!(boxed, png);
         assert!(std::fs::metadata(&boxed).unwrap().len() > 0);
-        let titles = [TitleSpec { png, at: 0.0, dur: 1.0 }];
+        let titles = [TitleSpec { png, at: 0.0, dur: 1.0, ..Default::default() }];
         let mut last = 0.0;
         export(&clips, &overlays, &titles, &audio, &out, ExportOpts::default(), |p| last = p).await.unwrap();
         assert_eq!(last, 1.0);

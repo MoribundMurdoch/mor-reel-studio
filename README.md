@@ -44,8 +44,13 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   a cut, because the monitor composites it the same way the export does.
 - **V2 overlay track** — B-roll cutaways with their own speed and transform;
   main audio keeps playing underneath.
-- **T title track** — drawtext-rasterized title cards on a transparent canvas,
-  with an optional outline and a **cameo/intaglio bevel** (the Krita-derived
+- **T title track** — drawtext-rasterized title cards on a transparent canvas.
+  Any installed font (not three generics), line-up, `\n` for manual breaks,
+  and a **slide-on entrance** — the card is composited with `overlay`, whose
+  x/y take time expressions, so it carries on and off with the fade. Styles
+  save as **presets** outside the project, so a series of reels can share one,
+  and one button pushes a style onto every caption.
+  Plus an optional outline and a **cameo/intaglio bevel** (the Krita-derived
   mor_cameo_emboss algorithm). The bevel exposes the same controls as
   [wearable-dictionary-designer](../wearable-dictionary-designer), which is
   where it came from: size, softness, depth, light angle and height, and

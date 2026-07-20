@@ -139,9 +139,6 @@ const TITLE_COLORS: &[(&str, &str)] = &[
 
 const TITLE_POS: &[(&str, f64)] = &[("Top", 0.10), ("Middle", 0.45), ("Lower third", 0.72)];
 
-/// Fontconfig generic families — resolve everywhere without bundling fonts.
-const TITLE_FONTS: &[&str] = &["Sans", "Serif", "Mono"];
-
 /// Bevel styles from the mor_cameo_emboss plugin. The stored value keeps the
 /// cameo/intaglio lineage; the label says what it actually looks like, the way
 /// the designer app words it — "raised" and "sunken" mean something to someone
@@ -237,8 +234,14 @@ struct TitleItem {
     pos: String,
     bevel: String,
     bevel_size: f64,
-    /// Fontconfig family: "Sans" | "Serif" | "Mono".
+    /// Any installed fontconfig family.
     font: String,
+    /// How multiple lines line up: "Centre" | "Left" | "Right".
+    #[serde(default = "centre")]
+    align: String,
+    /// How the card arrives and leaves; see engine::TITLE_ANIMS.
+    #[serde(default = "none_label")]
+    anim: String,
     /// Semi-opaque backdrop box behind the text (caption legibility).
     boxed: bool,
     /// Outline width in px, 0 = none — legibility without an opaque plate.
@@ -407,6 +410,7 @@ impl TitleItem {
             color: title_color(&self.color).to_string(),
             y_frac: title_y(&self.pos),
             font: self.font.clone(),
+            align: self.align.clone(),
             outline: self.outline,
             outline_color: title_color(&self.outline_color).to_string(),
             boxed: self.boxed,
@@ -617,9 +621,53 @@ fn unity() -> f64 {
 fn none_label() -> String {
     "None".to_string()
 }
+fn centre() -> String {
+    "Centre".to_string()
+}
 /// Default transition length. Short, because a reel cut is quick.
 fn half() -> f64 {
     0.5
+}
+
+/// A saved title look, kept outside any project so a series of reels can share
+/// one. The whole item is stored and only its styling is applied — that way a
+/// preset gains any field a title gains, with nothing to keep in step.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct TitlePreset {
+    name: String,
+    style: TitleItem,
+}
+
+fn presets_path() -> std::path::PathBuf {
+    engine::config_dir().join("title-presets.json")
+}
+
+fn load_presets() -> Vec<TitlePreset> {
+    std::fs::read_to_string(presets_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_presets(all: &[TitlePreset]) -> Result<(), String> {
+    let dir = engine::config_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(all).map_err(|e| e.to_string())?;
+    std::fs::write(presets_path(), json).map_err(|e| e.to_string())
+}
+
+/// Take `src`'s look but keep `dst`'s own words, timing and lane identity.
+/// A style is everything a card looks like; it is never what it says or when.
+fn restyle(dst: &TitleItem, src: &TitleItem) -> TitleItem {
+    TitleItem {
+        text: dst.text.clone(),
+        at: dst.at,
+        dur: dst.dur,
+        group: dst.group,
+        caption: dst.caption,
+        png: String::new(),
+        ..src.clone()
+    }
 }
 
 /// A whole-timeline snapshot for undo/redo. Snapshotting every lane is cheaper
@@ -1696,6 +1744,8 @@ fn Editor() -> Element {
             bevel: "Cameo".to_string(),
             bevel_size: 21.0,
             font: "Sans".to_string(),
+            align: "Centre".to_string(),
+            anim: "None".to_string(),
             // Transparent by default: the video shows through, and the relief
             // plus an outline carry legibility without an opaque plate.
             boxed: false,
@@ -1736,7 +1786,7 @@ fn Editor() -> Element {
             .read()
             .iter()
             .filter(|t| !t.png.is_empty())
-            .map(|t| TitleSpec { png: t.png.clone(), at: t.at, dur: t.dur })
+            .map(|t| TitleSpec { png: t.png.clone(), at: t.at, dur: t.dur, anim: t.anim.clone() })
             .collect();
         let aspecs = audios
             .read()
@@ -2007,6 +2057,8 @@ fn Editor() -> Element {
                                 bevel: "Off".to_string(),
                                 bevel_size: 21.0,
                                 font: "Sans".to_string(),
+                                align: "Centre".to_string(),
+                                anim: "None".to_string(),
                                 boxed: true, // backdrop keeps captions readable over busy video
                                 outline: 0.0,
                                 outline_color: "Black".to_string(),
@@ -2284,6 +2336,33 @@ fn Editor() -> Element {
                 }
             }
         }
+    };
+
+    // Title style presets, shared across projects: a creator making a series
+    // wants reel 47 to look like reel 46.
+    let mut presets = use_signal(load_presets);
+    let mut show_save_preset = use_signal(|| false);
+    let mut preset_name = use_signal(String::new);
+    let mut store_preset = move |k: usize| {
+        let Some(style) = titles.read().get(k).cloned() else { return };
+        let name = preset_name().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        {
+            let mut all = presets.write();
+            // Saving under an existing name replaces it, which is what anyone
+            // expects from a name they typed on purpose.
+            all.retain(|p| p.name != name);
+            all.push(TitlePreset { name: name.clone(), style });
+            all.sort_by_key(|p| p.name.to_lowercase());
+        }
+        match save_presets(&presets.read()) {
+            Ok(()) => status.set(format!("Saved the style \"{name}\".")),
+            Err(e) => status.set(format!("Could not save the preset: {e}")),
+        }
+        show_save_preset.set(false);
+        preset_name.set(String::new());
     };
 
     let mut drop_marker = move |_: ()| {
@@ -3379,7 +3458,7 @@ fn Editor() -> Element {
                                         }
                                     }
                                     mor_rust_dioxus_ui_kit::MorTextInput {
-                                        label: "Text".to_string(),
+                                        label: "Text (type \\n for a line break)".to_string(),
                                         value: t.text.clone(),
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
@@ -3443,7 +3522,7 @@ fn Editor() -> Element {
                                     MorSelect {
                                         label: "Font".to_string(),
                                         value: t.font.clone(),
-                                        options: TITLE_FONTS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                                        options: engine::font_families().to_vec(),
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.font = v;
@@ -3451,6 +3530,32 @@ fn Editor() -> Element {
                                             }
                                             rerender_title(k);
                                         },
+                                    }
+                                    MorSelect {
+                                        label: "Line-up".to_string(),
+                                        value: t.align.clone(),
+                                        options: engine::ALIGNMENTS.iter().map(|(l, _)| l.to_string()).collect::<Vec<_>>(),
+                                        onchange: move |v: String| {
+                                            if let Some(item) = titles.write().get_mut(k) {
+                                                item.align = v;
+                                                item.png.clear();
+                                            }
+                                            rerender_title(k);
+                                        },
+                                    }
+                                    MorSelect {
+                                        label: "Entrance".to_string(),
+                                        value: t.anim.clone(),
+                                        options: engine::TITLE_ANIMS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                                        onchange: move |v: String| {
+                                            push_undo("");
+                                            titles.write()[k].anim = v;
+                                        },
+                                    }
+                                    if t.anim != "None" {
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "Slides on and off with the fade. The monitor shows the card in place — press Ctrl+P to watch it move."
+                                        }
                                     }
                                     MorSelect {
                                         label: "Backdrop".to_string(),
@@ -3543,6 +3648,31 @@ fn Editor() -> Element {
                                             }
                                         }
                                     }
+                                    if !presets.read().is_empty() {
+                                        MorSelect {
+                                            label: "Apply a saved style".to_string(),
+                                            value: "—".to_string(),
+                                            options: std::iter::once("—".to_string())
+                                                .chain(presets.read().iter().map(|p| p.name.clone()))
+                                                .collect::<Vec<_>>(),
+                                            onchange: move |v: String| {
+                                                let found = presets.read().iter().find(|p| p.name == v).cloned();
+                                                let Some(p) = found else { return };
+                                                push_undo("");
+                                                if let Some(item) = titles.write().get_mut(k) {
+                                                    *item = restyle(item, &p.style);
+                                                }
+                                                rerender_title(k);
+                                                status.set(format!("Applied \"{}\".", p.name));
+                                            },
+                                        }
+                                    }
+                                    button {
+                                        class: "mor-btn mr-reset",
+                                        title: "Keep this card's look to use on other titles and other reels",
+                                        onclick: move |_| show_save_preset.set(true),
+                                        "☆ Save this style as a preset"
+                                    }
                                     // Auto captions can leave forty title items on the
                                     // lane. Restyling them one at a time is not a job
                                     // anyone should do twice.
@@ -3555,19 +3685,7 @@ fn Editor() -> Element {
                                                 let Some(src) = titles.read().get(k).cloned() else { return };
                                                 let mut n = 0;
                                                 for t in titles.write().iter_mut().filter(|t| t.caption) {
-                                                    // Wording and timing are the caption's
-                                                    // own; everything else is the style.
-                                                    let (text, at, dur, group) =
-                                                        (t.text.clone(), t.at, t.dur, t.group);
-                                                    *t = TitleItem {
-                                                        text,
-                                                        at,
-                                                        dur,
-                                                        group,
-                                                        caption: true,
-                                                        png: String::new(),
-                                                        ..src.clone()
-                                                    };
+                                                    *t = restyle(t, &src);
                                                     n += 1;
                                                 }
                                                 spawn(async move {
@@ -4295,6 +4413,37 @@ fn Editor() -> Element {
             }
         }
         Modal {
+            open: show_save_preset,
+            title: "Save title style".to_string(),
+            div { class: "mr-export-dialog",
+                p { class: "mor-statusbar-muted mr-export-blurb",
+                    "Keeps the font, size, colour, line-up, backdrop, outline, bevel and entrance — not the words or the timing. Saved outside the project, so other reels can use it."
+                }
+                mor_rust_dioxus_ui_kit::MorTextInput {
+                    label: "Name".to_string(),
+                    value: preset_name(),
+                    onchange: move |v: String| preset_name.set(v),
+                }
+                div { class: "mr-toolbar",
+                    button {
+                        class: "mor-btn",
+                        onclick: move |_| { show_save_preset.set(false); preset_name.set(String::new()); },
+                        "Cancel"
+                    }
+                    button {
+                        class: "mor-btn primary",
+                        disabled: preset_name().trim().is_empty(),
+                        onclick: move |_| {
+                            if let Some(Sel::Title(k)) = selected() {
+                                store_preset(k);
+                            }
+                        },
+                        "Save style"
+                    }
+                }
+            }
+        }
+        Modal {
             open: show_export,
             title: "Export".to_string(),
             div { class: "mr-export-dialog",
@@ -4938,6 +5087,56 @@ mod tests {
         r#"{"text":"Hi","at":0.0,"dur":3.0,"font_size":110.0,"color":"White",
             "pos":"Middle","bevel":"Cameo","bevel_size":21.0,"font":"Sans",
             "boxed":false,"caption":false,"group":0}"#
+    }
+
+    #[test]
+    fn a_style_is_a_look_never_the_words_or_the_timing() {
+        let mut src: TitleItem = serde_json::from_str(legacy_title_json()).unwrap();
+        src.text = "SOURCE".into();
+        src.at = 9.0;
+        src.dur = 1.0;
+        src.font_size = 200.0;
+        src.color = "Gold".into();
+        src.outline = 6.0;
+        src.anim = "Slide up".into();
+
+        let mut dst: TitleItem = serde_json::from_str(legacy_title_json()).unwrap();
+        dst.text = "KEEP ME".into();
+        dst.at = 3.0;
+        dst.dur = 4.0;
+        dst.caption = true;
+        dst.group = 7;
+        dst.png = "/cache/old.png".into();
+
+        let out = restyle(&dst, &src);
+        // Its own content and place on the timeline survive untouched.
+        assert_eq!(out.text, "KEEP ME");
+        assert_eq!((out.at, out.dur), (3.0, 4.0));
+        assert!(out.caption && out.group == 7, "lane identity should survive a restyle");
+        // The look comes wholesale from the source.
+        assert_eq!(out.font_size, 200.0);
+        assert_eq!(out.color, "Gold");
+        assert_eq!(out.outline, 6.0);
+        assert_eq!(out.anim, "Slide up");
+        // The rendered card must be dropped, or it would keep the old look.
+        assert!(out.png.is_empty(), "a restyle has to invalidate the rendered card");
+    }
+
+    #[test]
+    fn presets_round_trip_through_their_file_format() {
+        let mut style: TitleItem = serde_json::from_str(legacy_title_json()).unwrap();
+        style.color = "Cyan".into();
+        style.anim = "Slide in left".into();
+        style.png = "/cache/derived.png".into(); // derived, must not persist
+        let all = vec![TitlePreset { name: "Bold caption".into(), style }];
+
+        let json = serde_json::to_string(&all).unwrap();
+        assert!(!json.contains("derived.png"), "a rendered card leaked into the preset file");
+        let back: Vec<TitlePreset> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0].name, "Bold caption");
+        assert_eq!(back[0].style.color, "Cyan");
+        assert_eq!(back[0].style.anim, "Slide in left");
+        assert!(back[0].style.png.is_empty());
     }
 
     #[test]
