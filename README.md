@@ -37,7 +37,8 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   so a transform survives an export at a different size, and an untouched clip
   adds no filter at all. On V2 it composites, so scaling a cutaway below 1
   makes it a **picture-in-picture** with V1 showing through around it.
-- **V2 overlay track** — full-frame B-roll cutaways; main audio keeps playing.
+- **V2 overlay track** — B-roll cutaways with their own speed and transform;
+  main audio keeps playing underneath.
 - **T title track** — drawtext-rasterized title cards on a transparent canvas,
   with an optional outline and a **cameo/intaglio bevel** (the Krita-derived
   mor_cameo_emboss algorithm). The bevel exposes the same controls as
@@ -46,7 +47,8 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   highlight/shadow strength.
 - **A1 audio track** — music/VO mixed under with per-item trim and volume.
 - **Effects** — B&W, Sepia, Warm, Cool, Punch, Dreamy, Vignette, and the
-  Motion set (Slow/Pulse zoom, Drift, Sway) ported from
+  Motion set (Slow/Pulse zoom, Drift, Sway) — keyed on time, so they animate
+  in the monitor as you scrub — ported from
   [moranima](../moranima)'s camera moves; one ffmpeg filter each, identical in
   preview and export, with a strength slider that interpolates to identity.
 - **Safe-area guides** (`G`) — shaded bands showing where a phone app's own

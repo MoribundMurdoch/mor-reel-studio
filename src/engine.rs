@@ -334,7 +334,7 @@ impl ExportOpts {
 
 /// V2: full-frame cutaway laid over the main track at global time `at`.
 /// Main-track audio keeps playing underneath (classic B-roll).
-#[derive(Clone, PartialEq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct OverlaySpec {
     pub path: String,
     pub in_s: f64,
@@ -342,6 +342,31 @@ pub struct OverlaySpec {
     pub at: f64,
     pub effect: String,
     pub framing: String,
+    /// Playback rate, same as a V1 clip: 0.5 is slow motion.
+    pub speed: f64,
+}
+
+/// Hand-written for the same reason ClipSpec's is: a defaulted 0.0 rate would
+/// divide the cutaway's length by zero.
+impl Default for OverlaySpec {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            in_s: 0.0,
+            out_s: 0.0,
+            at: 0.0,
+            effect: String::new(),
+            framing: String::new(),
+            speed: 1.0,
+        }
+    }
+}
+
+impl OverlaySpec {
+    /// Seconds this cutaway covers V1 for — its source span, retimed.
+    pub fn trimmed(&self) -> f64 {
+        (self.out_s - self.in_s) / self.speed.max(0.01)
+    }
 }
 
 /// A1: audio mixed under the main track starting at global time `at`.
@@ -633,8 +658,11 @@ pub async fn frame_data_uri(
         // the frame itself never changes either. Run the effect on a clock
         // shifted to the seek point, then shift back so the title overlay
         // downstream still lines up on PTS 0.
-        // ponytail: zoompan looks (Slow zoom, Pulse zoom) key on output frame
-        // index, not PTS, so they still preview as their opening frame.
+        //
+        // This is why every Motion look is written against input time rather
+        // than a frame counter: one extracted frame has no frame history, so
+        // anything that accumulates across frames renders the same at every
+        // playhead position no matter what the clock says.
         chain = format!("{chain},setpts=PTS+{t:.3}/TB,{effect},setpts=PTS-{t:.3}/TB");
     }
     let mut cmd = Command::new("ffmpeg");
@@ -815,10 +843,11 @@ pub fn build_filter(
     for (j, o) in overlays.iter().enumerate() {
         let idx = clips.len() + j;
         f += &format!(
-            "[{idx}:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS+{:.3}/TB,fps={FPS},\
+            "[{idx}:v]trim=start={:.3}:end={:.3},setpts=(PTS-STARTPTS)/{:.4}+{:.3}/TB,fps={FPS},\
              {},setsar=1{}[ov{j}];",
             o.in_s,
             o.out_s,
+            o.speed.max(0.01),
             o.at,
             frame_chain(&o.framing, W, H),
             eff(&o.effect)
@@ -826,7 +855,7 @@ pub fn build_filter(
         f += &format!(
             "[{vl}][ov{j}]overlay=eof_action=pass:enable='between(t,{:.3},{:.3})'[vx{j}];",
             o.at,
-            o.at + (o.out_s - o.in_s)
+            o.at + o.trimmed()
         );
         vl = format!("vx{j}");
     }
@@ -1255,7 +1284,7 @@ mod tests {
         assert!(!f.contains("[1:a]") && f.contains("anullsrc"));
         assert!(f.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vc][ac]"));
         // input order: clips 0-1, overlay 2, title 3, audio 4
-        assert!(f.contains("[2:v]trim=start=0.000:end=1.000,setpts=PTS-STARTPTS+0.500/TB"));
+        assert!(f.contains("[2:v]trim=start=0.000:end=1.000,setpts=(PTS-STARTPTS)/1.0000+0.500/TB"));
         assert!(f.contains("[vc][ov0]overlay=eof_action=pass:enable='between(t,0.500,1.500)'[vx0]"));
         // title: looped still trimmed to its duration, alpha-faded both ends,
         // shifted to its timeline spot
@@ -1805,6 +1834,7 @@ mod tests {
             at: 0.0,
             effect: transform_chain(&pip, W, H, true),
             framing: "Crop".into(),
+            ..Default::default()
         }];
         let out = dir.join("pip.mp4");
         let opts = ExportOpts { quality: Quality::Draft, ..Default::default() };
@@ -1827,6 +1857,29 @@ mod tests {
             greenish < reddish,
             "inset cutaway should cover less than the main track: green={greenish} red={reddish}"
         );
+    }
+
+    #[test]
+    fn overlay_speed_retimes_the_cutaway_and_its_window() {
+        let base =
+            OverlaySpec { path: "b.mp4".into(), in_s: 0.0, out_s: 4.0, at: 1.0, ..Default::default() };
+        assert_eq!(base.trimmed(), 4.0);
+        assert_eq!(OverlaySpec { speed: 2.0, ..base.clone() }.trimmed(), 2.0);
+        assert_eq!(OverlaySpec { speed: 0.5, ..base.clone() }.trimmed(), 8.0);
+        assert_eq!(OverlaySpec::default().speed, 1.0);
+
+        // 4 s of source at 2x covers V1 for 2 s, so the window it is enabled
+        // over has to shrink with it or the cutaway outstays its picture.
+        let clips = [ClipSpec { path: "a.mp4".into(), out_s: 10.0, ..Default::default() }];
+        let f = build_filter(
+            &clips,
+            &[OverlaySpec { speed: 2.0, ..base }],
+            &[],
+            &[],
+            ExportOpts::default(),
+        );
+        assert!(f.contains("setpts=(PTS-STARTPTS)/2.0000+1.000/TB"), "not retimed: {f}");
+        assert!(f.contains("enable='between(t,1.000,3.000)'"), "window not retimed: {f}");
     }
 
     #[test]

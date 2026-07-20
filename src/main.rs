@@ -61,9 +61,15 @@ const EFFECTS: &[(&str, &str, &str)] = &[
     ("Color", "Punch", "eq=contrast=1.18:saturation=1.45"),
     ("Look", "Dreamy", "gblur=sigma=2,eq=brightness=0.04:saturation=1.15"),
     ("Look", "Vignette", "vignette"),
-    ("Motion", "Slow zoom", "zoompan=z='min(zoom+0.0006,1.25)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1"),
-    // moranima Zoom: z = 1 + 0.12·(0.5+0.5·sin(2ph)); on/30 = t → 0.628t = 0.0209·on
-    ("Motion", "Pulse zoom", "zoompan=z='1.06+0.06*sin(0.0209*on)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1"),
+    // Keyed on input time, not on zoompan's own `zoom` accumulator. With d=1
+    // (one output frame per input frame) that accumulator resets every frame
+    // instead of compounding, so `min(zoom+0.0006,1.25)` pinned this at a flat
+    // 1.005x — it never actually zoomed, in the preview or the export. Against
+    // input time it ramps as advertised: 0.0006 per frame at 30 fps is 0.018
+    // per second, reaching the 1.25 cap in about 14 s.
+    ("Motion", "Slow zoom", "zoompan=z='min(1+0.018*it,1.25)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1"),
+    // moranima Zoom: z = 1 + 0.12·(0.5+0.5·sin(2ph)), and 2ph = 0.628t
+    ("Motion", "Pulse zoom", "zoompan=z='1.06+0.06*sin(0.628*it)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1"),
     // moranima Drift: 1.12× overscan, window slides ±0.05w / ±0.03h on offset sines
     ("Motion", "Drift", "scale=1210:2150,crop=1080:1920:x='65+54*sin(0.628*t)':y='115+58*cos(0.408*t)',setsar=1"),
     // moranima Sway: 1.1× overscan hides the corners of a ±0.035 rad rock
@@ -104,11 +110,11 @@ fn effect_filter_amt(name: &str, a: f64) -> String {
         ),
         "Vignette" => format!("vignette=angle={:.4}", 0.6283 * a), // PI/5 at full
         "Slow zoom" => format!(
-            "zoompan=z='min(zoom+{:.6},{:.3})':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1",
-            0.0006 * a, 1.0 + 0.25 * a
+            "zoompan=z='min(1+{:.4}*it,{:.3})':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1",
+            0.018 * a, 1.0 + 0.25 * a
         ),
         "Pulse zoom" => format!(
-            "zoompan=z='{:.3}+{:.3}*sin(0.0209*on)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1",
+            "zoompan=z='{:.3}+{:.3}*sin(0.628*it)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1",
             1.0 + 0.06 * a, 0.06 * a
         ),
         "Drift" => format!(
@@ -526,6 +532,9 @@ struct OverlayItem {
     /// picture-in-picture, since V2 composites over V1.
     #[serde(default)]
     transform: engine::Transform,
+    /// Playback rate, same as a V1 clip: 0.5 is slow motion.
+    #[serde(default = "unity")]
+    speed: f64,
     #[serde(skip)]
     proxy: String,
     /// Drag-together group id; 0 = ungrouped.
@@ -533,6 +542,11 @@ struct OverlayItem {
 }
 
 impl OverlayItem {
+    /// Seconds this cutaway covers V1 for — its source span, retimed.
+    fn trimmed(&self) -> f64 {
+        (self.out_s - self.in_s) / self.speed.max(0.01)
+    }
+
     /// Same as a clip's, but built for a layer that composites: the area the
     /// picture vacates is transparent, so V1 shows through around it.
     fn look(&self) -> String {
@@ -945,7 +959,7 @@ fn Editor() -> Element {
             .rev()
             .find(|ti| t >= ti.at && t < ti.at + ti.dur && !ti.png.is_empty())
             .map(|ti| (ti.png.clone(), title_alpha(t, ti.at, ti.dur)));
-        let over = overlays.read().iter().find(|o| t >= o.at && t < o.at + (o.out_s - o.in_s)).map(
+        let over = overlays.read().iter().find(|o| t >= o.at && t < o.at + o.trimmed()).map(
             |o| {
                 (
                     o.scrub_path(),
@@ -1284,10 +1298,13 @@ fn Editor() -> Element {
         // V2 and A1 split identically — the left half keeps the head, the right
         // half starts at the cut and anchors to the playhead.
         macro_rules! split_lane {
-            ($lane:ident, $idx:expr, $sel:path, $noun:literal) => {{
+            ($lane:ident, $idx:expr, $sel:path, $noun:literal, $rate:expr) => {{
                 let i = $idx;
                 let Some(item) = $lane.read().get(i).cloned() else { return };
-                match cut_local(item.in_s, item.out_s, item.in_s + (t - item.at), MIN) {
+                // A retimed cutaway covers `rate` seconds of source per second
+                // of timeline, so the cut lands further into the source.
+                let rate: f64 = $rate(&item);
+                match cut_local(item.in_s, item.out_s, item.in_s + (t - item.at) * rate, MIN) {
                     Some(local) => {
                         {
                             let mut lane = $lane.write();
@@ -1310,10 +1327,10 @@ fn Editor() -> Element {
             }};
         }
         if let Some(Sel::Over(j)) = selected() {
-            split_lane!(overlays, j, Sel::Over, "overlay");
+            split_lane!(overlays, j, Sel::Over, "overlay", |o: &OverlayItem| o.speed.max(0.01));
         }
         if let Some(Sel::Aud(k)) = selected() {
-            split_lane!(audios, k, Sel::Aud, "audio");
+            split_lane!(audios, k, Sel::Aud, "audio", |_: &AudioItem| 1.0);
         }
 
         let loc = locate(&clips.read(), t);
@@ -1491,6 +1508,7 @@ fn Editor() -> Element {
                         effect_amount: 1.0,
                         framing: "Crop".to_string(),
                         transform: engine::Transform::default(),
+                        speed: 1.0,
                         proxy: String::new(),
                         group: 0,
                     });
@@ -1619,6 +1637,7 @@ fn Editor() -> Element {
                 in_s: o.in_s,
                 out_s: o.out_s,
                 at: o.at,
+                speed: o.speed,
                 effect: o.look(),
                 framing: o.framing.clone(),
             })
@@ -2129,6 +2148,51 @@ fn Editor() -> Element {
                 )));
             }
         });
+    };
+
+    // The Transform panel. A V1 clip and a V2 cutaway differ only in whether
+    // opacity means anything, and both write through the selection, so one
+    // definition serves both lanes.
+    let transform_panel = move |with_opacity: bool| {
+        let Some(xf) = selected_xf() else {
+            return rsx! {};
+        };
+        rsx! {
+            h4 { class: "mr-fx-cat", "Transform" }
+            if with_opacity {
+                p { class: "mor-statusbar-muted mr-export-blurb",
+                    "Scale below 1 makes this a picture-in-picture — V1 shows through around it."
+                }
+            }
+            for (label, value, min, max, step, set) in transform_knobs(&xf, with_opacity) {
+                Slider {
+                    key: "{label}",
+                    label: Some(label),
+                    min, max, step,
+                    precision: if step < 0.1 { 3 } else { 0 },
+                    value,
+                    oninput: Some(EventHandler::new(move |v: f64| {
+                        push_undo(&format!("xf-{label}"));
+                        // Read the live value rather than the one this render
+                        // captured, so a drag never writes back a stale sibling.
+                        if let Some(mut t) = selected_xf() {
+                            set(&mut t, v);
+                            set_selected_xf(t);
+                        }
+                    })),
+                }
+            }
+            if !xf.is_identity() {
+                button {
+                    class: "mor-btn mr-reset",
+                    onclick: move |_| {
+                        push_undo("");
+                        set_selected_xf(engine::Transform::default());
+                    },
+                    "↺ Reset transform"
+                }
+            }
+        }
     };
 
     // Safe-area guides over the monitor — the portrait editor's ruler for
@@ -2999,40 +3063,7 @@ fn Editor() -> Element {
                                             })),
                                         }
                                     }
-                                    h4 { class: "mr-fx-cat", "Transform" }
-                                    for (label, value, min, max, step, set) in transform_knobs(&c.transform, false) {
-                                        Slider {
-                                            key: "{label}",
-                                            label: Some(label),
-                                            min, max, step,
-                                            precision: if step < 0.1 { 3 } else { 0 },
-                                            value,
-                                            oninput: Some(EventHandler::new(move |v: f64| {
-                                                push_undo(&format!("xf{label}{i}"));
-                                                let (path, t, fr, look) = {
-                                                    let mut cl = clips.write();
-                                                    set(&mut cl[i].transform, v);
-                                                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look())
-                                                };
-                                                request_preview(path, t, fr, look, None);
-                                            })),
-                                        }
-                                    }
-                                    if !c.transform.is_identity() {
-                                        button {
-                                            class: "mor-btn mr-reset",
-                                            onclick: move |_| {
-                                                push_undo("");
-                                                let (path, t, fr, look) = {
-                                                    let mut cl = clips.write();
-                                                    cl[i].transform = engine::Transform::default();
-                                                    (cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look())
-                                                };
-                                                request_preview(path, t, fr, look, None);
-                                            },
-                                            "↺ Reset transform"
-                                        }
-                                    }
+                                    {transform_panel(false)}
                                     div { class: "mr-toolbar",
                                         button { class: "mor-btn", onclick: move |_| move_sel(-1), "◀ Move left" }
                                         button { class: "mor-btn", onclick: move |_| move_sel(1), "Move right ▶" }
@@ -3050,7 +3081,7 @@ fn Editor() -> Element {
                                             " {o.name}"
                                         }
                                         p { class: "mor-statusbar-muted",
-                                            "Cutaway covers V1 from {fmt_t(o.at)} for {fmt_t(o.out_s - o.in_s)} — main audio keeps playing."
+                                            "Cutaway covers V1 from {fmt_t(o.at)} for {fmt_t(o.trimmed())} — main audio keeps playing."
                                         }
                                     }
                                     Slider {
@@ -3153,43 +3184,19 @@ fn Editor() -> Element {
                                             }
                                         },
                                     }
-                                    h4 { class: "mr-fx-cat", "Transform" }
-                                    p { class: "mor-statusbar-muted mr-export-blurb",
-                                        "Scale below 1 makes this a picture-in-picture — V1 shows through around it."
+                                    Slider {
+                                        label: Some("Speed (×)"),
+                                        min: 0.25,
+                                        max: 4.0,
+                                        step: 0.05,
+                                        precision: 2,
+                                        value: o.speed,
+                                        oninput: Some(EventHandler::new(move |v: f64| {
+                                            push_undo(&format!("ospeed{j}"));
+                                            overlays.write()[j].speed = v.max(0.05);
+                                        })),
                                     }
-                                    for (label, value, min, max, step, set) in transform_knobs(&o.transform, true) {
-                                        Slider {
-                                            key: "{label}",
-                                            label: Some(label),
-                                            min, max, step,
-                                            precision: if step < 0.1 { 3 } else { 0 },
-                                            value,
-                                            oninput: Some(EventHandler::new(move |v: f64| {
-                                                push_undo(&format!("xo{label}{j}"));
-                                                let (path, t, fr, look) = {
-                                                    let mut ov = overlays.write();
-                                                    set(&mut ov[j].transform, v);
-                                                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look())
-                                                };
-                                                request_preview(path, t, fr, look, None);
-                                            })),
-                                        }
-                                    }
-                                    if !o.transform.is_identity() {
-                                        button {
-                                            class: "mor-btn mr-reset",
-                                            onclick: move |_| {
-                                                push_undo("");
-                                                let (path, t, fr, look) = {
-                                                    let mut ov = overlays.write();
-                                                    ov[j].transform = engine::Transform::default();
-                                                    (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look())
-                                                };
-                                                request_preview(path, t, fr, look, None);
-                                            },
-                                            "↺ Reset transform"
-                                        }
-                                    }
+                                    {transform_panel(true)}
                                     div { class: "mr-toolbar",
                                         button { class: "mor-btn mr-danger", onclick: move |_| delete_sel(()), "✕ Remove overlay" }
                                     }
@@ -3574,7 +3581,7 @@ fn Editor() -> Element {
                         {
                             let scale = calc_scale();
                             let track_end = total
-                                .max(overlays.read().iter().map(|o| o.at + o.out_s - o.in_s).fold(0.0, f64::max))
+                                .max(overlays.read().iter().map(|o| o.at + o.trimmed()).fold(0.0, f64::max))
                                 .max(titles.read().iter().map(|t| t.at + t.dur).fold(0.0, f64::max))
                                 .max(audios.read().iter().map(|a| a.at + a.out_s - a.in_s).fold(0.0, f64::max));
                             // Adaptive ruler: a labeled tick every ~72px whatever the
@@ -3674,7 +3681,7 @@ fn Editor() -> Element {
                                             div {
                                                 key: "{j}-{o.path}",
                                                 class: item_class("mr-lane-item", selected() == Some(Sel::Over(j)), marked().contains(&Sel::Over(j))),
-                                                style: "left: {o.at * scale}px; width: {(o.out_s - o.in_s) * scale}px",
+                                                style: "left: {o.at * scale}px; width: {o.trimmed() * scale}px",
                                                 onmousedown: move |evt| {
                                                     if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
                                                         selected.set(Some(Sel::Over(j)));
@@ -4380,6 +4387,39 @@ mod tests {
         // moranima camera-move ports are present
         for port in ["Pulse zoom", "Drift", "Sway"] {
             assert!(!effect_filter(port).is_empty(), "missing moranima port {port}");
+        }
+    }
+
+    // A Motion look that renders the same at every playhead position is a look
+    // you cannot see before you export. Each one has to move with the clock.
+    #[tokio::test]
+    async fn every_motion_effect_previews_differently_over_time() {
+        let dir = std::env::temp_dir().join("morreel-motion-preview");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("still.png").display().to_string();
+        // A still, so the only thing that can change between frames is the
+        // effect itself.
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-f", "lavfi"])
+            .args(["-i", "testsrc=duration=1:size=400x300:rate=1", "-frames:v", "1", &png])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        for (cat, name, _) in EFFECTS.iter().filter(|(c, _, _)| *c == "Motion") {
+            let look = effect_filter_amt(name, 1.0);
+            let at = |t: f64| {
+                let look = look.clone();
+                let png = png.clone();
+                async move {
+                    engine::frame_data_uri(&png, t, 108, 192, "Crop", &look, None).await.unwrap()
+                }
+            };
+            assert_ne!(
+                at(0.0).await,
+                at(2.0).await,
+                "{cat}/{name} renders identically at 0s and 2s — it never previews"
+            );
         }
     }
 

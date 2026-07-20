@@ -13,7 +13,13 @@
 //!   6. Lambertian dot product with light vector.
 //!   7. Split into highlight (above 0.5) and shadow (below 0.5) alphas.
 //!   8. Output two RGBA buffers: pure white + hi alpha, pure black + sh alpha.
-//!     The frontend composites these with Screen / Multiply blend modes.
+//!      The frontend composites these with Screen / Multiply blend modes.
+
+// This file is kept in the shape of the port it came from so the two can still
+// be diffed against each other. The index-based loops below are idiomatic in
+// the C++ and Python originals and read the same in all three; rewriting them
+// as iterators would clear the lint at the cost of that correspondence.
+#![allow(clippy::needless_range_loop)]
 
 pub struct BevelParams {
     pub size: u32,
