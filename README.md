@@ -16,6 +16,11 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
 - **Photos on the timeline** — drop a PNG/JPEG onto V1 or V2 and it loops for
   as long as you hold it, so the Motion effects become camera moves over a
   still. Same lanes, same effects, same export.
+- **Drag and drop** — drag media in from a file manager and the lane you drop
+  on decides what it becomes: a clip on V1, a cutaway on V2, music under on A1.
+  The file has the final say, so audio aimed at a video lane still lands on A1
+  and a video dropped on A1 contributes its soundtrack. The target lane lights
+  up before you let go.
 - **Reads what ffmpeg reads** — MP4/MOV/MKV/WebM/AVI/GIF/MPEG-TS and the rest
   for video, PNG/JPEG/WebP/HEIC/AVIF/TIFF for stills, MP3/M4A/WAV/FLAC/Ogg/
   Opus for audio. The dialog filters are a convenience, not a gate: every one

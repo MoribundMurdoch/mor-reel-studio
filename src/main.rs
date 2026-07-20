@@ -6,6 +6,7 @@
 mod bevel;
 mod engine;
 
+use dioxus::html::HasFileData;
 use dioxus::prelude::*;
 use engine::{AudioSpec, ClipSpec, OverlaySpec, TitleSpec};
 use mor_rust_dioxus_ui_kit::{
@@ -546,6 +547,77 @@ fn magnet_delta(at: f64, old: &[(f64, f64)], new_start: impl Fn(usize) -> Option
         .position(|&(s, e)| at >= s && at < e)
         .and_then(|k| new_start(k).map(|ns| ns - old[k].0))
         .unwrap_or(0.0)
+}
+
+/// A timeline lane, as a drop target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lane {
+    V1,
+    V2,
+    A1,
+}
+
+/// What a file is, by extension. An unknown extension is treated as video:
+/// `probe` decides for real, and its no-duration fallback catches images in
+/// containers these tables have never heard of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Video,
+    Still,
+    Audio,
+}
+
+fn kind_of(path: &str) -> Kind {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if engine::AUDIO_EXT.contains(&ext.as_str()) {
+        Kind::Audio
+    } else if engine::IMAGE_EXT.contains(&ext.as_str()) {
+        Kind::Still
+    } else {
+        Kind::Video
+    }
+}
+
+fn file_name_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Where a dropped file actually lands. The lane you drop on says what you
+/// meant, but the file has the final say: sound can't go on a video track and
+/// a photo has nothing to contribute to an audio one. Returns the lane to use,
+/// plus a note when that differs from where it was dropped.
+fn route_drop(kind: Kind, onto: Lane) -> Result<(Lane, Option<&'static str>), &'static str> {
+    match (kind, onto) {
+        // Sound is sound wherever it was aimed — quietly send it to A1.
+        (Kind::Audio, Lane::A1) => Ok((Lane::A1, None)),
+        (Kind::Audio, _) => Ok((Lane::A1, Some("audio goes to A1"))),
+        // A video dropped on A1 contributes its soundtrack.
+        (Kind::Video, Lane::A1) => Ok((Lane::A1, Some("using its soundtrack"))),
+        (Kind::Still, Lane::A1) => Err("a photo has no sound to mix"),
+        (_, lane) => Ok((lane, None)),
+    }
+}
+
+/// Which index a drop at `t` seconds should insert before on V1. The main track
+/// is a concat with no gaps, so a drop can only ever mean "between these two
+/// clips" — never "at 12.4s". Past the midpoint of a clip means after it.
+fn insert_index(clips: &[Clip], t: f64) -> usize {
+    let mut acc = 0.0;
+    for (i, c) in clips.iter().enumerate() {
+        let d = c.trimmed();
+        if t < acc + d / 2.0 {
+            return i;
+        }
+        acc += d;
+    }
+    clips.len()
 }
 
 /// Snap `at` to the nearest of `targets` within `tol` seconds, else leave it.
@@ -1181,6 +1253,84 @@ fn Editor() -> Element {
         }
     };
 
+    // One file onto V1 at `insert_at` (None = append). Shared by the Add clips
+    // dialog and by drops on the timeline, so both land identically. Returns
+    // the error text rather than setting status, so a batch can summarise.
+    let import_one_clip = move |path: String, insert_at: Option<usize>| async move {
+        let name = file_name_of(&path);
+        let (duration, has_audio) = engine::probe(&path).await.map_err(|e| format!("{name}: {e}"))?;
+        let thumb =
+            engine::frame_data_uri(&path, (duration * 0.1).min(1.0), 108, 192, "", "", None)
+                .await
+                .unwrap_or_default();
+        let clip = Clip {
+            path: path.clone(),
+            name,
+            duration,
+            in_s: 0.0,
+            out_s: initial_out(&path, duration),
+            has_audio,
+            effect: "None".to_string(),
+            effect_amount: 1.0,
+            framing: "Crop".to_string(),
+            speed: 1.0,
+            volume: 1.0,
+            thumb,
+            wave: String::new(),
+            proxy: String::new(),
+            group: 0,
+        };
+        {
+            let mut cl = clips.write();
+            let i = insert_at.unwrap_or(cl.len()).min(cl.len());
+            cl.insert(i, clip);
+        }
+        queue_proxy(path.clone());
+        // A clip's own audio gets the same waveform strip A1 items have, so you
+        // can see where the sound is without scrubbing for it. Rendered once per
+        // source in the background; splits inherit it by clone.
+        if has_audio {
+            spawn(async move {
+                if let Ok(uri) = engine::waveform_data_uri(&path).await {
+                    for c in clips.write().iter_mut().filter(|c| c.path == path) {
+                        c.wave = uri.clone();
+                    }
+                }
+            });
+        }
+        if selected().is_none() {
+            select_clip(0);
+        }
+        Ok::<(), String>(())
+    };
+
+    // A batch onto V1, reporting how many made it. Drops and the dialog both
+    // arrive here with a list of paths.
+    let import_clip_paths = move |paths: Vec<String>, insert_at: Option<usize>| {
+        if paths.is_empty() || importing() {
+            return;
+        }
+        spawn(async move {
+            importing.set(true);
+            push_undo(""); // one undo step for the whole batch
+            let (mut ok, mut failed) = (0usize, Vec::<String>::new());
+            for (n, path) in paths.into_iter().enumerate() {
+                status.set(format!("Importing {}…", file_name_of(&path)));
+                // Later files in a batch go after the earlier ones.
+                match import_one_clip(path, insert_at.map(|i| i + n)).await {
+                    Ok(()) => ok += 1,
+                    Err(e) => failed.push(e),
+                }
+            }
+            importing.set(false);
+            status.set(if failed.is_empty() {
+                format!("{ok} added — {} clip(s) on the timeline.", clips.read().len())
+            } else {
+                format!("{ok} added, {} skipped: {}", failed.len(), failed.join("; "))
+            });
+        });
+    };
+
     let import_clips = move |_: ()| {
         if importing() {
             return;
@@ -1195,58 +1345,36 @@ fn Editor() -> Element {
             else {
                 return;
             };
-            importing.set(true);
-            push_undo(""); // one step for the whole batch
-            for f in files {
-                let path = f.path().display().to_string();
-                status.set(format!("Importing {}…", f.file_name()));
-                match engine::probe(&path).await {
-                    Ok((duration, has_audio)) => {
-                        let thumb = engine::frame_data_uri(
-                            &path, (duration * 0.1).min(1.0), 108, 192, "", "", None,
-                        )
-                        .await
-                        .unwrap_or_default();
-                        clips.write().push(Clip {
-                            path: path.clone(),
-                            name: f.file_name(),
-                            duration,
-                            in_s: 0.0,
-                            out_s: initial_out(&path, duration),
-                            has_audio,
-                            effect: "None".to_string(),
-                            effect_amount: 1.0,
-                            framing: "Crop".to_string(),
-                            speed: 1.0,
-                            volume: 1.0,
-                            thumb,
-                            wave: String::new(),
-                            proxy: String::new(),
-                            group: 0,
-                        });
-                        queue_proxy(path.clone());
-                        // A clip's own audio gets the same waveform strip A1
-                        // items have, so you can see where the sound is without
-                        // scrubbing for it. Rendered once per source in the
-                        // background; splits inherit it by clone.
-                        if has_audio {
-                            spawn(async move {
-                                if let Ok(uri) = engine::waveform_data_uri(&path).await {
-                                    for c in clips.write().iter_mut().filter(|c| c.path == path) {
-                                        c.wave = uri.clone();
-                                    }
-                                }
-                            });
-                        }
-                        if selected().is_none() {
-                            select_clip(0);
-                        }
-                    }
-                    Err(e) => status.set(format!("Could not import {}: {e}", f.file_name())),
+            import_clip_paths(files.iter().map(|f| f.path().display().to_string()).collect(), None);
+        });
+    };
+
+    // A cutaway on V2 starting at `at`. Shared by the dialog and by drops.
+    let add_overlay_path = move |path: String, at: f64| {
+        spawn(async move {
+            let name = file_name_of(&path);
+            match engine::probe(&path).await {
+                Ok((duration, _)) => {
+                    push_undo("");
+                    overlays.write().push(OverlayItem {
+                        path: path.clone(),
+                        name,
+                        duration,
+                        in_s: 0.0,
+                        out_s: initial_out(&path, duration),
+                        at: at.max(0.0),
+                        effect: "None".to_string(),
+                        effect_amount: 1.0,
+                        framing: "Crop".to_string(),
+                        proxy: String::new(),
+                        group: 0,
+                    });
+                    queue_proxy(path);
+                    selected.set(Some(Sel::Over(overlays.read().len() - 1)));
+                    status.set(format!("Overlay at {} — V2 covers V1 while it runs.", fmt_t(at)));
                 }
+                Err(e) => status.set(format!("Could not add overlay: {e}")),
             }
-            importing.set(false);
-            status.set(format!("{} clip(s) on the timeline.", clips.read().len()));
         });
     };
 
@@ -1261,28 +1389,45 @@ fn Editor() -> Element {
             else {
                 return;
             };
-            let path = f.path().display().to_string();
+            add_overlay_path(f.path().display().to_string(), playhead());
+        });
+    };
+
+    // Sound under the main track from `at`. A video dropped here contributes its
+    // soundtrack, which is why the dialog offers video too.
+    let add_audio_path = move |path: String, at: f64| {
+        spawn(async move {
+            let name = file_name_of(&path);
             match engine::probe(&path).await {
-                Ok((duration, _)) => {
+                Ok((duration, has_audio)) => {
+                    if !has_audio {
+                        status.set(format!("{name} has no audio stream."));
+                        return;
+                    }
                     push_undo("");
-                    overlays.write().push(OverlayItem {
+                    audios.write().push(AudioItem {
                         path: path.clone(),
-                        name: f.file_name(),
+                        name,
                         duration,
                         in_s: 0.0,
-                        out_s: initial_out(&path, duration),
-                        at: playhead(),
-                        effect: "None".to_string(),
-                        effect_amount: 1.0,
-                        framing: "Crop".to_string(),
-                        proxy: String::new(),
+                        out_s: duration,
+                        at: at.max(0.0),
+                        volume: 1.0,
+                        wave: String::new(),
                         group: 0,
                     });
-                    queue_proxy(path);
-                    selected.set(Some(Sel::Over(overlays.read().len() - 1)));
-                    status.set("Overlay added at the playhead (V2 covers V1 while it runs).".to_string());
+                    selected.set(Some(Sel::Aud(audios.read().len() - 1)));
+                    status.set(format!("Audio at {} — mixed under the main track.", fmt_t(at)));
+                    // Waveform renders in the background; splits share it by path.
+                    spawn(async move {
+                        if let Ok(uri) = engine::waveform_data_uri(&path).await {
+                            for a in audios.write().iter_mut().filter(|a| a.path == path) {
+                                a.wave = uri.clone();
+                            }
+                        }
+                    });
                 }
-                Err(e) => status.set(format!("Could not add overlay: {e}")),
+                Err(e) => status.set(format!("Could not add audio: {e}")),
             }
         });
     };
@@ -1299,38 +1444,7 @@ fn Editor() -> Element {
             else {
                 return;
             };
-            let path = f.path().display().to_string();
-            match engine::probe(&path).await {
-                Ok((duration, has_audio)) => {
-                    if !has_audio {
-                        status.set(format!("{} has no audio stream.", f.file_name()));
-                        return;
-                    }
-                    push_undo("");
-                    audios.write().push(AudioItem {
-                        path: path.clone(),
-                        name: f.file_name(),
-                        duration,
-                        in_s: 0.0,
-                        out_s: duration,
-                        at: playhead(),
-                        volume: 1.0,
-                        wave: String::new(),
-                        group: 0,
-                    });
-                    selected.set(Some(Sel::Aud(audios.read().len() - 1)));
-                    status.set("Audio added at the playhead — mixed under the main track.".to_string());
-                    // Waveform renders in the background; splits share it by path.
-                    spawn(async move {
-                        if let Ok(uri) = engine::waveform_data_uri(&path).await {
-                            for a in audios.write().iter_mut().filter(|a| a.path == path) {
-                                a.wave = uri.clone();
-                            }
-                        }
-                    });
-                }
-                Err(e) => status.set(format!("Could not add audio: {e}")),
-            }
+            add_audio_path(f.path().display().to_string(), playhead());
         });
     };
 
@@ -1916,6 +2030,57 @@ fn Editor() -> Element {
         ((48.0 / min_dur).clamp(14.0, 240.0) * zoom()).clamp(2.0, 960.0)
     };
 
+    // Files dragged in from the file manager. The lane under the cursor decides
+    // what the file becomes; `route_drop` has the final say when the two
+    // disagree. V1 collects its files into one batch so a multi-file drop is a
+    // single undo step and lands in the order they were dropped.
+    let mut drop_hover = use_signal(|| Option::<Lane>::None);
+    let mut handle_drop = move |paths: Vec<String>, onto: Lane, at: f64| {
+        drop_hover.set(None);
+        if paths.is_empty() {
+            return;
+        }
+        let (mut to_v1, mut notes, mut refused) = (Vec::new(), Vec::new(), Vec::new());
+        for path in paths {
+            match route_drop(kind_of(&path), onto) {
+                Err(why) => refused.push(format!("{} ({why})", file_name_of(&path))),
+                Ok((lane, note)) => {
+                    if let Some(n) = note {
+                        if !notes.contains(&n) {
+                            notes.push(n);
+                        }
+                    }
+                    match lane {
+                        Lane::V1 => to_v1.push(path),
+                        Lane::V2 => add_overlay_path(path, at),
+                        Lane::A1 => add_audio_path(path, at),
+                    }
+                }
+            }
+        }
+        if !to_v1.is_empty() {
+            let index = insert_index(&clips.read(), at);
+            import_clip_paths(to_v1, Some(index));
+        }
+        if !refused.is_empty() {
+            status.set(format!("Skipped {}", refused.join(", ")));
+        } else if !notes.is_empty() {
+            status.set(format!("Dropped — {}.", notes.join(", ")));
+        }
+    };
+
+    // Turn a drop event into (paths, timeline seconds under the cursor).
+    let drop_payload = move |evt: &Event<DragData>| -> (Vec<String>, f64) {
+        let paths = evt
+            .files()
+            .iter()
+            .map(|f| f.path().display().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let t = (evt.element_coordinates().x / calc_scale()).max(0.0);
+        (paths, t)
+    };
+
     // Left-drag state: (target, last pointer x, V1 block's floating start,
     // total px travelled). `drag_moved` swallows the click after a real drag.
     let mut drag = use_signal(|| Option::<(Sel, f64, f64, f64)>::None);
@@ -2254,8 +2419,21 @@ fn Editor() -> Element {
                 div { class: "mr-work",
                     div { class: "mr-preview-col",
                         if !monitor_out() {
-                            div { class: "mr-phone",
+                            div {
+                                class: if drop_hover() == Some(Lane::V2) { "mr-phone mr-drop" } else { "mr-phone" },
                                 oncontextmenu: move |evt| open_ctx(evt, Ctx::Monitor),
+                                // Dropping on the picture means "show me this" —
+                                // append to the end of the main track.
+                                ondragover: move |evt| {
+                                    evt.prevent_default();
+                                    if drop_hover() != Some(Lane::V2) { drop_hover.set(Some(Lane::V2)); }
+                                },
+                                ondragleave: move |_| drop_hover.set(None),
+                                ondrop: move |evt| {
+                                    evt.prevent_default();
+                                    let (paths, _) = drop_payload(&evt);
+                                    handle_drop(paths, Lane::V1, total_of());
+                                },
                                 if preview().is_empty() {
                                     span { "Add clips to preview your reel" }
                                 } else {
@@ -2947,13 +3125,27 @@ fn Editor() -> Element {
                         }
 
                         p { class: "mor-statusbar-muted mr-keys",
-                            "Ctrl+Z undo · I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · drag to move (snaps) · Ctrl+G group · ~ magnet · G safe areas · Ctrl+E export"
+                            "Drop files onto a lane · Ctrl+Z undo · I/O trim · S split · Del ripple delete · ←/→ scrub (Shift = 1s) · drag to move (snaps) · Ctrl+G group · ~ magnet · G safe areas · Ctrl+E export"
                         }
                     }
                 }
 
-                div { class: "mr-timeline",
+                div {
+                    class: if drop_hover() == Some(Lane::V1) { "mr-timeline mr-drop" } else { "mr-timeline" },
                     oncontextmenu: move |evt| open_ctx(evt, Ctx::Timeline),
+                    // Fallback drop target: an empty timeline has no lanes yet,
+                    // and the ruler and the gaps between lanes are still the
+                    // timeline. Everything here appends to the end of V1.
+                    ondragover: move |evt| {
+                        evt.prevent_default();
+                        if drop_hover().is_none() { drop_hover.set(Some(Lane::V1)); }
+                    },
+                    ondragleave: move |_| drop_hover.set(None),
+                    ondrop: move |evt| {
+                        evt.prevent_default();
+                        let (paths, _) = drop_payload(&evt);
+                        handle_drop(paths, Lane::V1, total_of());
+                    },
                     // Middle-mouse drag pans the timeline on both axes.
                     onmousedown: move |evt| {
                         if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Auxiliary) {
@@ -3049,7 +3241,7 @@ fn Editor() -> Element {
                         scrubbing.set(false);
                     },
                     if clips.read().is_empty() {
-                        span { class: "mor-statusbar-muted mr-timeline-hint", "Add clips (Ctrl+O) — your story builds left to right" }
+                        span { class: "mor-statusbar-muted mr-timeline-hint", "Drop media here, or Add clips (Ctrl+O) — your story builds left to right" }
                     } else {
                         {
                             let scale = calc_scale();
@@ -3130,7 +3322,25 @@ fn Editor() -> Element {
                                             }
                                         }
                                     }
-                                    div { class: "mr-lane",
+                                    div {
+                                        class: if drop_hover() == Some(Lane::V2) { "mr-lane mr-drop" } else { "mr-lane" },
+                                        ondragover: move |evt| {
+                                            // Dioxus's runtime already prevents the window
+                                            // default (it would navigate to the file); this is
+                                            // the per-element half of the same contract.
+                                            evt.prevent_default();
+                                            evt.stop_propagation();
+                                            if drop_hover() != Some(Lane::V2) { drop_hover.set(Some(Lane::V2)); }
+                                        },
+                                        ondragleave: move |_| {
+                                            if drop_hover() == Some(Lane::V2) { drop_hover.set(None); }
+                                        },
+                                        ondrop: move |evt| {
+                                            evt.prevent_default();
+                                            evt.stop_propagation(); // else the timeline fallback imports it twice
+                                            let (paths, t) = drop_payload(&evt);
+                                            handle_drop(paths, Lane::V2, t);
+                                        },
                                         span { class: "mr-lane-tag", "V2" }
                                         for (j, o) in overlays().into_iter().enumerate() {
                                             div {
@@ -3167,7 +3377,25 @@ fn Editor() -> Element {
                                             }
                                         }
                                     }
-                                    div { class: "mr-clips",
+                                    div {
+                                        class: if drop_hover() == Some(Lane::V1) { "mr-clips mr-drop" } else { "mr-clips" },
+                                        ondragover: move |evt| {
+                                            // Dioxus's runtime already prevents the window
+                                            // default (it would navigate to the file); this is
+                                            // the per-element half of the same contract.
+                                            evt.prevent_default();
+                                            evt.stop_propagation();
+                                            if drop_hover() != Some(Lane::V1) { drop_hover.set(Some(Lane::V1)); }
+                                        },
+                                        ondragleave: move |_| {
+                                            if drop_hover() == Some(Lane::V1) { drop_hover.set(None); }
+                                        },
+                                        ondrop: move |evt| {
+                                            evt.prevent_default();
+                                            evt.stop_propagation(); // else the timeline fallback imports it twice
+                                            let (paths, t) = drop_payload(&evt);
+                                            handle_drop(paths, Lane::V1, t);
+                                        },
                                         span { class: "mr-lane-tag", title: "Primary story — drag clips to reorder", "V1" }
                                         for (i, c) in clips().into_iter().enumerate() {
                                             div {
@@ -3220,7 +3448,25 @@ fn Editor() -> Element {
                                             }
                                         }
                                     }
-                                    div { class: "mr-lane mr-lane-a1",
+                                    div {
+                                        class: if drop_hover() == Some(Lane::A1) { "mr-lane mr-lane-a1 mr-drop" } else { "mr-lane mr-lane-a1" },
+                                        ondragover: move |evt| {
+                                            // Dioxus's runtime already prevents the window
+                                            // default (it would navigate to the file); this is
+                                            // the per-element half of the same contract.
+                                            evt.prevent_default();
+                                            evt.stop_propagation();
+                                            if drop_hover() != Some(Lane::A1) { drop_hover.set(Some(Lane::A1)); }
+                                        },
+                                        ondragleave: move |_| {
+                                            if drop_hover() == Some(Lane::A1) { drop_hover.set(None); }
+                                        },
+                                        ondrop: move |evt| {
+                                            evt.prevent_default();
+                                            evt.stop_propagation(); // else the timeline fallback imports it twice
+                                            let (paths, t) = drop_payload(&evt);
+                                            handle_drop(paths, Lane::A1, t);
+                                        },
                                         span { class: "mr-lane-tag", "A1" }
                                         for (k, a) in audios().into_iter().enumerate() {
                                             div {
@@ -3459,6 +3705,7 @@ fn Editor() -> Element {
                     ("← / →", "Nudge playhead 0.1s (Shift = 1s)"),
                     ("[ / ]", "Select previous / next clip"),
                     ("Drag", "Move items; snaps to cuts and the playhead, V1 clips reorder"),
+                    ("Drop files", "Drag media in from a file manager; the lane decides what it becomes"),
                     ("Ctrl+Click", "Mark items for grouping"),
                     ("Ctrl+G / Ctrl+Shift+G", "Group marked items / ungroup"),
                     ("~", "Toggle magnetic timeline (V2/A1/T ride V1 edits)"),
@@ -3556,6 +3803,13 @@ const APP_CSS: &str = r#"
 .mr-phone img { width: 100%; height: 100%; object-fit: cover; display: block; }
 /* Punch-hole speaker slit: the bezel reads as a phone at a glance. */
 .mr-phone::after { content: ""; position: absolute; top: 6px; left: 50%; transform: translateX(-50%); width: 22%; height: 5px; border-radius: 3px; background: #060608; box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.05); z-index: 2; pointer-events: none; }
+
+/* Drop target under a dragged file. Without this the gesture feels broken even
+   when it works — you get no confirmation of where it will land before you let
+   go. Inset shadow rather than a border, so nothing reflows mid-drag and the
+   lane geometry stays ruler-exact. */
+.mr-drop { box-shadow: inset 0 0 0 2px var(--mor-accent), 0 0 12px color-mix(in srgb, var(--mor-accent) 30%, transparent); background-color: color-mix(in srgb, var(--mor-accent) 12%, transparent); }
+.mr-timeline.mr-drop { border-radius: var(--mor-radius); }
 
 /* Safe-area guides: shaded bands where the phone app's own chrome sits over a
    9:16 feed. Worst case across TikTok / Reels / Shorts, so clearing these
@@ -3857,6 +4111,62 @@ mod tests {
                 "waveform slice and clip width disagree at {speed}x"
             );
         }
+    }
+
+    #[test]
+    fn dropped_files_are_classified_by_extension() {
+        assert_eq!(kind_of("/x/a.mp4"), Kind::Video);
+        assert_eq!(kind_of("/x/a.MKV"), Kind::Video);
+        assert_eq!(kind_of("/x/a.gif"), Kind::Video); // animated: video, not a still
+        assert_eq!(kind_of("/x/a.png"), Kind::Still);
+        assert_eq!(kind_of("/x/a.JPEG"), Kind::Still);
+        assert_eq!(kind_of("/x/a.mp3"), Kind::Audio);
+        assert_eq!(kind_of("/x/a.flac"), Kind::Audio);
+        // Unknown falls to video, where probe (and its still fallback) decides.
+        assert_eq!(kind_of("/x/mystery.xyz"), Kind::Video);
+        assert_eq!(kind_of("/x/noext"), Kind::Video);
+    }
+
+    #[test]
+    fn drops_route_to_the_lane_the_file_belongs_on() {
+        // Dropped where it belongs: no lane change, nothing to explain.
+        assert_eq!(route_drop(Kind::Video, Lane::V1), Ok((Lane::V1, None)));
+        assert_eq!(route_drop(Kind::Still, Lane::V1), Ok((Lane::V1, None)));
+        assert_eq!(route_drop(Kind::Video, Lane::V2), Ok((Lane::V2, None)));
+        assert_eq!(route_drop(Kind::Audio, Lane::A1), Ok((Lane::A1, None)));
+
+        // Sound aimed at a video lane still goes to A1, and says so.
+        assert_eq!(route_drop(Kind::Audio, Lane::V1), Ok((Lane::A1, Some("audio goes to A1"))));
+        assert_eq!(route_drop(Kind::Audio, Lane::V2), Ok((Lane::A1, Some("audio goes to A1"))));
+
+        // A video on A1 contributes its soundtrack rather than being refused.
+        assert_eq!(
+            route_drop(Kind::Video, Lane::A1),
+            Ok((Lane::A1, Some("using its soundtrack")))
+        );
+        // A photo genuinely has nothing to give an audio track.
+        assert!(route_drop(Kind::Still, Lane::A1).is_err());
+    }
+
+    #[test]
+    fn drop_position_picks_an_insertion_point_not_a_time() {
+        // V1 is a concat with no gaps, so a drop can only mean "between these
+        // two clips". Clips of 2 s and 3 s: boundaries at 0, 2, 5.
+        let clips = [clip(0.0, 2.0), clip(0.0, 3.0)];
+        assert_eq!(insert_index(&clips, 0.0), 0);
+        assert_eq!(insert_index(&clips, 0.9), 0); // before clip 0's midpoint
+        assert_eq!(insert_index(&clips, 1.5), 1); // past it, so after clip 0
+        assert_eq!(insert_index(&clips, 3.0), 1); // before clip 1's midpoint (3.5)
+        assert_eq!(insert_index(&clips, 4.0), 2); // past it: append
+        assert_eq!(insert_index(&clips, 99.0), 2);
+        assert_eq!(insert_index(&[], 5.0), 0); // empty timeline
+    }
+
+    #[test]
+    fn file_name_of_handles_paths_and_junk() {
+        assert_eq!(file_name_of("/a/b/clip.mp4"), "clip.mp4");
+        assert_eq!(file_name_of("clip.mp4"), "clip.mp4");
+        assert_eq!(file_name_of(""), "");
     }
 
     #[test]
