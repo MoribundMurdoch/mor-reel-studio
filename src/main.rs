@@ -157,11 +157,11 @@ fn bevel_value(label: &str) -> String {
 /// center-crops, Fit letterboxes on black, Zoom punches in 1.5× then crops.
 const FRAMINGS: &[&str] = &["Crop", "Fit", "Zoom"];
 
-/// What V1 and V2 accept. Photos ride the same lanes as video — ffmpeg loops
-/// the still, so a Motion effect turns it into a camera move over the picture.
-const MEDIA_EXT: [&str; 13] = [
-    "mp4", "mov", "mkv", "webm", "m4v", "avi", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff",
-];
+/// What V1 and V2 accept: video and photos on the same lanes, since ffmpeg
+/// loops a still and a Motion effect turns it into a camera move over it.
+fn media_ext() -> Vec<&'static str> {
+    engine::VIDEO_EXT.iter().chain(engine::IMAGE_EXT).copied().collect()
+}
 
 /// Timeline span a freshly imported source takes: a video keeps its whole
 /// length, a still gets a sensible default the Out point can stretch.
@@ -1187,7 +1187,8 @@ fn Editor() -> Element {
         }
         spawn(async move {
             let Some(files) = rfd::AsyncFileDialog::new()
-                .add_filter("Video & photos", &MEDIA_EXT)
+                .add_filter("Video & photos", &media_ext())
+                .add_filter("All files", &["*"])
                 .set_title("Add clips")
                 .pick_files()
                 .await
@@ -1252,7 +1253,8 @@ fn Editor() -> Element {
     let add_overlay = move |_: ()| {
         spawn(async move {
             let Some(f) = rfd::AsyncFileDialog::new()
-                .add_filter("Video & photos", &MEDIA_EXT)
+                .add_filter("Video & photos", &media_ext())
+                .add_filter("All files", &["*"])
                 .set_title("Add overlay (V2)")
                 .pick_file()
                 .await
@@ -1288,7 +1290,9 @@ fn Editor() -> Element {
     let add_audio = move |_: ()| {
         spawn(async move {
             let Some(f) = rfd::AsyncFileDialog::new()
-                .add_filter("Audio", &["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "mp4"])
+                .add_filter("Audio", engine::AUDIO_EXT)
+                .add_filter("Video (use its soundtrack)", engine::VIDEO_EXT)
+                .add_filter("All files", &["*"])
                 .set_title("Add audio (A1)")
                 .pick_file()
                 .await
@@ -1697,15 +1701,23 @@ fn Editor() -> Element {
         status.set(format!("Removed {n} caption(s) — manual titles kept."));
     };
 
-    let mut do_export = move |_: ()| {
+    // Export settings live in a dialog rather than being hardcoded: the format
+    // decides whether the reel even carries audio, so it has to be chosen
+    // before the save dialog names the file.
+    let mut show_export = use_signal(|| false);
+    let mut export_opts = use_signal(engine::ExportOpts::default);
+
+    let mut run_export = move |_: ()| {
         if clips.read().is_empty() || export_progress().is_some() {
             return;
         }
         playing.set(false);
+        show_export.set(false);
         spawn(async move {
+            let opts = export_opts();
             let Some(file) = rfd::AsyncFileDialog::new()
-                .add_filter("MP4", &["mp4"])
-                .set_file_name("morreel.mp4")
+                .add_filter(opts.format.label(), &[opts.format.ext()])
+                .set_file_name(format!("morreel.{}", opts.format.ext()))
                 .set_title("Export portrait video")
                 .save_file()
                 .await
@@ -1715,8 +1727,8 @@ fn Editor() -> Element {
             ensure_titles().await;
             let (specs, ospecs, tspecs, aspecs) = gather_specs();
             export_progress.set(Some(0.0));
-            status.set("Exporting…".to_string());
-            let res = engine::export(&specs, &ospecs, &tspecs, &aspecs, file.path(), false, |p| {
+            status.set(format!("Exporting {} at {}…", opts.format.label(), engine::size_label(opts.width)));
+            let res = engine::export(&specs, &ospecs, &tspecs, &aspecs, file.path(), opts, |p| {
                 export_progress.set(Some(p))
             })
             .await;
@@ -1726,6 +1738,13 @@ fn Editor() -> Element {
                 Err(e) => status.set(format!("Export failed: {e}")),
             }
         });
+    };
+
+    let mut do_export = move |_: ()| {
+        if clips.read().is_empty() || export_progress().is_some() {
+            return;
+        }
+        show_export.set(true);
     };
 
     // smplayer-style full-fidelity preview: fast-render the timeline to a temp
@@ -1741,7 +1760,7 @@ fn Editor() -> Element {
             let (specs, ospecs, tspecs, aspecs) = gather_specs();
             export_progress.set(Some(0.0));
             status.set("Rendering preview…".to_string());
-            let res = engine::export(&specs, &ospecs, &tspecs, &aspecs, &out, true, |p| {
+            let res = engine::export(&specs, &ospecs, &tspecs, &aspecs, &out, engine::ExportOpts::preview(), |p| {
                 export_progress.set(Some(p))
             })
             .await;
@@ -3459,6 +3478,59 @@ fn Editor() -> Element {
             }
         }
         Modal {
+            open: show_export,
+            title: "Export".to_string(),
+            div { class: "mr-export-dialog",
+                MorSelect {
+                    label: "Format".to_string(),
+                    value: export_opts().format.label().to_string(),
+                    options: engine::Format::ALL.iter().map(|f| f.label().to_string()).collect::<Vec<_>>(),
+                    onchange: move |v: String| {
+                        let mut o = export_opts();
+                        o.format = engine::Format::from_label(&v);
+                        export_opts.set(o);
+                    },
+                }
+                p { class: "mor-statusbar-muted mr-export-blurb", "{export_opts().format.blurb()}" }
+                MorSelect {
+                    label: "Quality".to_string(),
+                    value: export_opts().quality.label().to_string(),
+                    options: engine::Quality::ALL.iter().map(|q| q.label().to_string()).collect::<Vec<_>>(),
+                    onchange: move |v: String| {
+                        let mut o = export_opts();
+                        o.quality = engine::Quality::from_label(&v);
+                        export_opts.set(o);
+                    },
+                }
+                MorSelect {
+                    label: "Size".to_string(),
+                    value: engine::size_label(export_opts().width),
+                    options: engine::SIZES.iter().map(|(l, _, _)| l.to_string()).collect::<Vec<_>>(),
+                    onchange: move |v: String| {
+                        let w = engine::SIZES.iter().find(|(l, _, _)| *l == v).map_or(1080, |(_, w, _)| *w);
+                        export_opts.set(export_opts().with_size(w));
+                    },
+                }
+                p { class: "mor-statusbar-muted mr-export-blurb",
+                    "{fmt_t(total)} at 30 fps"
+                    if !export_opts().format.has_audio() { " · silent — this format carries no audio" }
+                    if let Some(warn) = over_limits(total) { " · {warn}" }
+                }
+                div { class: "mr-toolbar",
+                    button {
+                        class: "mor-btn",
+                        onclick: move |_| show_export.set(false),
+                        "Cancel"
+                    }
+                    button {
+                        class: "mor-btn primary mr-export",
+                        onclick: move |_| run_export(()),
+                        "⇪ Choose file and export"
+                    }
+                }
+            }
+        }
+        Modal {
             open: show_about,
             title: "About MorReel Studio".to_string(),
             p { "Portrait-only (9:16) video editor for phone reels." }
@@ -3605,6 +3677,12 @@ const APP_CSS: &str = r#"
 .mr-fx-tile.active { border-color: var(--mor-accent); box-shadow: 0 0 8px color-mix(in srgb, var(--mor-accent) 30%, transparent); }
 .mr-fx-tile img, .mr-fx-ph { width: 100%; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 4px; background: #000; display: block; }
 .mr-fx-tile span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Export dialog: the format picker carries a one-line blurb, so the choice
+   doesn't need a manual. */
+.mr-export-dialog { display: flex; flex-direction: column; gap: 10px; min-width: 320px; }
+.mr-export-blurb { margin: -4px 0 2px; font-size: 12px; }
+.mr-export-dialog .mr-toolbar { justify-content: flex-end; margin-top: 4px; }
 
 .mr-shortcut-table { border-collapse: collapse; width: 100%; font-size: 13px; }
 .mr-shortcut-table td { padding: 4px 10px 4px 0; }

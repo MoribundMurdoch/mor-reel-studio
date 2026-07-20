@@ -12,19 +12,39 @@ const W: u32 = 1080;
 const H: u32 = 1920;
 const FPS: u32 = 30;
 
+/// What the file dialogs offer, and the single source of truth for what counts
+/// as what. These are only a convenience filter — ffmpeg reads far more than
+/// this, which is why every dialog also offers "All files": if ffprobe can
+/// open it, the editor can use it.
+pub const VIDEO_EXT: &[&str] = &[
+    "mp4", "mov", "mkv", "webm", "m4v", "avi", "gif", "mpg", "mpeg", "mpe", "ts", "mts", "m2ts",
+    "flv", "wmv", "asf", "3gp", "3g2", "ogv", "vob", "mxf", "divx", "f4v", "rm", "rmvb", "y4m",
+];
+
+/// Anything ffmpeg decodes to a single frame. These take the `-loop 1` path.
+pub const IMAGE_EXT: &[&str] = &[
+    "png", "jpg", "jpeg", "jfif", "webp", "bmp", "tif", "tiff", "avif", "heic", "heif", "tga",
+    "ppm", "pgm", "pbm", "pnm", "dds", "ico", "jp2", "j2k", "exr", "hdr", "qoi",
+];
+
+pub const AUDIO_EXT: &[&str] = &[
+    "mp3", "m4a", "m4b", "aac", "wav", "flac", "ogg", "oga", "opus", "wma", "aiff", "aif", "aifc",
+    "alac", "mka", "ac3", "eac3", "dts", "amr", "au", "caf", "mp2", "wv", "ape",
+];
+
 /// A still photo on the timeline. ffmpeg gets `-loop 1` for these, so the one
 /// frame becomes a stream the trim can bound and the Motion effects (moranima's
 /// camera moves) have real timestamps to animate against — a photo with Drift
 /// or Pulse zoom is the whole point of putting one on a reel.
+///
+/// GIF is deliberately *not* here: an animated one is a video, and a static one
+/// still probes with a duration, so the normal path handles both.
 pub fn is_still(path: &str) -> bool {
-    matches!(
-        Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff")
-    )
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|e| IMAGE_EXT.contains(&e.as_str()))
 }
 
 /// A still has no duration of its own. `STILL_SOURCE` is the nominal source
@@ -92,6 +112,130 @@ fn atempo_chain(speed: f64) -> String {
         parts.push(format!("atempo={s:.4}"));
     }
     parts.join(",")
+}
+
+/// Output container and codec.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Format {
+    Mp4,
+    WebM,
+    Gif,
+}
+
+impl Format {
+    pub const ALL: &'static [Format] = &[Format::Mp4, Format::WebM, Format::Gif];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Format::Mp4 => "MP4 · H.264",
+            Format::WebM => "WebM · VP9",
+            Format::Gif => "Animated GIF",
+        }
+    }
+
+    /// One line on what it is good for, so the picker doesn't need a manual.
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Format::Mp4 => "Plays everywhere. The one to upload.",
+            Format::WebM => "Smaller at the same quality, but not every phone plays it.",
+            Format::Gif => "Loops forever, silent, limited colours. For stickers and memes.",
+        }
+    }
+
+    pub fn ext(self) -> &'static str {
+        match self {
+            Format::Mp4 => "mp4",
+            Format::WebM => "webm",
+            Format::Gif => "gif",
+        }
+    }
+
+    /// GIF has no audio track at all — the mix is discarded, not muted.
+    pub fn has_audio(self) -> bool {
+        self != Format::Gif
+    }
+
+    pub fn from_label(label: &str) -> Format {
+        Format::ALL.iter().copied().find(|f| f.label() == label).unwrap_or(Format::Mp4)
+    }
+}
+
+/// The quality/time trade-off. Draft is also what the in-app full preview
+/// renders at, where getting a file to play is the entire point.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quality {
+    Draft,
+    Balanced,
+    High,
+}
+
+impl Quality {
+    pub const ALL: &'static [Quality] = &[Quality::Draft, Quality::Balanced, Quality::High];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::Draft => "Draft — fastest",
+            Quality::Balanced => "Balanced",
+            Quality::High => "High — slowest",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Quality {
+        Quality::ALL.iter().copied().find(|q| q.label() == label).unwrap_or(Quality::Balanced)
+    }
+
+    /// (speed knob, crf) for a codec. x264 takes a preset name; libvpx-vp9
+    /// takes a -cpu-used number, and its crf scale is coarser and higher.
+    fn encode(self, format: Format) -> (&'static str, u32) {
+        match (format, self) {
+            (Format::WebM, Quality::Draft) => ("5", 40),
+            (Format::WebM, Quality::Balanced) => ("3", 33),
+            (Format::WebM, Quality::High) => ("1", 28),
+            (_, Quality::Draft) => ("ultrafast", 32),
+            (_, Quality::Balanced) => ("veryfast", 23),
+            (_, Quality::High) => ("medium", 18),
+        }
+    }
+}
+
+/// Portrait sizes worth offering. The edit is always composed at 1080×1920 —
+/// these scale once at the end of the graph.
+pub const SIZES: &[(&str, u32, u32)] = &[
+    ("1080 × 1920 (full)", 1080, 1920),
+    ("720 × 1280 (smaller file)", 720, 1280),
+    ("540 × 960 (draft)", 540, 960),
+];
+
+pub fn size_label(w: u32) -> String {
+    SIZES.iter().find(|(_, sw, _)| *sw == w).map_or(SIZES[0].0, |(l, _, _)| l).to_string()
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ExportOpts {
+    pub format: Format,
+    pub quality: Quality,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for ExportOpts {
+    fn default() -> Self {
+        Self { format: Format::Mp4, quality: Quality::Balanced, width: W, height: H }
+    }
+}
+
+impl ExportOpts {
+    /// The in-app "full preview" render: fastest thing that still plays, at
+    /// half size, because it goes straight to a player and then to the bin.
+    pub fn preview() -> Self {
+        Self { format: Format::Mp4, quality: Quality::Draft, width: W / 2, height: H / 2 }
+    }
+
+    pub fn with_size(mut self, w: u32) -> Self {
+        let (_, w, h) = SIZES.iter().copied().find(|(_, sw, _)| *sw == w).unwrap_or(SIZES[0]);
+        (self.width, self.height) = (w, h);
+        self
+    }
 }
 
 /// V2: full-frame cutaway laid over the main track at global time `at`.
@@ -349,16 +493,30 @@ pub async fn probe(path: &str) -> Result<(f64, bool), String> {
         &["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
     )
     .await?;
-    let dur: f64 = dur
-        .trim()
-        .parse()
-        .map_err(|_| format!("no duration found in {path}"))?;
     let audio = capture(
         "ffprobe",
         &["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path],
     )
     .await?;
-    Ok((dur, !audio.trim().is_empty()))
+    let has_audio = !audio.trim().is_empty();
+    match dur.trim().parse::<f64>() {
+        Ok(d) if d > 0.0 => Ok((d, has_audio)),
+        // No usable duration. An image in a container this table doesn't list
+        // still has a video stream, so treat it as a still rather than refusing
+        // a file ffmpeg is perfectly happy to decode — this is what lets the
+        // "All files" option in the dialogs actually mean all files.
+        _ => {
+            let video = capture(
+                "ffprobe",
+                &["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width", "-of", "csv=p=0", path],
+            )
+            .await?;
+            if video.trim().is_empty() {
+                return Err(format!("no video or duration found in {path}"));
+            }
+            Ok((STILL_SOURCE, false))
+        }
+    }
 }
 
 /// One portrait-cropped JPEG frame at time `t`, as a data: URI for <img src>.
@@ -537,6 +695,7 @@ pub fn build_filter(
     overlays: &[OverlaySpec],
     titles: &[TitleSpec],
     audio: &[AudioSpec],
+    opts: ExportOpts,
 ) -> String {
     let mut f = String::new();
     for (i, c) in clips.iter().enumerate() {
@@ -613,7 +772,28 @@ pub fn build_filter(
         al = "am".to_string();
     }
 
-    f += &format!("[{vl}]null[vout];[{al}]anull[aout]");
+    // The edit is always composed at 1080x1920 (title cards are rasterized at
+    // that size), so a smaller export is one scale at the very end rather than
+    // a differently shaped graph.
+    let fit = if (opts.width, opts.height) == (W, H) {
+        "null".to_string()
+    } else {
+        format!("scale={}:{}:flags=lanczos", opts.width, opts.height)
+    };
+    f += &format!("[{vl}]{fit}[vout];");
+    // GIF carries no audio track. The mix still has to go somewhere: an
+    // unmapped [aout] is a hard filtergraph error, so it drains into a sink.
+    if opts.format.has_audio() {
+        f += &format!("[{al}]anull[aout]");
+    } else {
+        f += &format!("[{al}]anullsink", );
+    }
+    if opts.format == Format::Gif {
+        // One palette measured over the whole clip, then applied. Without this
+        // a GIF of real video bands into mud.
+        f += ";[vout]split[gp0][gp1];[gp0]palettegen=stats_mode=diff[pal];\
+             [gp1][pal]paletteuse=dither=bayer:bayer_scale=3[gout]";
+    }
     f
 }
 
@@ -814,15 +994,15 @@ pub async fn transcribe(
     Err("no transcriber found — pip install openai-whisper (or whisper-ctranslate2)".into())
 }
 
-/// Render to `out`. `on_progress` gets 0.0..=1.0 as ffmpeg reports out_time.
-/// `fast` trades quality for render speed (ultrafast preview files for playback).
+/// Render to `out` with the chosen container, quality and size.
+/// `on_progress` gets 0.0..=1.0 as ffmpeg reports out_time.
 pub async fn export(
     clips: &[ClipSpec],
     overlays: &[OverlaySpec],
     titles: &[TitleSpec],
     audio: &[AudioSpec],
     out: &Path,
-    fast: bool,
+    opts: ExportOpts,
     mut on_progress: impl FnMut(f64),
 ) -> Result<(), String> {
     if clips.is_empty() {
@@ -847,12 +1027,33 @@ pub async fn export(
     for a in audio {
         cmd.args(["-i", &a.path]);
     }
-    let (preset, crf) = if fast { ("ultrafast", "32") } else { ("veryfast", "20") };
-    cmd.args(["-filter_complex", &build_filter(clips, overlays, titles, audio)])
-        .args(["-map", "[vout]", "-map", "[aout]"])
-        .args(["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p"])
-        .args(["-c:a", "aac", "-b:a", "192k"])
-        .args(["-movflags", "+faststart", "-progress", "pipe:1", "-nostats"])
+    let (speed, crf) = opts.quality.encode(opts.format);
+    let crf = crf.to_string();
+    cmd.args(["-filter_complex", &build_filter(clips, overlays, titles, audio, opts)]);
+    // GIF's palette pass renames the video output; everything else maps [vout].
+    cmd.args(["-map", if opts.format == Format::Gif { "[gout]" } else { "[vout]" }]);
+    if opts.format.has_audio() {
+        cmd.args(["-map", "[aout]"]);
+    }
+    match opts.format {
+        Format::Mp4 => {
+            cmd.args(["-c:v", "libx264", "-preset", speed, "-crf", &crf, "-pix_fmt", "yuv420p"])
+                .args(["-c:a", "aac", "-b:a", "192k"])
+                // faststart puts the index first so it plays before it finishes
+                // downloading — the difference between a reel that starts and
+                // one that spins.
+                .args(["-movflags", "+faststart"]);
+        }
+        Format::WebM => {
+            cmd.args(["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", &crf, "-row-mt", "1"])
+                .args(["-cpu-used", speed, "-pix_fmt", "yuv420p"])
+                .args(["-c:a", "libopus", "-b:a", "128k"]);
+        }
+        Format::Gif => {
+            cmd.args(["-loop", "0"]);
+        }
+    }
+    cmd.args(["-progress", "pipe:1", "-nostats"])
         .arg(out)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -953,7 +1154,7 @@ mod tests {
         let overlays = [OverlaySpec { path: "c.mp4".into(), in_s: 0.0, out_s: 1.0, at: 0.5, ..Default::default() }];
         let titles = [TitleSpec { png: "t.png".into(), at: 0.2, dur: 2.0 }];
         let audio = [AudioSpec { path: "m.mp3".into(), in_s: 0.0, out_s: 2.0, at: 1.0, volume: 0.5 }];
-        let f = build_filter(&clips, &overlays, &titles, &audio);
+        let f = build_filter(&clips, &overlays, &titles, &audio, ExportOpts::default());
         assert!(f.contains("[0:v]trim=start=0.500:end=2.000"));
         assert!(f.contains("setsar=1,hue=s=0[v0]"));
         assert!(f.contains("crop=1080:1920"));
@@ -975,7 +1176,7 @@ mod tests {
         assert!(f.ends_with("[vt0]null[vout];[am]anull[aout]"));
 
         // no overlays / titles / audio degenerates to plain concat
-        let f = build_filter(&clips, &[], &[], &[]);
+        let f = build_filter(&clips, &[], &[], &[], ExportOpts::default());
         assert!(f.ends_with("[vc]null[vout];[ac]anull[aout]"));
     }
 
@@ -1093,7 +1294,7 @@ mod tests {
         assert!(clip_audio(0, &ClipSpec { volume: 0.4, ..base.clone() }).contains("volume=0.40"));
 
         // The video side retimes through setpts and the span shrinks to match.
-        let f = build_filter(&[ClipSpec { speed: 2.0, ..base }], &[], &[], &[]);
+        let f = build_filter(&[ClipSpec { speed: 2.0, ..base }], &[], &[], &[], ExportOpts::default());
         assert!(f.contains("setpts=(PTS-STARTPTS)/2.0000"), "video not retimed: {f}");
     }
 
@@ -1119,7 +1320,7 @@ mod tests {
             speed: 2.0,
             ..Default::default()
         }];
-        export(&clips, &[], &[], &[], &out, true, |_| {}).await.unwrap();
+        export(&clips, &[], &[], &[], &out, ExportOpts::preview(), |_| {}).await.unwrap();
         let d = capture("ffprobe", &[
             "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
             &out.display().to_string(),
@@ -1232,6 +1433,186 @@ mod tests {
         assert_eq!(outlined.get_pixel(0, 0).0[3], 0, "outline made the card opaque");
     }
 
+    // Every format has its own codec branch, its own audio story and, for GIF,
+    // its own output label — so each one gets encoded for real.
+    #[tokio::test]
+    async fn every_export_format_produces_a_playable_file() {
+        let dir = std::env::temp_dir().join("morreel-format-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=30",
+            "-f", "lavfi", "-i", "sine=duration=1",
+            "-c:v", "libx264", "-c:a", "aac", "-shortest", &src,
+        ]).await.unwrap();
+        let clips = [ClipSpec {
+            path: src,
+            in_s: 0.0,
+            out_s: 1.0,
+            has_audio: true,
+            ..Default::default()
+        }];
+
+        for format in Format::ALL.iter().copied() {
+            let out = dir.join(format!("out.{}", format.ext()));
+            let opts = ExportOpts { format, quality: Quality::Draft, ..Default::default() }
+                .with_size(540);
+            export(&clips, &[], &[], &[], &out, opts, |_| {})
+                .await
+                .unwrap_or_else(|e| panic!("{} export failed: {e}", format.label()));
+            assert!(
+                std::fs::metadata(&out).unwrap().len() > 0,
+                "{} produced an empty file",
+                format.label()
+            );
+
+            let streams = capture("ffprobe", &[
+                "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                &out.display().to_string(),
+            ]).await.unwrap();
+            assert!(streams.contains("video"), "{} has no video", format.label());
+            // GIF cannot carry sound, so the mix has to be dropped rather than
+            // muxed — and dropping it must not break the filtergraph.
+            assert_eq!(
+                streams.contains("audio"),
+                format.has_audio(),
+                "{} audio presence is wrong: {streams}",
+                format.label()
+            );
+
+            let dims = capture("ffprobe", &[
+                "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                &out.display().to_string(),
+            ]).await.unwrap();
+            assert_eq!(dims.trim(), "540,960", "{} ignored the size setting", format.label());
+        }
+    }
+
+    #[test]
+    fn export_option_labels_round_trip() {
+        for f in Format::ALL {
+            assert_eq!(Format::from_label(f.label()), *f);
+            assert!(!f.blurb().is_empty() && !f.ext().is_empty());
+        }
+        for q in Quality::ALL {
+            assert_eq!(Quality::from_label(q.label()), *q);
+        }
+        // Unknown labels fall back to something that works, never a panic.
+        assert_eq!(Format::from_label("???"), Format::Mp4);
+        assert_eq!(Quality::from_label("???"), Quality::Balanced);
+
+        // Higher quality means a lower crf on every codec.
+        for f in Format::ALL {
+            let (_, draft) = Quality::Draft.encode(*f);
+            let (_, high) = Quality::High.encode(*f);
+            assert!(high < draft, "{} quality ladder is backwards", f.label());
+        }
+
+        // Size picks a real portrait pair; an unknown width falls back to full.
+        assert_eq!(
+            (ExportOpts::default().with_size(720).width, ExportOpts::default().with_size(720).height),
+            (720, 1280)
+        );
+        assert_eq!(ExportOpts::default().with_size(999).width, 1080);
+        assert!(ExportOpts::preview().width < 1080, "preview should render smaller");
+    }
+
+    #[test]
+    fn filter_scales_only_when_the_size_differs() {
+        let clips = [ClipSpec { out_s: 1.0, ..Default::default() }];
+        let full = build_filter(&clips, &[], &[], &[], ExportOpts::default());
+        assert!(full.contains("[vc]null[vout]"), "full size should not rescale: {full}");
+        assert!(full.ends_with("[ac]anull[aout]"));
+
+        let small = build_filter(&clips, &[], &[], &[], ExportOpts::default().with_size(720));
+        assert!(small.contains("scale=720:1280"), "{small}");
+
+        // GIF drains the mix into a sink and renames the video output, because
+        // an unmapped [aout] is a hard filtergraph error.
+        let gif = build_filter(
+            &clips,
+            &[],
+            &[],
+            &[],
+            ExportOpts { format: Format::Gif, ..Default::default() },
+        );
+        assert!(gif.contains("anullsink") && !gif.contains("[aout]"), "{gif}");
+        assert!(gif.contains("palettegen") && gif.ends_with("[gout]"), "{gif}");
+    }
+
+    // The point of the broadened tables plus "All files": if ffprobe can open
+    // it, the editor can use it.
+    #[tokio::test]
+    async fn probe_handles_the_long_tail_of_containers() {
+        let dir = std::env::temp_dir().join("morreel-container-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = |n: &str| dir.join(n).display().to_string();
+
+        // An animated GIF is video, not a still — it probes with a real duration.
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-f", "lavfi",
+            "-i", "testsrc=duration=1:size=64x64:rate=10", &at("clip.gif"),
+        ]).await.unwrap();
+        assert!(!is_still(&at("clip.gif")), "gif must take the video path");
+        let (d, a) = probe(&at("clip.gif")).await.unwrap();
+        assert!(d > 0.5 && !a, "gif probed as {d}s audio={a}");
+
+        // Ogg Vorbis and Matroska, neither of which the old lists accepted.
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-f", "lavfi", "-i", "sine=duration=1", &at("music.ogg"),
+        ]).await.unwrap();
+        let (d, a) = probe(&at("music.ogg")).await.unwrap();
+        assert!(d > 0.5 && a, "ogg probed as {d}s audio={a}");
+
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=64x64:rate=10",
+            "-f", "lavfi", "-i", "sine=duration=1",
+            "-c:v", "libx264", "-c:a", "libvorbis", "-shortest", &at("movie.mkv"),
+        ]).await.unwrap();
+        let (d, a) = probe(&at("movie.mkv")).await.unwrap();
+        assert!(d > 0.5 && a, "mkv probed as {d}s audio={a}");
+
+        // An image whose extension the table doesn't list: no duration to read,
+        // but it has a video stream, so the fallback imports it as a still.
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-f", "lavfi",
+            "-i", "testsrc=duration=1:size=64x64:rate=1", "-frames:v", "1", &at("odd.bin.png"),
+        ]).await.unwrap();
+        std::fs::copy(at("odd.bin.png"), at("mystery.xyz")).unwrap();
+        assert!(!is_still(&at("mystery.xyz")), "unknown extension is not on the still fast path");
+        assert_eq!(probe(&at("mystery.xyz")).await.unwrap(), (STILL_SOURCE, false));
+
+        // Something that is not media at all still fails, and says so.
+        std::fs::write(dir.join("notes.txt"), b"not media").unwrap();
+        assert!(probe(&at("notes.txt")).await.is_err(), "a text file should not import");
+    }
+
+    #[test]
+    fn extension_tables_are_disjoint_and_cover_the_obvious() {
+        for e in ["mp4", "mov", "mkv", "webm", "avi", "gif"] {
+            assert!(VIDEO_EXT.contains(&e), "{e} missing from the video list");
+        }
+        for e in ["png", "jpg", "jpeg", "webp", "heic", "avif"] {
+            assert!(IMAGE_EXT.contains(&e), "{e} missing from the image list");
+        }
+        for e in ["mp3", "m4a", "wav", "flac", "ogg", "opus"] {
+            assert!(AUDIO_EXT.contains(&e), "{e} missing from the audio list");
+        }
+        // A file cannot be two kinds at once, or is_still would disagree with
+        // whichever lane the dialog put it on.
+        for e in VIDEO_EXT {
+            assert!(!IMAGE_EXT.contains(e), "{e} is listed as both video and image");
+            assert!(!AUDIO_EXT.contains(e), "{e} is listed as both video and audio");
+        }
+        for e in IMAGE_EXT {
+            assert!(!AUDIO_EXT.contains(e), "{e} is listed as both image and audio");
+            assert!(is_still(&format!("x.{e}")), "{e} should take the still path");
+        }
+    }
+
     #[test]
     fn still_classification() {
         for p in ["a.png", "A.JPG", "/x/y/photo.jpeg", "shot.webp", "s.TIFF", "b.bmp"] {
@@ -1276,7 +1657,10 @@ mod tests {
         }];
         let out = dir.join("still.mp4");
         let mut last = 0.0;
-        export(&clips, &[], &[], &[], &out, true, |p| last = p).await.unwrap();
+        // Draft quality but full size: this test is about the still becoming a
+        // real span of portrait video, not about the preview's half-size path.
+        let opts = ExportOpts { quality: Quality::Draft, ..Default::default() };
+        export(&clips, &[], &[], &[], &out, opts, |p| last = p).await.unwrap();
         assert_eq!(last, 1.0);
 
         let info = capture("ffprobe", &[
@@ -1416,12 +1800,12 @@ mod tests {
         assert!(std::fs::metadata(&boxed).unwrap().len() > 0);
         let titles = [TitleSpec { png, at: 0.0, dur: 1.0 }];
         let mut last = 0.0;
-        export(&clips, &overlays, &titles, &audio, &out, false, |p| last = p).await.unwrap();
+        export(&clips, &overlays, &titles, &audio, &out, ExportOpts::default(), |p| last = p).await.unwrap();
         assert_eq!(last, 1.0);
 
         // fast preview render (playback path) produces a playable file too
         let fast_out = dir.join("preview.mp4");
-        export(&clips, &overlays, &titles, &audio, &fast_out, true, |_| {}).await.unwrap();
+        export(&clips, &overlays, &titles, &audio, &fast_out, ExportOpts::preview(), |_| {}).await.unwrap();
         assert!(std::fs::metadata(&fast_out).unwrap().len() > 0);
 
         // in-app playback audio mix renders with the V1 timeline's duration

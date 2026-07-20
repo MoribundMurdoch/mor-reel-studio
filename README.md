@@ -16,6 +16,15 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
 - **Photos on the timeline** — drop a PNG/JPEG onto V1 or V2 and it loops for
   as long as you hold it, so the Motion effects become camera moves over a
   still. Same lanes, same effects, same export.
+- **Reads what ffmpeg reads** — MP4/MOV/MKV/WebM/AVI/GIF/MPEG-TS and the rest
+  for video, PNG/JPEG/WebP/HEIC/AVIF/TIFF for stills, MP3/M4A/WAV/FLAC/Ogg/
+  Opus for audio. The dialog filters are a convenience, not a gate: every one
+  also offers **All files**, and anything ffprobe can open will import — a
+  file with no duration but a video stream comes in as a still.
+- **Export options** — MP4 (H.264), WebM (VP9) or animated GIF; Draft /
+  Balanced / High quality; 1080×1920, 720×1280 or 540×960. The edit is always
+  composed at 1080×1920 and scaled once at the end of the graph, so a smaller
+  export is a smaller file, not a different render.
 - **V2 overlay track** — full-frame B-roll cutaways; main audio keeps playing.
 - **T title track** — drawtext-rasterized title cards on a transparent canvas,
   with an optional outline and a **cameo/intaglio bevel** (the Krita-derived
