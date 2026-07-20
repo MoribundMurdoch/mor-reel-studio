@@ -186,6 +186,56 @@ pub fn font_families() -> &'static [String] {
     })
 }
 
+/// What a T-lane card actually is. Shapes ride the title lane because they
+/// need exactly what a title needs — a rasterized card, a place on the
+/// timeline, a fade — and nothing a title does not.
+pub const TITLE_KINDS: &[&str] = &["Text", "Box", "Ellipse", "Line"];
+
+/// Numeric colour for geq, which cannot take the names drawtext accepts.
+fn rgb_of(color: &str) -> (u32, u32, u32) {
+    match color {
+        "black" => (0, 0, 0),
+        hex if hex.len() == 7 && hex.starts_with('#') => {
+            let byte = |at: usize| u32::from_str_radix(&hex[at..at + 2], 16).unwrap_or(255);
+            (byte(1), byte(3), byte(5))
+        }
+        _ => (255, 255, 255),
+    }
+}
+
+/// A shape, drawn straight into the alpha plane.
+///
+/// It has to be geq: drawbox writes colour but leaves alpha alone, so on the
+/// transparent canvas a title card is rasterized onto, its box comes out fully
+/// coloured and completely invisible.
+fn shape_chain(s: &TitleStyle, w: u32, h: u32) -> String {
+    let (r, g, b) = rgb_of(&s.color);
+    let (fw, fh) = (w as f64, h as f64);
+    let cx = fw * (0.5 + s.shape_x);
+    let cy = fh * s.y_frac.clamp(0.0, 1.0);
+    let hw = (fw * s.shape_w / 2.0).max(1.0);
+    let hh = (fh * s.shape_h / 2.0).max(1.0);
+    let covers = |hw: f64, hh: f64| match s.kind.as_str() {
+        "Ellipse" => format!("lte(pow((X-{cx:.1})/{hw:.1},2)+pow((Y-{cy:.1})/{hh:.1},2),1)"),
+        _ => format!(
+            "between(X,{:.1},{:.1})*between(Y,{:.1},{:.1})",
+            cx - hw,
+            cx + hw,
+            cy - hh,
+            cy + hh
+        ),
+    };
+    // An outline thickness turns a solid shape into a ring — inside the outer
+    // edge but not inside the inner one. A line is always solid.
+    let t = s.outline.max(0.0);
+    let alpha = if t > 0.0 && s.kind != "Line" && hw > t && hh > t {
+        format!("if({}*(1-{}),255,0)", covers(hw, hh), covers(hw - t, hh - t))
+    } else {
+        format!("if({},255,0)", covers(hw, hh))
+    };
+    format!("format=rgba,geq=r='{r}':g='{g}':b='{b}':a='{alpha}'")
+}
+
 /// How multi-line title text lines up within its block.
 pub const ALIGNMENTS: &[(&str, &str)] = &[
     ("Centre", "center"),
@@ -546,13 +596,30 @@ pub const TITLE_ANIMS: &[&str] =
     &["None", "Slide up", "Slide down", "Slide in left", "Slide in right"];
 
 /// T: a pre-rendered 1080×1920 transparent PNG shown from `at` for `dur`.
-#[derive(Clone, PartialEq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct TitleSpec {
     pub png: String,
     pub at: f64,
     pub dur: f64,
     /// One of TITLE_ANIMS. Anything unrecognised sits still.
     pub anim: String,
+    /// A word-by-word reveal is a run of cards back to back. Only the first
+    /// fades up and only the last fades out, or every word would pulse.
+    pub fade_in: bool,
+    pub fade_out: bool,
+}
+
+impl Default for TitleSpec {
+    fn default() -> Self {
+        Self {
+            png: String::new(),
+            at: 0.0,
+            dur: 0.0,
+            anim: String::new(),
+            fade_in: true,
+            fade_out: true,
+        }
+    }
 }
 
 impl TitleSpec {
@@ -624,6 +691,14 @@ pub struct TitleStyle {
     pub outline_color: String,
     /// Semi-opaque backdrop box behind the text.
     pub boxed: bool,
+    /// One of TITLE_KINDS. "Text" draws words; the rest draw a shape and
+    /// ignore everything about type.
+    pub kind: String,
+    /// Shape size and horizontal offset, as fractions of the frame. Vertical
+    /// placement reuses `y_frac`, the same control a title uses.
+    pub shape_w: f64,
+    pub shape_h: f64,
+    pub shape_x: f64,
     /// "Off" | "Cameo" (raised) | "Intaglio" (sunken).
     pub bevel: String,
     pub bevel_size: f64,
@@ -647,6 +722,10 @@ impl Default for TitleStyle {
             outline: 0.0,
             outline_color: "black".into(),
             boxed: false,
+            kind: "Text".into(),
+            shape_w: 0.6,
+            shape_h: 0.12,
+            shape_x: 0.0,
             bevel: "Off".into(),
             // The designer app's own bevel defaults, so a card struck here and
             // a card struck there look like the same tool made them.
@@ -676,6 +755,7 @@ impl std::hash::Hash for TitleStyle {
         self.align.hash(h);
         self.outline_color.hash(h);
         self.boxed.hash(h);
+        self.kind.hash(h);
         self.bevel.hash(h);
         for f in [
             self.y_frac,
@@ -687,6 +767,9 @@ impl std::hash::Hash for TitleStyle {
             self.altitude,
             self.hi_opacity,
             self.sh_opacity,
+            self.shape_w,
+            self.shape_h,
+            self.shape_x,
         ] {
             f.to_bits().hash(h);
         }
@@ -699,8 +782,8 @@ impl std::hash::Hash for TitleStyle {
 pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
     use std::hash::{Hash, Hasher};
     // Bump when the rendering changes, so cards cached by an older build are
-    // re-rendered instead of served stale. v4: adds text alignment.
-    const CACHE_VER: u32 = 4;
+    // re-rendered instead of served stale. v5: adds shapes.
+    const CACHE_VER: u32 = 5;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     CACHE_VER.hash(&mut h);
     s.hash(&mut h);
@@ -710,6 +793,25 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
         return Ok(png.display().to_string());
     }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // A shape needs none of the type machinery below it.
+    let shape = s.kind != "Text" && !s.kind.is_empty();
+    if shape {
+        let out = Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+            .arg(format!("color=c=black@0.0:s={W}x{H},format=rgba"))
+            .args(["-vf", &shape_chain(s, W, H), "-frames:v", "1", "-pix_fmt", "rgba"])
+            .arg(&png)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+        // Falls through to the bevel below, so a shape can be embossed too.
+        return finish_title(&png, s);
+    }
 
     // textfile= sidesteps drawtext's escaping rules entirely.
     let txt = png.with_extension("txt");
@@ -755,8 +857,14 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
 
+    finish_title(&png, s)
+}
+
+/// Bake the bevel, if any, into a rasterized card. Shared by text and shapes —
+/// an embossed box is as reasonable as embossed type.
+fn finish_title(png: &std::path::Path, s: &TitleStyle) -> Result<String, String> {
     if s.bevel != "Off" {
-        let img = image::open(&png).map_err(|e| e.to_string())?;
+        let img = image::open(png).map_err(|e| e.to_string())?;
         let mut rgba = img.to_rgba8();
         let (w, h_px) = rgba.dimensions();
         let result = crate::bevel::compute_bevel(
@@ -787,7 +895,7 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
                 buf[i * 4 + c] = (shadowed + hi_a * (255.0 - shadowed)) as u8;
             }
         }
-        rgba.save(&png).map_err(|e| e.to_string())?;
+        rgba.save(png).map_err(|e| e.to_string())?;
     }
     Ok(png.display().to_string())
 }
@@ -1176,13 +1284,15 @@ pub fn build_filter(
         // timestamps to fade against: alpha in/out over `fade`, then shifted to
         // its timeline spot. Short titles shrink the fade so they still read.
         let fade = title_fade(t.dur);
+        let fin = if t.fade_in { format!("fade=t=in:st=0:d={fade:.3}:alpha=1,") } else { String::new() };
+        let fout = if t.fade_out {
+            format!("fade=t=out:st={:.3}:d={fade:.3}:alpha=1,", t.dur - fade)
+        } else {
+            String::new()
+        };
         f += &format!(
-            "[{idx}:v]format=rgba,trim=duration={:.3},\
-             fade=t=in:st=0:d={fade:.3}:alpha=1,fade=t=out:st={:.3}:d={fade:.3}:alpha=1,\
-             setpts=PTS+{:.3}/TB[ti{j}];",
-            t.dur,
-            t.dur - fade,
-            t.at
+            "[{idx}:v]format=rgba,trim=duration={:.3},{fin}{fout}setpts=PTS+{:.3}/TB[ti{j}];",
+            t.dur, t.at
         );
         f += &format!(
             "[{vl}][ti{j}]overlay={}enable='between(t,{:.3},{:.3})'[vt{j}];",
@@ -2474,7 +2584,7 @@ mod tests {
 
     #[test]
     fn only_an_animated_title_gets_overlay_coordinates() {
-        let still = TitleSpec { png: "t.png".into(), at: 1.0, dur: 3.0, anim: "None".into() };
+        let still = TitleSpec { png: "t.png".into(), at: 1.0, dur: 3.0, anim: "None".into(), ..Default::default() };
         assert_eq!(still.overlay_xy(), "", "a still card needs no x/y at all");
         // An unknown name sits still rather than breaking the graph.
         assert_eq!(TitleSpec { anim: "wat".into(), ..still.clone() }.overlay_xy(), "");
@@ -2511,7 +2621,7 @@ mod tests {
         let clips = [ClipSpec { path: bg, out_s: 3.0, ..Default::default() }];
         let mut frames = Vec::new();
         for anim in ["None", "Slide up"] {
-            let titles = [TitleSpec { png: png.clone(), at: 0.0, dur: 3.0, anim: anim.into() }];
+            let titles = [TitleSpec { png: png.clone(), at: 0.0, dur: 3.0, anim: anim.into(), ..Default::default() }];
             let out = dir.join(format!("{}.mp4", anim.replace(' ', "_")));
             let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
             export(&clips, &[], &titles, &[], &out, opts, |_| {}).await.unwrap();
@@ -2546,6 +2656,61 @@ mod tests {
             "an unusable face reached the picker"
         );
         assert!(fams.iter().all(|f| !f.trim().is_empty()));
+    }
+
+    // A shape has to actually paint alpha. drawbox writes colour and leaves
+    // alpha alone, which on a transparent card is a fully coloured, completely
+    // invisible box — this is the test that would catch that regression.
+    #[tokio::test]
+    async fn shapes_paint_alpha_where_they_should_and_nowhere_else() {
+        let base = TitleStyle {
+            kind: "Box".into(),
+            color: "#E8C060".into(),
+            shape_w: 0.5,
+            shape_h: 0.2,
+            y_frac: 0.5,
+            ..Default::default()
+        };
+        let load = |p: String| image::open(p).unwrap().to_rgba8();
+
+        let solid = load(render_title(&base).await.unwrap());
+        let (w, h) = solid.dimensions();
+        let centre = solid.get_pixel(w / 2, h / 2).0;
+        assert_eq!(centre[3], 255, "the middle of a filled box must be opaque");
+        assert_eq!((centre[0], centre[1], centre[2]), (232, 192, 96), "wrong colour: {centre:?}");
+        assert_eq!(solid.get_pixel(2, 2).0[3], 0, "outside the box must stay transparent");
+
+        // Roughly the right area: half the width by a fifth of the height.
+        let painted = solid.pixels().filter(|p| p.0[3] > 200).count() as f64;
+        let expected = 0.5 * 0.2 * (w * h) as f64;
+        assert!((painted / expected - 1.0).abs() < 0.1, "box covers {painted}, wanted ~{expected}");
+
+        // An outline hollows it out: the edge stays, the middle goes.
+        let ring = load(render_title(&TitleStyle { outline: 12.0, ..base.clone() }).await.unwrap());
+        assert_eq!(ring.get_pixel(w / 2, h / 2).0[3], 0, "an outlined box must be hollow");
+        assert!(ring.pixels().filter(|p| p.0[3] > 200).count() > 0, "the ring itself vanished");
+
+        // An ellipse fills its middle but not the corners of its bounding box.
+        let ell = load(render_title(&TitleStyle { kind: "Ellipse".into(), ..base.clone() }).await.unwrap());
+        assert_eq!(ell.get_pixel(w / 2, h / 2).0[3], 255);
+        let corner_x = (w as f64 / 2.0 + 0.5 * w as f64 / 2.0 * 0.97) as u32;
+        let corner_y = (h as f64 / 2.0 + 0.2 * h as f64 / 2.0 * 0.97) as u32;
+        assert_eq!(ell.get_pixel(corner_x, corner_y).0[3], 0, "an ellipse should not fill corners");
+
+        // A line ignores the outline and stays solid.
+        let line = load(
+            render_title(&TitleStyle { kind: "Line".into(), outline: 12.0, ..base }).await.unwrap(),
+        );
+        assert_eq!(line.get_pixel(w / 2, h / 2).0[3], 255, "a line is always solid");
+    }
+
+    #[test]
+    fn shape_colours_come_out_as_numbers_geq_understands() {
+        assert_eq!(rgb_of("black"), (0, 0, 0));
+        assert_eq!(rgb_of("white"), (255, 255, 255));
+        assert_eq!(rgb_of("#E8C060"), (232, 192, 96));
+        assert_eq!(rgb_of("#3DD6D0"), (61, 214, 208));
+        assert_eq!(rgb_of("nonsense"), (255, 255, 255), "fall back rather than break the render");
     }
 
     #[test]
@@ -2768,5 +2933,6 @@ mod tests {
         assert_eq!(dims.trim(), "1080,1920");
     }
 }
+
 
 

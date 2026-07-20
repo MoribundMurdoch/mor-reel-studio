@@ -49,7 +49,10 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   and a **slide-on entrance** — the card is composited with `overlay`, whose
   x/y take time expressions, so it carries on and off with the fade. Styles
   save as **presets** outside the project, so a series of reels can share one,
-  and one button pushes a style onto every caption.
+  and one button pushes a style onto every caption. Words can arrive **one at
+  a time** — the phone-caption reveal — and the same lane draws **shapes**
+  (box, ellipse, line, filled or hollow) for the times a reel needs an arrow
+  or a highlight rather than a sentence.
   Plus an optional outline and a **cameo/intaglio bevel** (the Krita-derived
   mor_cameo_emboss algorithm). The bevel exposes the same controls as
   [wearable-dictionary-designer](../wearable-dictionary-designer), which is

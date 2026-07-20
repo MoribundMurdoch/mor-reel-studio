@@ -219,9 +219,15 @@ fn wrap_caption(text: &str, max: usize) -> String {
     out
 }
 
-/// Rasterize a title card from its item's params.
-async fn render_one(t: &TitleItem) -> Result<String, String> {
-    engine::render_title(&t.style()).await
+/// Rasterize every card a title is made of — one normally, one per word when
+/// the words come in individually. Content-addressed, so re-rendering after an
+/// edit only pays for the steps that actually changed.
+async fn render_one(t: &TitleItem) -> Result<Vec<String>, String> {
+    let mut cards = Vec::new();
+    for (text, _, _) in t.segments() {
+        cards.push(engine::render_title(&t.style_of(&text)).await?);
+    }
+    Ok(cards)
 }
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -242,6 +248,20 @@ struct TitleItem {
     /// How the card arrives and leaves; see engine::TITLE_ANIMS.
     #[serde(default = "none_label")]
     anim: String,
+    /// Bring the words in one at a time instead of all at once — the caption
+    /// style every phone editor has. Costs one rendered card per word.
+    #[serde(default)]
+    reveal: bool,
+    /// "Text" or one of the shapes. A shape is a T-lane card like any other —
+    /// it just draws a box instead of words.
+    #[serde(default = "text_kind")]
+    kind: String,
+    #[serde(default = "shape_w_default")]
+    shape_w: f64,
+    #[serde(default = "shape_h_default")]
+    shape_h: f64,
+    #[serde(default)]
+    shape_x: f64,
     /// Semi-opaque backdrop box behind the text (caption legibility).
     boxed: bool,
     /// Outline width in px, 0 = none — legibility without an opaque plate.
@@ -265,9 +285,10 @@ struct TitleItem {
     sh_opacity: f64,
     /// Made by Auto captions — lets "Remove captions" clear them in bulk.
     caption: bool,
-    /// Rendered PNG path; empty while a render is in flight.
+    /// Rendered cards, one per revealed step (just one unless the words
+    /// come in one at a time). Empty while a render is in flight.
     #[serde(skip)]
-    png: String,
+    pngs: Vec<String>,
     /// Drag-together group id; 0 = ungrouped.
     group: usize,
 }
@@ -361,6 +382,19 @@ fn xf_apply(
     t
 }
 
+/// Shape size and offset, as fractions of the frame. Vertical placement reuses
+/// the Position control a title already has.
+type ShapeKnob = (&'static str, f64, fn(&mut TitleItem, f64));
+
+fn shape_knobs(t: &TitleItem) -> Vec<ShapeKnob> {
+    let set_w: fn(&mut TitleItem, f64) = |i, v| i.shape_w = v;
+    vec![
+        ("Width", t.shape_w, set_w),
+        ("Height", t.shape_h, |i, v| i.shape_h = v),
+        ("Across", t.shape_x, |i, v| i.shape_x = v),
+    ]
+}
+
 /// One row of the Transform panel: label, value, min, max, step, and how to
 /// write it back. Both lanes carry the same struct, so one table serves both.
 type XformKnob = (&'static str, f64, f64, f64, f64, fn(&mut engine::Transform, f64));
@@ -399,13 +433,67 @@ fn bevel_knobs(t: &TitleItem) -> Vec<BevelKnob> {
     ]
 }
 
+/// A word-by-word reveal finishes this far into the card's life, so the
+/// finished line still holds long enough to read.
+const REVEAL_SPAN: f64 = 0.6;
+
+/// Prefixes of `text` ending at each word, cut out of the original string so
+/// the line breaks it already has survive exactly. Rejoining split words with
+/// spaces would unwrap a caption and make it jump between lines mid-reveal.
+fn word_prefixes(text: &str) -> Vec<String> {
+    let mut ends = Vec::new();
+    let mut in_word = false;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if in_word {
+                ends.push(i);
+            }
+            in_word = false;
+        } else {
+            in_word = true;
+        }
+    }
+    if in_word {
+        ends.push(text.len());
+    }
+    ends.into_iter().map(|e| text[..e].to_string()).collect()
+}
+
 impl TitleItem {
+    /// The cards this title is actually made of: (text, start, length). One
+    /// card normally; one per word when the words come in individually.
+    fn segments(&self) -> Vec<(String, f64, f64)> {
+        let steps = word_prefixes(&self.text);
+        if !self.reveal || self.kind != "Text" || steps.len() < 2 {
+            return vec![(self.text.clone(), self.at, self.dur)];
+        }
+        let n = steps.len();
+        let step = self.dur * REVEAL_SPAN / n as f64;
+        steps
+            .into_iter()
+            .enumerate()
+            .map(|(k, text)| {
+                let at = self.at + k as f64 * step;
+                // The last word holds until the card is done.
+                let end =
+                    if k + 1 == n { self.at + self.dur } else { self.at + (k + 1) as f64 * step };
+                (text, at, (end - at).max(0.01))
+            })
+            .collect()
+    }
+
+    /// Which card is on screen at `t`, if any.
+    fn card_at(&self, t: f64) -> Option<usize> {
+        self.segments().iter().position(|(_, at, dur)| t >= *at && t < at + dur)
+    }
+
     /// Map the timeline item onto the engine's render parameters. The item
     /// stores friendly choices (a colour name, a position name); the style
     /// stores what ffmpeg and the bevel actually need.
-    fn style(&self) -> engine::TitleStyle {
+    /// This card's look, carrying whichever words this step shows.
+    fn style_of(&self, text: &str) -> engine::TitleStyle {
         engine::TitleStyle {
-            text: self.text.clone(),
+            text: text.to_string(),
             font_size: self.font_size as u32,
             color: title_color(&self.color).to_string(),
             y_frac: title_y(&self.pos),
@@ -414,6 +502,10 @@ impl TitleItem {
             outline: self.outline,
             outline_color: title_color(&self.outline_color).to_string(),
             boxed: self.boxed,
+            kind: self.kind.clone(),
+            shape_w: self.shape_w,
+            shape_h: self.shape_h,
+            shape_x: self.shape_x,
             bevel: self.bevel.clone(),
             bevel_size: self.bevel_size,
             soften: self.soften,
@@ -624,6 +716,15 @@ fn none_label() -> String {
 fn centre() -> String {
     "Centre".to_string()
 }
+fn text_kind() -> String {
+    "Text".to_string()
+}
+fn shape_w_default() -> f64 {
+    0.6
+}
+fn shape_h_default() -> f64 {
+    0.12
+}
 /// Default transition length. Short, because a reel cut is quick.
 fn half() -> f64 {
     0.5
@@ -665,7 +766,7 @@ fn restyle(dst: &TitleItem, src: &TitleItem) -> TitleItem {
         dur: dst.dur,
         group: dst.group,
         caption: dst.caption,
-        png: String::new(),
+        pngs: Vec::new(),
         ..src.clone()
     }
 }
@@ -1071,8 +1172,13 @@ fn Editor() -> Element {
             .read()
             .iter()
             .rev()
-            .find(|ti| t >= ti.at && t < ti.at + ti.dur && !ti.png.is_empty())
-            .map(|ti| (ti.png.clone(), title_alpha(t, ti.at, ti.dur)));
+            .find(|ti| t >= ti.at && t < ti.at + ti.dur && !ti.pngs.is_empty())
+            .and_then(|ti| {
+                // A revealed title is a run of cards; show whichever is up now,
+                // faded against the whole title rather than its own step.
+                let k = ti.card_at(t).unwrap_or(0).min(ti.pngs.len().saturating_sub(1));
+                ti.pngs.get(k).map(|p| (p.clone(), title_alpha(t, ti.at, ti.dur)))
+            });
         let over = overlays.read().iter().find(|o| t >= o.at && t < o.at + o.trimmed()).map(
             |o| {
                 (
@@ -1123,7 +1229,7 @@ fn Editor() -> Element {
             match render_one(&t).await {
                 Ok(png) => {
                     if let Some(item) = titles.write().get_mut(k) {
-                        item.png = png;
+                        item.pngs = png;
                     }
                     seek_to(playhead());
                 }
@@ -1746,6 +1852,11 @@ fn Editor() -> Element {
             font: "Sans".to_string(),
             align: "Centre".to_string(),
             anim: "None".to_string(),
+            reveal: false,
+            kind: "Text".to_string(),
+            shape_w: 0.6,
+            shape_h: 0.12,
+            shape_x: 0.0,
             // Transparent by default: the video shows through, and the relief
             // plus an outline carry legibility without an opaque plate.
             boxed: false,
@@ -1758,7 +1869,7 @@ fn Editor() -> Element {
             hi_opacity: 0.75,
             sh_opacity: 0.75,
             caption: false,
-            png: String::new(),
+            pngs: Vec::new(),
             group: 0,
         });
         let k = titles.read().len() - 1;
@@ -1785,8 +1896,23 @@ fn Editor() -> Element {
         let tspecs = titles
             .read()
             .iter()
-            .filter(|t| !t.png.is_empty())
-            .map(|t| TitleSpec { png: t.png.clone(), at: t.at, dur: t.dur, anim: t.anim.clone() })
+            .filter(|t| !t.pngs.is_empty())
+            .flat_map(|t| {
+                let segs = t.segments();
+                let n = segs.len().min(t.pngs.len());
+                // Only the first card slides on and only the last fades out, so
+                // a revealed line reads as one title rather than n flashes.
+                (0..n)
+                    .map(|k| TitleSpec {
+                        png: t.pngs[k].clone(),
+                        at: segs[k].1,
+                        dur: segs[k].2,
+                        anim: if k == 0 { t.anim.clone() } else { "None".to_string() },
+                        fade_in: k == 0,
+                        fade_out: k + 1 == n,
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect();
         let aspecs = audios
             .read()
@@ -1865,13 +1991,13 @@ fn Editor() -> Element {
             .read()
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.png.is_empty())
+            .filter(|(_, t)| t.pngs.is_empty())
             .map(|(k, t)| (k, t.clone()))
             .collect();
         for (k, t) in missing {
             if let Ok(png) = render_one(&t).await {
                 if let Some(item) = titles.write().get_mut(k) {
-                    item.png = png;
+                    item.pngs = png;
                 }
             }
         }
@@ -2059,6 +2185,11 @@ fn Editor() -> Element {
                                 font: "Sans".to_string(),
                                 align: "Centre".to_string(),
                                 anim: "None".to_string(),
+                                reveal: false,
+                                kind: "Text".to_string(),
+                                shape_w: 0.6,
+                                shape_h: 0.12,
+                                shape_x: 0.0,
                                 boxed: true, // backdrop keeps captions readable over busy video
                                 outline: 0.0,
                                 outline_color: "Black".to_string(),
@@ -2069,7 +2200,7 @@ fn Editor() -> Element {
                                 hi_opacity: 0.75,
                                 sh_opacity: 0.75,
                                 caption: true,
-                                png: String::new(),
+                                pngs: Vec::new(),
                                 group: 0,
                             });
                         }
@@ -3450,20 +3581,58 @@ fn Editor() -> Element {
                                     div { class: "mr-clip-info",
                                         h3 {
                                             span { class: "mr-ctx-tag title", "T" }
-                                            if t.caption { " Caption" } else { " Title" }
+                                            if t.caption { " Caption" } else if t.kind != "Text" { " Shape" } else { " Title" }
                                         }
                                         p { class: "mor-statusbar-muted",
                                             "Shown from {fmt_t(t.at)} for {fmt_t(t.dur)}"
-                                            if t.png.is_empty() { " • rendering…" }
+                                            if t.pngs.is_empty() { " • rendering…" }
                                         }
                                     }
+                                    MorSelect {
+                                        label: "Card".to_string(),
+                                        value: t.kind.clone(),
+                                        options: engine::TITLE_KINDS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                                        onchange: move |v: String| {
+                                            push_undo("");
+                                            if let Some(item) = titles.write().get_mut(k) {
+                                                item.kind = v;
+                                                item.pngs.clear();
+                                            }
+                                            rerender_title(k);
+                                        },
+                                    }
+                                    if t.kind != "Text" {
+                                        for (label, value, set) in shape_knobs(&t) {
+                                            Slider {
+                                                key: "{label}",
+                                                label: Some(label),
+                                                min: if label == "Across" { -0.5 } else { 0.01 },
+                                                max: if label == "Across" { 0.5 } else { 1.0 },
+                                                step: 0.01,
+                                                precision: 2,
+                                                value,
+                                                oninput: Some(EventHandler::new(move |v: f64| {
+                                                    push_undo(&format!("shape{label}{k}"));
+                                                    if let Some(item) = titles.write().get_mut(k) {
+                                                        set(item, v);
+                                                        item.pngs.clear();
+                                                    }
+                                                    rerender_title(k);
+                                                })),
+                                            }
+                                        }
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "Outline above 0 makes it a hollow ring; Position sets its height on the frame."
+                                        }
+                                    }
+                                    if t.kind == "Text" {
                                     mor_rust_dioxus_ui_kit::MorTextInput {
                                         label: "Text (type \\n for a line break)".to_string(),
                                         value: t.text.clone(),
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.text = v;
-                                                item.png.clear();
+                                                item.pngs.clear();
                                             }
                                             rerender_title(k);
                                         },
@@ -3502,7 +3671,7 @@ fn Editor() -> Element {
                                         oninput: Some(EventHandler::new(move |v: f64| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.font_size = v;
-                                                item.png.clear();
+                                                item.pngs.clear();
                                             }
                                             rerender_title(k);
                                         })),
@@ -3514,7 +3683,7 @@ fn Editor() -> Element {
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.color = v;
-                                                item.png.clear();
+                                                item.pngs.clear();
                                             }
                                             rerender_title(k);
                                         },
@@ -3526,7 +3695,7 @@ fn Editor() -> Element {
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.font = v;
-                                                item.png.clear();
+                                                item.pngs.clear();
                                             }
                                             rerender_title(k);
                                         },
@@ -3538,7 +3707,7 @@ fn Editor() -> Element {
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.align = v;
-                                                item.png.clear();
+                                                item.pngs.clear();
                                             }
                                             rerender_title(k);
                                         },
@@ -3552,10 +3721,29 @@ fn Editor() -> Element {
                                             titles.write()[k].anim = v;
                                         },
                                     }
+                                    MorSelect {
+                                        label: "Words appear".to_string(),
+                                        value: if t.reveal { "One at a time".to_string() } else { "All at once".to_string() },
+                                        options: vec!["All at once".to_string(), "One at a time".to_string()],
+                                        onchange: move |v: String| {
+                                            push_undo("");
+                                            if let Some(item) = titles.write().get_mut(k) {
+                                                item.reveal = v == "One at a time";
+                                                item.pngs.clear();
+                                            }
+                                            rerender_title(k);
+                                        },
+                                    }
+                                    if t.reveal {
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "{t.segments().len()} card(s) — one per word, revealed over the first 60% of the title, then held."
+                                        }
+                                    }
                                     if t.anim != "None" {
                                         p { class: "mor-statusbar-muted mr-export-blurb",
                                             "Slides on and off with the fade. The monitor shows the card in place — press Ctrl+P to watch it move."
                                         }
+                                    }
                                     }
                                     MorSelect {
                                         label: "Backdrop".to_string(),
@@ -3564,7 +3752,7 @@ fn Editor() -> Element {
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.boxed = v == "Box";
-                                                item.png.clear();
+                                                item.pngs.clear();
                                             }
                                             rerender_title(k);
                                         },
@@ -3581,7 +3769,7 @@ fn Editor() -> Element {
                                         oninput: Some(EventHandler::new(move |v: f64| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.outline = v;
-                                                item.png.clear();
+                                                item.pngs.clear();
                                             }
                                             rerender_title(k);
                                         })),
@@ -3594,7 +3782,7 @@ fn Editor() -> Element {
                                             onchange: move |v: String| {
                                                 if let Some(item) = titles.write().get_mut(k) {
                                                     item.outline_color = v;
-                                                    item.png.clear();
+                                                    item.pngs.clear();
                                                 }
                                                 rerender_title(k);
                                             },
@@ -3607,7 +3795,7 @@ fn Editor() -> Element {
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.pos = v;
-                                                item.png.clear();
+                                                item.pngs.clear();
                                             }
                                             rerender_title(k);
                                         },
@@ -3619,7 +3807,7 @@ fn Editor() -> Element {
                                         onchange: move |v: String| {
                                             if let Some(item) = titles.write().get_mut(k) {
                                                 item.bevel = bevel_value(&v);
-                                                item.png.clear();
+                                                item.pngs.clear();
                                             }
                                             rerender_title(k);
                                         },
@@ -3641,7 +3829,7 @@ fn Editor() -> Element {
                                                 oninput: Some(EventHandler::new(move |v: f64| {
                                                     if let Some(item) = titles.write().get_mut(k) {
                                                         set(item, v);
-                                                        item.png.clear();
+                                                        item.pngs.clear();
                                                     }
                                                     rerender_title(k);
                                                 })),
@@ -3997,7 +4185,7 @@ fn Editor() -> Element {
                                                 if t.group != 0 {
                                                     span { class: "mr-group-dot", style: "background: hsl({(t.group * 67) % 360}, 70%, 60%)" }
                                                 }
-                                                "𝐓 {t.text}"
+                                                if t.kind == "Text" { "𝐓 {t.text}" } else { "◧ {t.kind}" }
                                             }
                                         }
                                     }
@@ -5090,6 +5278,67 @@ mod tests {
     }
 
     #[test]
+    fn word_prefixes_keep_the_breaks_the_text_already_has() {
+        assert_eq!(word_prefixes("one two three"), vec!["one", "one two", "one two three"]);
+        // A wrapped caption must not be un-wrapped: rejoining on spaces would
+        // make the words jump between lines as they arrive.
+        assert_eq!(
+            word_prefixes("hello there\nfriend"),
+            vec!["hello", "hello there", "hello there\nfriend"]
+        );
+        assert_eq!(word_prefixes("solo"), vec!["solo"]);
+        assert_eq!(word_prefixes("  padded  out  "), vec!["  padded", "  padded  out"]);
+        assert!(word_prefixes("").is_empty());
+        assert!(word_prefixes("   ").is_empty());
+    }
+
+    #[test]
+    fn a_revealed_title_is_a_run_of_cards_that_tiles_its_span() {
+        let mut t: TitleItem = serde_json::from_str(legacy_title_json()).unwrap();
+        t.text = "one two three".into();
+        t.at = 2.0;
+        t.dur = 3.0;
+
+        // Off: exactly the single card it always was.
+        assert_eq!(t.segments(), vec![("one two three".to_string(), 2.0, 3.0)]);
+
+        t.reveal = true;
+        let segs = t.segments();
+        assert_eq!(segs.len(), 3, "one card per word");
+        assert_eq!(segs[0].0, "one");
+        assert_eq!(segs[2].0, "one two three");
+
+        // The cards run back to back and finish exactly when the title does.
+        assert_eq!(segs[0].1, 2.0, "the first card starts with the title");
+        for w in segs.windows(2) {
+            assert!((w[0].1 + w[0].2 - w[1].1).abs() < 1e-9, "cards must not gap or overlap");
+        }
+        let (last_at, last_dur) = (segs[2].1, segs[2].2);
+        assert!((last_at + last_dur - 5.0).abs() < 1e-9, "the run must end with the title");
+        // The finished line holds far longer than any single word takes.
+        assert!(last_dur > segs[0].2 * 2.0, "the whole line should hold to be read");
+
+        // A single word has nothing to reveal, so it stays one card.
+        t.text = "solo".into();
+        assert_eq!(t.segments().len(), 1);
+    }
+
+    #[test]
+    fn card_at_finds_the_step_showing_now() {
+        let mut t: TitleItem = serde_json::from_str(legacy_title_json()).unwrap();
+        t.text = "one two three".into();
+        t.at = 0.0;
+        t.dur = 3.0;
+        t.reveal = true;
+        let segs = t.segments();
+        assert_eq!(t.card_at(segs[0].1 + 0.01), Some(0));
+        assert_eq!(t.card_at(segs[1].1 + 0.01), Some(1));
+        assert_eq!(t.card_at(segs[2].1 + 0.01), Some(2));
+        assert_eq!(t.card_at(2.99), Some(2), "the last word holds to the end");
+        assert_eq!(t.card_at(5.0), None, "nothing is up after the title is over");
+    }
+
+    #[test]
     fn a_style_is_a_look_never_the_words_or_the_timing() {
         let mut src: TitleItem = serde_json::from_str(legacy_title_json()).unwrap();
         src.text = "SOURCE".into();
@@ -5106,7 +5355,7 @@ mod tests {
         dst.dur = 4.0;
         dst.caption = true;
         dst.group = 7;
-        dst.png = "/cache/old.png".into();
+        dst.pngs = vec!["/cache/old.png".into()];
 
         let out = restyle(&dst, &src);
         // Its own content and place on the timeline survive untouched.
@@ -5119,7 +5368,7 @@ mod tests {
         assert_eq!(out.outline, 6.0);
         assert_eq!(out.anim, "Slide up");
         // The rendered card must be dropped, or it would keep the old look.
-        assert!(out.png.is_empty(), "a restyle has to invalidate the rendered card");
+        assert!(out.pngs.is_empty(), "a restyle has to invalidate the rendered card");
     }
 
     #[test]
@@ -5127,7 +5376,7 @@ mod tests {
         let mut style: TitleItem = serde_json::from_str(legacy_title_json()).unwrap();
         style.color = "Cyan".into();
         style.anim = "Slide in left".into();
-        style.png = "/cache/derived.png".into(); // derived, must not persist
+        style.pngs = vec!["/cache/derived.png".into()]; // derived, must not persist
         let all = vec![TitlePreset { name: "Bold caption".into(), style }];
 
         let json = serde_json::to_string(&all).unwrap();
@@ -5136,7 +5385,7 @@ mod tests {
         assert_eq!(back[0].name, "Bold caption");
         assert_eq!(back[0].style.color, "Cyan");
         assert_eq!(back[0].style.anim, "Slide in left");
-        assert!(back[0].style.png.is_empty());
+        assert!(back[0].style.pngs.is_empty());
     }
 
     #[test]
@@ -5300,7 +5549,7 @@ mod tests {
         assert_eq!((t.hi_opacity, t.sh_opacity), (0.75, 0.75));
 
         // The item's friendly choices map onto what ffmpeg and the bevel need.
-        let s = t.style();
+        let s = t.style_of(&t.text);
         assert_eq!((s.color.as_str(), s.outline_color.as_str()), ("white", "black"));
         assert_eq!(s.bevel, "Cameo");
         assert!((s.y_frac - 0.45).abs() < 1e-9);
