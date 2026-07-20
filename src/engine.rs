@@ -20,9 +20,22 @@ const FPS: u32 = 30;
 // keyframed, and nothing here animates yet.
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Transform {
-    /// 1.0 fills the frame, 0.5 is half size.
+    /// The master size, the way Final Cut's "Scale All" works: 1.0 fills the
+    /// frame, 0.5 is half.
     #[serde(default = "unit")]
     pub scale: f64,
+    /// Per-axis multipliers on top of `scale` — this is the stretch. Kept
+    /// separate from it so an old project, which had only one size, loads as
+    /// exactly the shape it was saved in.
+    #[serde(default = "unit")]
+    pub scale_x: f64,
+    #[serde(default = "unit")]
+    pub scale_y: f64,
+    /// Mirror. Flipping a selfie back the right way round is the usual reason.
+    #[serde(default)]
+    pub flip_h: bool,
+    #[serde(default)]
+    pub flip_v: bool,
     /// Offset as a fraction of the frame: 0 is centred, 0.5 is half a frame
     /// right (or down). Fractions rather than pixels so a transform survives an
     /// export at a different size.
@@ -45,7 +58,17 @@ fn unit() -> f64 {
 
 impl Default for Transform {
     fn default() -> Self {
-        Self { scale: 1.0, x: 0.0, y: 0.0, rotation: 0.0, opacity: 1.0 }
+        Self {
+            scale: 1.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            flip_h: false,
+            flip_v: false,
+            x: 0.0,
+            y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+        }
     }
 }
 
@@ -53,6 +76,10 @@ impl Transform {
     /// Untouched: emit no filter at all rather than a chain that scales by 1.
     pub fn is_identity(&self) -> bool {
         (self.scale - 1.0).abs() < 1e-6
+            && (self.scale_x - 1.0).abs() < 1e-6
+            && (self.scale_y - 1.0).abs() < 1e-6
+            && !self.flip_h
+            && !self.flip_v
             && self.x.abs() < 1e-6
             && self.y.abs() < 1e-6
             && self.rotation.abs() < 1e-6
@@ -73,8 +100,9 @@ pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
     // Every dimension is computed here rather than as an ffmpeg expression, so
     // the crop window is provably inside the padded picture.
     let even = |v: f64| ((v.round().max(2.0)) as u32) & !1u32;
-    let sw = even(w as f64 * t.scale);
-    let sh = even(h as f64 * t.scale);
+    // Master size times the per-axis stretch, so "Scale" still moves both.
+    let sw = even(w as f64 * t.scale * t.scale_x.max(0.01));
+    let sh = even(h as f64 * t.scale * t.scale_y.max(0.01));
     let dx = (t.x * w as f64).round() as i64;
     let dy = (t.y * h as f64).round() as i64;
     // Pad out to whatever the offset crop needs, so the picture can be moved
@@ -86,6 +114,13 @@ pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
     let mut c = String::new();
     if alpha {
         c += "format=rgba,";
+    }
+    // Mirror before anything else, so a flip does not fight the rotation.
+    if t.flip_h {
+        c += "hflip,";
+    }
+    if t.flip_v {
+        c += "vflip,";
     }
     c += &format!("scale={sw}:{sh}");
     if t.rotation.abs() > 1e-6 {
@@ -2204,6 +2239,92 @@ mod tests {
     }
 
     #[test]
+    fn stretch_and_mirror_reach_the_chain() {
+        // The master scale still moves both axes together.
+        let uniform = transform_chain(
+            &Transform { scale: 0.5, ..Default::default() },
+            1000,
+            2000,
+            false,
+        );
+        assert!(uniform.contains("scale=500:1000"), "{uniform}");
+
+        // Per-axis multipliers ride on top of it: half overall, then twice as
+        // wide and half as tall again.
+        let stretched = transform_chain(
+            &Transform { scale: 0.5, scale_x: 2.0, scale_y: 0.5, ..Default::default() },
+            1000,
+            2000,
+            false,
+        );
+        assert!(stretched.contains("scale=1000:500"), "{stretched}");
+
+        // Mirroring happens before the geometry, so a flip does not fight the
+        // rotation that follows it.
+        let flipped = transform_chain(
+            &Transform { flip_h: true, ..Default::default() },
+            1000,
+            2000,
+            false,
+        );
+        assert!(flipped.starts_with("hflip,"), "{flipped}");
+        let both = transform_chain(
+            &Transform { flip_h: true, flip_v: true, rotation: 30.0, ..Default::default() },
+            1000,
+            2000,
+            false,
+        );
+        let (h, v, rot) = (
+            both.find("hflip").unwrap(),
+            both.find("vflip").unwrap(),
+            both.find("rotate").unwrap(),
+        );
+        assert!(h < v && v < rot, "mirroring must come before the rotation: {both}");
+
+        // A mirror alone is still a transform worth emitting.
+        assert!(!Transform { flip_v: true, ..Default::default() }.is_identity());
+        assert!(!Transform { scale_x: 1.2, ..Default::default() }.is_identity());
+    }
+
+    // A stretched, mirrored, rotated clip has to survive ffmpeg, not just look
+    // right as a string — the crop window is computed from all of it.
+    #[tokio::test]
+    async fn a_stretched_mirrored_clip_still_renders() {
+        let dir = std::env::temp_dir().join("morreel-stretch-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error", "-f", "lavfi",
+            "-i", "testsrc=duration=1:size=320x568:rate=30", "-c:v", "libx264", &src,
+        ]).await.unwrap();
+
+        for xf in [
+            Transform { scale_x: 2.5, ..Default::default() },
+            Transform { scale_y: 0.3, ..Default::default() },
+            Transform { scale: 1.6, scale_x: 0.4, flip_h: true, ..Default::default() },
+            Transform { scale_x: 3.0, scale_y: 0.4, rotation: 37.0, x: 0.3, y: -0.2, ..Default::default() },
+        ] {
+            let clips = [ClipSpec {
+                path: src.clone(),
+                out_s: 1.0,
+                effect: transform_chain(&xf, W, H, false),
+                ..Default::default()
+            }];
+            let out = dir.join("out.mp4");
+            let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
+            export(&clips, &[], &[], &[], &out, opts, |_| {})
+                .await
+                .unwrap_or_else(|e| panic!("{xf:?} failed to render: {e}"));
+            let dims = capture("ffprobe", &[
+                "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                &out.display().to_string(),
+            ]).await.unwrap();
+            assert_eq!(dims.trim(), "540,960", "{xf:?} came out the wrong size");
+        }
+    }
+
+    #[test]
     fn transform_composites_only_where_it_has_something_to_composite_over() {
         let t = Transform { scale: 0.5, opacity: 0.5, ..Default::default() };
         // V1 sits on nothing, so it fills with black and ignores opacity.
@@ -2933,6 +3054,7 @@ mod tests {
         assert_eq!(dims.trim(), "1080,1920");
     }
 }
+
 
 
 

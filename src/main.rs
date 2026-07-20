@@ -319,7 +319,11 @@ fn bevel_opacity() -> f64 {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum XfGrab {
     Move,
+    /// A corner: both axes together, so the picture keeps its shape.
     Scale,
+    /// A side: one axis only. This is the stretch.
+    StretchX,
+    StretchY,
     Rotate,
 }
 
@@ -330,14 +334,28 @@ enum XfGrab {
 /// 9:16 frame a rotated box comes out sheared: one fraction of width is not the
 /// same distance as one fraction of height.
 fn xf_corners(t: &engine::Transform) -> [(f64, f64); 4] {
-    let half = t.scale / 2.0;
+    let (half_w, half_h) = (t.scale * t.scale_x / 2.0, t.scale * t.scale_y / 2.0);
     let (sin, cos) = t.rotation.to_radians().sin_cos();
     let ar = engine::W as f64 / engine::H as f64;
     // The box turns about its own centre, and that centre is where the
     // position offset put it.
     let (cx, cy) = (0.5 + t.x, 0.5 + t.y);
     [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(sx, sy)| {
-        let (fx, fy) = (sx * half, sy * half);
+        let (fx, fy) = (sx * half_w, sy * half_h);
+        (cx + (fx * cos - fy * sin / ar), cy + (fx * sin * ar + fy * cos))
+    })
+}
+
+/// The midpoints of the four sides, where the stretch handles live. Same
+/// rotation treatment as the corners so they stay glued to the box.
+fn xf_edges(t: &engine::Transform) -> [(f64, f64); 4] {
+    let (half_w, half_h) = (t.scale * t.scale_x / 2.0, t.scale * t.scale_y / 2.0);
+    let (sin, cos) = t.rotation.to_radians().sin_cos();
+    let ar = engine::W as f64 / engine::H as f64;
+    let (cx, cy) = (0.5 + t.x, 0.5 + t.y);
+    // left, right, top, bottom — the first two stretch across, the last two down
+    [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)].map(|(sx, sy)| {
+        let (fx, fy) = (sx * half_w, sy * half_h);
         (cx + (fx * cos - fy * sin / ar), cy + (fx * sin * ar + fy * cos))
     })
 }
@@ -351,6 +369,7 @@ fn xf_apply(
     from: (f64, f64),
     to: (f64, f64),
     rect: (f64, f64, f64, f64),
+    snap: bool,
 ) -> engine::Transform {
     let (rl, rt, rw, rh) = rect;
     if rw < 1.0 || rh < 1.0 {
@@ -372,11 +391,30 @@ fn xf_apply(
                 t.scale = (start.scale * d1 / d0).clamp(0.1, 4.0);
             }
         }
+        // A side handle stretches one axis, measured along that axis alone —
+        // radial distance would make dragging sideways change the height too.
+        XfGrab::StretchX => {
+            let (d0, d1) = ((from.0 - cx).abs(), (to.0 - cx).abs());
+            if d0 > 2.0 {
+                t.scale_x = (start.scale_x * d1 / d0).clamp(0.1, 4.0);
+            }
+        }
+        XfGrab::StretchY => {
+            let (d0, d1) = ((from.1 - cy).abs(), (to.1 - cy).abs());
+            if d0 > 2.0 {
+                t.scale_y = (start.scale_y * d1 / d0).clamp(0.1, 4.0);
+            }
+        }
         XfGrab::Rotate => {
             let a0 = (from.1 - cy).atan2(from.0 - cx);
             let a1 = (to.1 - cy).atan2(to.0 - cx);
+            let mut deg = start.rotation + (a1 - a0).to_degrees();
+            // Shift snaps to 15°, which is how you get a level horizon or a
+            // clean right angle without nudging a slider.
+            if snap {
+                deg = (deg / 15.0).round() * 15.0;
+            }
             // Keep it in the -180..180 the slider shows.
-            let deg = start.rotation + (a1 - a0).to_degrees();
             t.rotation = (deg + 180.0).rem_euclid(360.0) - 180.0;
         }
     }
@@ -406,6 +444,8 @@ fn transform_knobs(t: &engine::Transform, with_opacity: bool) -> Vec<XformKnob> 
     let set_scale: fn(&mut engine::Transform, f64) = |x, v| x.scale = v;
     let mut knobs: Vec<XformKnob> = vec![
         ("Scale", t.scale, 0.1, 4.0, 0.01, set_scale),
+        ("Stretch across", t.scale_x, 0.1, 4.0, 0.01, |x, v| x.scale_x = v),
+        ("Stretch down", t.scale_y, 0.1, 4.0, 0.01, |x, v| x.scale_y = v),
         ("Position X", t.x, -1.0, 1.0, 0.005, |x, v| x.x = v),
         ("Position Y", t.y, -1.0, 1.0, 0.005, |x, v| x.y = v),
         ("Rotation", t.rotation, -180.0, 180.0, 1.0, |x, v| x.rotation = v),
@@ -2457,6 +2497,24 @@ fn Editor() -> Element {
                     })),
                 }
             }
+            MorSelect {
+                label: "Mirror".to_string(),
+                value: match (xf.flip_h, xf.flip_v) {
+                    (true, true) => "Both".to_string(),
+                    (true, false) => "Across".to_string(),
+                    (false, true) => "Down".to_string(),
+                    _ => "None".to_string(),
+                },
+                options: ["None", "Across", "Down", "Both"].map(str::to_string).to_vec(),
+                onchange: move |v: String| {
+                    push_undo("");
+                    if let Some(mut t) = selected_xf() {
+                        t.flip_h = v == "Across" || v == "Both";
+                        t.flip_v = v == "Down" || v == "Both";
+                        set_selected_xf(t);
+                    }
+                },
+            }
             if !xf.is_identity() {
                 button {
                     class: "mor-btn mr-reset",
@@ -3051,7 +3109,8 @@ fn Editor() -> Element {
                                         // grabbable — the maths is distance-based, so
                                         // a clamped handle still scales correctly.
                                         let clamp = |v: f64| (v * 100.0).clamp(1.5, 98.5);
-                                        let (bw, bh) = (xf.scale * 100.0, xf.scale * 100.0);
+                                        let (bw, bh) =
+                                            (xf.scale * xf.scale_x * 100.0, xf.scale * xf.scale_y * 100.0);
                                         let bl = 50.0 + xf.x * 100.0 - bw / 2.0;
                                         let bt = 50.0 + xf.y * 100.0 - bh / 2.0;
                                         rsx! {
@@ -3063,7 +3122,8 @@ fn Editor() -> Element {
                                                 onmousemove: move |evt| {
                                                     let Some((grab, from, start, rect)) = xf_drag() else { return };
                                                     let p = evt.client_coordinates();
-                                                    set_selected_xf(xf_apply(grab, start, from, (p.x, p.y), rect));
+                                                    let snap = evt.modifiers().shift();
+                                                    set_selected_xf(xf_apply(grab, start, from, (p.x, p.y), rect, snap));
                                                 },
                                                 onmouseup: move |_| xf_drag.set(None),
                                                 onmouseleave: move |_| xf_drag.set(None),
@@ -3089,10 +3149,25 @@ fn Editor() -> Element {
                                                         },
                                                     }
                                                 }
+                                                // Sides stretch one axis; corners keep the shape.
+                                                for (n, (fx, fy)) in xf_edges(&xf).into_iter().enumerate() {
+                                                    div {
+                                                        key: "e{n}",
+                                                        class: if n < 2 { "mr-xf-e wide" } else { "mr-xf-e tall" },
+                                                        title: "Drag to stretch this way only",
+                                                        style: "left:{clamp(fx)}%;top:{clamp(fy)}%",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            let p = evt.client_coordinates();
+                                                            let grab = if n < 2 { XfGrab::StretchX } else { XfGrab::StretchY };
+                                                            begin_xf(grab, (p.x, p.y));
+                                                        },
+                                                    }
+                                                }
                                                 div {
                                                     class: "mr-xf-rot",
                                                     style: "left:{clamp(50.0 + xf.x * 100.0)}%;top:{clamp((50.0 + xf.y * 100.0 - bh / 2.0) - 4.0)}%",
-                                                    title: "Drag to rotate",
+                                                    title: "Drag to rotate \u{2014} hold Shift to snap to 15 degrees",
                                                     onmousedown: move |evt| {
                                                         evt.stop_propagation();
                                                         let p = evt.client_coordinates();
@@ -5757,29 +5832,104 @@ mod tests {
     fn dragging_a_corner_scales_by_the_distance_from_the_centre() {
         let start = engine::Transform::default();
         // Twice as far from the centre is twice the size.
-        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (335.0, 240.0), RECT);
+        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (335.0, 240.0), RECT, false);
         assert!((t.scale - 2.0).abs() < 1e-9, "scale = {}", t.scale);
         // Half as far is half the size.
-        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (185.0, 240.0), RECT);
+        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (185.0, 240.0), RECT, false);
         assert!((t.scale - 0.5).abs() < 1e-9, "scale = {}", t.scale);
         // Clamped to the slider's range rather than collapsing to nothing.
-        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (135.5, 240.0), RECT);
+        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (135.5, 240.0), RECT, false);
         assert!(t.scale >= 0.1, "scale should not collapse: {}", t.scale);
         // A grab that starts on the centre has no distance to work from.
-        assert_eq!(xf_apply(XfGrab::Scale, start, (135.0, 240.0), (200.0, 240.0), RECT).scale, 1.0);
+        assert_eq!(xf_apply(XfGrab::Scale, start, (135.0, 240.0), (200.0, 240.0), RECT, false).scale, 1.0);
     }
 
     #[test]
     fn dragging_the_knob_rotates_and_stays_in_slider_range() {
         let start = engine::Transform::default();
         // From straight up to straight right is a quarter turn clockwise.
-        let t = xf_apply(XfGrab::Rotate, start, (135.0, 40.0), (235.0, 240.0), RECT);
+        let t = xf_apply(XfGrab::Rotate, start, (135.0, 40.0), (235.0, 240.0), RECT, false);
         assert!((t.rotation - 90.0).abs() < 1e-6, "rotation = {}", t.rotation);
         // Rotation always lands inside what the slider can show.
         for (to_x, to_y) in [(35.0, 240.0), (135.0, 440.0), (200.0, 100.0), (60.0, 300.0)] {
-            let r = xf_apply(XfGrab::Rotate, start, (135.0, 40.0), (to_x, to_y), RECT).rotation;
+            let r = xf_apply(XfGrab::Rotate, start, (135.0, 40.0), (to_x, to_y), RECT, false).rotation;
             assert!((-180.0..=180.0).contains(&r), "rotation {r} is outside the slider");
         }
+    }
+
+    #[test]
+    fn a_side_handle_stretches_one_axis_only() {
+        let start = engine::Transform::default();
+        // Dragging the right edge twice as far from the centre doubles the
+        // width and leaves the height exactly alone.
+        let t = xf_apply(XfGrab::StretchX, start, (235.0, 240.0), (335.0, 240.0), RECT, false);
+        assert!((t.scale_x - 2.0).abs() < 1e-9, "scale_x = {}", t.scale_x);
+        assert_eq!(t.scale_y, 1.0, "a sideways drag must not change the height");
+        assert_eq!(t.scale, 1.0, "the master scale stays put");
+
+        // Vertical drags measure along their own axis, so moving sideways
+        // while dragging a top handle does nothing.
+        let t = xf_apply(XfGrab::StretchY, start, (135.0, 340.0), (135.0, 290.0), RECT, false);
+        assert!((t.scale_y - 0.5).abs() < 1e-9, "scale_y = {}", t.scale_y);
+        assert_eq!(t.scale_x, 1.0);
+        let sideways = xf_apply(XfGrab::StretchY, start, (135.0, 340.0), (300.0, 340.0), RECT, false);
+        assert_eq!(sideways.scale_y, 1.0, "a horizontal drag should not stretch downward");
+
+        // A corner still keeps the shape: it moves the master scale, not an axis.
+        let t = xf_apply(XfGrab::Scale, start, (235.0, 240.0), (335.0, 240.0), RECT, false);
+        assert!((t.scale - 2.0).abs() < 1e-9);
+        assert_eq!((t.scale_x, t.scale_y), (1.0, 1.0));
+    }
+
+    #[test]
+    fn shift_snaps_rotation_to_fifteen_degrees() {
+        let start = engine::Transform::default();
+        // A drag that lands near 90° goes to exactly 90° when snapping.
+        let from = (135.0, 40.0);
+        let to = (233.0, 245.0); // a few degrees shy of a quarter turn
+        let free = xf_apply(XfGrab::Rotate, start, from, to, RECT, false).rotation;
+        let snapped = xf_apply(XfGrab::Rotate, start, from, to, RECT, true).rotation;
+        assert!((free - 90.0).abs() > 0.5, "the test drag should not already be square: {free}");
+        assert!((snapped % 15.0).abs() < 1e-6, "snapped to {snapped}, not a multiple of 15");
+        assert!((snapped - 90.0).abs() < 1e-6, "should land on the nearest quarter turn: {snapped}");
+        // Snapping still respects the slider's range.
+        for to in [(35.0, 240.0), (135.0, 440.0), (60.0, 300.0)] {
+            let r = xf_apply(XfGrab::Rotate, start, from, to, RECT, true).rotation;
+            assert!((-180.0..=180.0).contains(&r), "{r} is outside the slider");
+        }
+    }
+
+    #[test]
+    fn stretching_moves_the_handles_with_the_box() {
+        // Wide and short: the corners spread across and pull in vertically.
+        let t = engine::Transform { scale_x: 2.0, scale_y: 0.5, ..Default::default() };
+        let c = xf_corners(&t);
+        assert_eq!(c[0], (-0.5, 0.25), "top-left of a box twice as wide, half as tall");
+        assert_eq!(c[2], (1.5, 0.75));
+
+        // Side handles sit at the midpoints of that same box.
+        let e = xf_edges(&t);
+        assert_eq!(e[0], (-0.5, 0.5), "left edge");
+        assert_eq!(e[1], (1.5, 0.5), "right edge");
+        assert_eq!(e[2], (0.5, 0.25), "top edge");
+        assert_eq!(e[3], (0.5, 0.75), "bottom edge");
+
+        // Rotated, every handle stays glued to the box rather than drifting.
+        let spun = engine::Transform { rotation: 90.0, ..t };
+        let (ec, ee) = (xf_corners(&spun), xf_edges(&spun));
+        assert!(ec.iter().all(|(x, y)| x.is_finite() && y.is_finite()));
+        assert!((ee[0].0 - 0.5).abs() < 1e-6, "a quarter turn puts the left edge above centre");
+    }
+
+    #[test]
+    fn mirroring_is_not_the_identity() {
+        let mut t = engine::Transform::default();
+        assert!(t.is_identity());
+        t.flip_h = true;
+        assert!(!t.is_identity(), "a mirrored clip must still emit a filter");
+        assert!(!engine::transform_chain(&t, engine::W, engine::H, false).is_empty());
+        let stretched = engine::Transform { scale_x: 1.5, ..Default::default() };
+        assert!(!stretched.is_identity(), "a stretched clip must still emit a filter");
     }
 
     #[test]
@@ -5787,8 +5937,8 @@ mod tests {
         // The rect is measured asynchronously; a drag must degrade to a no-op
         // rather than divide by zero if it somehow arrives empty.
         let start = engine::Transform { scale: 1.5, x: 0.2, ..Default::default() };
-        for grab in [XfGrab::Move, XfGrab::Scale, XfGrab::Rotate] {
-            let t = xf_apply(grab, start, (10.0, 10.0), (99.0, 99.0), (0.0, 0.0, 0.0, 0.0));
+        for grab in [XfGrab::Move, XfGrab::Scale, XfGrab::StretchX, XfGrab::StretchY, XfGrab::Rotate] {
+            let t = xf_apply(grab, start, (10.0, 10.0), (99.0, 99.0), (0.0, 0.0, 0.0, 0.0), false);
             assert_eq!(t, start, "{grab:?} on an unmeasured monitor should change nothing");
         }
     }
@@ -5831,10 +5981,13 @@ mod tests {
         for (i, (_, _, _, _, _, set)) in transform_knobs(&t, true).into_iter().enumerate() {
             set(&mut t, i as f64 + 1.0);
         }
-        assert_eq!((t.scale, t.x, t.y, t.rotation, t.opacity), (1.0, 2.0, 3.0, 4.0, 5.0));
+        assert_eq!(
+            (t.scale, t.scale_x, t.scale_y, t.x, t.y, t.rotation, t.opacity),
+            (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)
+        );
         // V1 has nothing underneath it, so opacity is not offered there.
-        assert_eq!(transform_knobs(&t, false).len(), 4);
-        assert_eq!(transform_knobs(&t, true).len(), 5);
+        assert_eq!(transform_knobs(&t, false).len(), 6);
+        assert_eq!(transform_knobs(&t, true).len(), 7);
         assert!(!transform_knobs(&t, false).iter().any(|k| k.0 == "Opacity"));
 
         // Every slider's range must contain the value it starts at, or the
