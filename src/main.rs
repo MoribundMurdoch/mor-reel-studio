@@ -69,7 +69,7 @@ fn main() {
         .with_window(
             WindowBuilder::new()
                 .with_title("MorReel Studio")
-                .with_inner_size(LogicalSize::new(1100.0, 720.0))
+                .with_inner_size(LogicalSize::new(1100.0, 860.0))
                 .with_decorations(is_native)
                 .with_transparent(!is_native)
                 .with_window_icon(window_icon()),
@@ -313,20 +313,6 @@ enum Phase {
     Text,
     Audio,
     Export,
-}
-
-impl Phase {
-    fn label(self) -> &'static str {
-        match self {
-            Phase::Add => "Add",
-            Phase::Cut => "Cut",
-            Phase::Style => "Style",
-            Phase::Background => "Background",
-            Phase::Text => "Text",
-            Phase::Audio => "Audio",
-            Phase::Export => "Export",
-        }
-    }
 }
 
 /// The timeline's phase-emphasis class: the CSS rules keyed on it dim the lanes
@@ -848,32 +834,6 @@ impl Clip {
     fn scrub_path(&self) -> String {
         if self.proxy.is_empty() { self.path.clone() } else { self.proxy.clone() }
     }
-}
-
-/// The inspector's one-line summary of a V1 clip. A still has no source length
-/// to report and needs no proxy, so it reads differently from a video.
-fn clip_note(c: &Clip) -> String {
-    if engine::is_still(&c.path) {
-        return format!(
-            "Photo • holding {} — drag Out to hold it longer, or add a Motion effect",
-            fmt_t(c.trimmed())
-        );
-    }
-    let audio = if !c.has_audio {
-        " • no audio"
-    } else if c.volume <= 0.0 {
-        " • audio muted (detached or silent)"
-    } else {
-        ""
-    };
-    format!(
-        "{} source • keeping {}{}{}{}",
-        fmt_t(c.duration),
-        fmt_t(c.trimmed()),
-        if (c.speed - 1.0).abs() > 0.01 { format!(" at {:.2}×", c.speed) } else { String::new() },
-        audio,
-        if c.proxy.is_empty() { " • building proxy…" } else { " • proxy" },
-    )
 }
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1457,6 +1417,20 @@ enum Sel {
     Over(usize),
     Aud(usize),
     Title(usize),
+}
+
+/// The noun for whatever's selected, shown in the inspector title so the panel
+/// header names what you're editing instead of a redundant in-body label.
+fn sel_noun(sel: Option<Sel>, titles: &[TitleItem]) -> Option<&'static str> {
+    Some(match sel? {
+        Sel::Main(_) => "Clip",
+        Sel::Over(_) => "Cutaway",
+        Sel::Aud(_) => "Audio",
+        Sel::Title(k) => {
+            let t = titles.get(k)?;
+            if t.caption { "Caption" } else if t.kind != "Text" { "Shape" } else { "Text" }
+        }
+    })
 }
 
 /// What was right-clicked; picks the context menu's contents.
@@ -4603,6 +4577,7 @@ fn Editor() -> Element {
                 div { class: "mr-work",
                     div { class: "mr-preview-col",
                         if !monitor_out() {
+                            div { class: "mr-stage",
                             div {
                                 class: if drop_hover() == Some(Lane::V2) { "mr-phone mr-drop" } else { "mr-phone" },
                                 onmounted: move |evt| phone_el.set(Some(evt.data())),
@@ -4706,6 +4681,7 @@ fn Editor() -> Element {
                                     }
                                 }
                             }
+                            }
                         }
                         if !clips.read().is_empty() {
                             div { class: "mr-scrub",
@@ -4714,15 +4690,6 @@ fn Editor() -> Element {
                                 div { class: if playing() { "mr-deck playing" } else { "mr-deck" },
                                     span { "{fmt_t(playhead().min(total))}" }
                                     span { class: "mr-deck-total", "/ {fmt_t(total)}" }
-                                }
-                                Slider {
-                                    label: Some("Playhead"),
-                                    min: 0.0,
-                                    max: total,
-                                    step: 0.05,
-                                    precision: 1,
-                                    value: playhead().min(total),
-                                    oninput: Some(EventHandler::new(move |v: f64| seek_to(v))),
                                 }
                                 div { class: "mr-play-row",
                                     button {
@@ -4784,7 +4751,13 @@ fn Editor() -> Element {
                                 begin_float(FloatGrab::Move, p.x, p.y);
                             },
                             span { class: "mr-panel-title",
-                                if insp_float() { "Inspector · floating" } else { "Inspector" }
+                                {
+                                    let base = if insp_float() { "Inspector · floating" } else { "Inspector" };
+                                    match sel_noun(selected(), &titles.read()) {
+                                        Some(noun) => format!("{noun} · {base}"),
+                                        None => base.to_string(),
+                                    }
+                                }
                             }
                             div { class: "mr-panel-tools",
                                 button {
@@ -4887,7 +4860,6 @@ fn Editor() -> Element {
                             }
                         }
 
-                        h4 { class: "mr-phase-head", "{active_phase().label()}" }
                         if active_phase() == Phase::Add {
                             p { class: "mor-statusbar-muted mr-export-blurb",
                                 "Main clips go on V1, cutaways on V2, and music or voiceover underneath."
@@ -5006,16 +4978,6 @@ fn Editor() -> Element {
                             Some(Sel::Main(i)) if i < clips.read().len() && active_phase() != Phase::Text => {
                                 let c = clips.read()[i].clone();
                                 rsx! {
-                                    div { class: "mr-clip-info",
-                                        h3 {
-                                            span { class: "mr-ctx-tag", "V1" }
-                                            " {c.name}"
-                                        }
-                                        p { class: "mor-statusbar-muted", "{clip_note(&c)}" }
-                                        p { class: "mor-statusbar-muted mr-export-blurb",
-                                            "Trim with I / O at the playhead, or drag the clip edges on the timeline."
-                                        }
-                                    }
                                     if active_phase() == Phase::Style {
                                     MorTabs {
                                         tabs: vec!["Look".to_string(), "Transform".to_string()],
@@ -5251,15 +5213,6 @@ fn Editor() -> Element {
                             Some(Sel::Over(j)) if j < overlays.read().len() && active_phase() != Phase::Text => {
                                 let o = overlays.read()[j].clone();
                                 rsx! {
-                                    div { class: "mr-clip-info",
-                                        h3 {
-                                            span { class: "mr-ctx-tag", "V2" }
-                                            " {o.name}"
-                                        }
-                                        p { class: "mor-statusbar-muted",
-                                            "Cutaway covers V1 from {fmt_t(o.at)} for {fmt_t(o.trimmed())} — main audio keeps playing."
-                                        }
-                                    }
                                     Slider {
                                         label: Some("Position on timeline"),
                                         min: 0.0,
@@ -5395,14 +5348,29 @@ fn Editor() -> Element {
                             Some(Sel::Title(k)) if k < titles.read().len() => {
                                 let t = titles.read()[k].clone();
                                 rsx! {
-                                    div { class: "mr-clip-info",
-                                        h3 {
-                                            span { class: "mr-ctx-tag title", "T" }
-                                            if t.caption { " Caption" } else if t.kind != "Text" { " Shape" } else { " Text" }
-                                        }
-                                        p { class: "mor-statusbar-muted",
-                                            "Shown from {fmt_t(t.at)} for {fmt_t(t.dur)}"
-                                            if t.pngs.is_empty() { " • rendering…" }
+                                    if t.kind == "Text" {
+                                        // A real multi-line field: Enter makes a line break,
+                                        // no magic "\n" to type. The render is debounced and
+                                        // the old card is left on the monitor while typing, so
+                                        // the caret never fights an async re-render. Kept at the
+                                        // top of the inspector so the words you're editing lead.
+                                        div { class: "mor-input-wrapper",
+                                            div { class: "mor-input-label", "Text — Enter for a new line" }
+                                            textarea {
+                                                class: "mor-input mr-text-area",
+                                                rows: "3",
+                                                value: "{t.text}",
+                                                // Typing must never reach the shortcut root — a
+                                                // single-letter bind would fire on each keystroke.
+                                                onkeydown: move |evt| evt.stop_propagation(),
+                                                oninput: move |evt| {
+                                                    let v = evt.value();
+                                                    if let Some(item) = titles.write().get_mut(k) {
+                                                        item.text = v;
+                                                    }
+                                                    rerender_title_soon(k);
+                                                },
+                                            }
                                         }
                                     }
                                     div { class: "mr-toolbar mr-text-nav",
@@ -5447,28 +5415,6 @@ fn Editor() -> Element {
                                         }
                                     }
                                     if t.kind == "Text" {
-                                    // A real multi-line field: Enter makes a line break,
-                                    // no magic "\n" to type. The render is debounced and
-                                    // the old card is left on the monitor while typing, so
-                                    // the caret never fights an async re-render.
-                                    div { class: "mor-input-wrapper",
-                                        div { class: "mor-input-label", "Text — Enter for a new line" }
-                                        textarea {
-                                            class: "mor-input mr-text-area",
-                                            rows: "3",
-                                            value: "{t.text}",
-                                            // Typing must never reach the shortcut root — a
-                                            // single-letter bind would fire on each keystroke.
-                                            onkeydown: move |evt| evt.stop_propagation(),
-                                            oninput: move |evt| {
-                                                let v = evt.value();
-                                                if let Some(item) = titles.write().get_mut(k) {
-                                                    item.text = v;
-                                                }
-                                                rerender_title_soon(k);
-                                            },
-                                        }
-                                    }
                                     Slider {
                                         label: Some("Position on timeline"),
                                         min: 0.0,
@@ -5735,16 +5681,6 @@ fn Editor() -> Element {
                                 let treat_opts: Vec<String> =
                                     engine::AUDIO_TREATS.iter().map(|s| s.to_string()).collect();
                                 rsx! {
-                                    div { class: "mr-clip-info",
-                                        h3 {
-                                            span { class: "mr-ctx-tag audio", "{a.lane_tag()}" }
-                                            " {a.name}"
-                                        }
-                                        p { class: "mor-statusbar-muted",
-                                            "Mixed under V1 from {fmt_t(a.at)} for {fmt_t(span)}."
-                                        }
-                                    }
-
                                     // Whole-source waveform with the kept window bright
                                     // and the trimmed ends and fade ramps shaded — the
                                     // same picture the lane shows, sized to read here.
@@ -7676,7 +7612,11 @@ const APP_CSS: &str = r#"
     var(--mor-bg);
 }
 .mr-work { display: flex; gap: 16px; flex: 1; min-height: 0; }
-.mr-preview-col { display: flex; flex-direction: column; gap: 10px; align-items: center; min-height: 0; padding-top: 4px; }
+.mr-preview-col { display: flex; flex-direction: column; gap: 10px; align-items: center; min-height: 0; padding-top: 4px; flex: 0 0 auto; width: clamp(180px, 34vw, 560px); }
+/* The phone fills whatever height is left after the scrub controls; a definite
+   column width keeps the height-driven phone from overflowing (the old WebKit
+   intrinsic-width bug). 9:16 is tall, so height is the binding constraint. */
+.mr-stage { flex: 1; min-height: 0; width: 100%; display: flex; align-items: center; justify-content: center; }
 
 /* Buttons inside the editor: longer ease, slight lift, brass-rim primary. */
 .mr-root .mor-btn {
@@ -7708,7 +7648,7 @@ const APP_CSS: &str = r#"
    width in WebKit, so a flex-sized phone overflows. 400px ≈ vertical chrome. */
 .mr-phone {
   position: relative; flex: none;
-  width: calc((100vh - 400px) * 9 / 16); min-width: 140px; max-height: 100%;
+  height: 100%; width: auto; max-width: 100%; min-width: 0;
   aspect-ratio: 9 / 16; background: #000;
   border: 5px solid #06060a;
   border-radius: 24px; overflow: hidden;
@@ -7813,7 +7753,7 @@ const APP_CSS: &str = r#"
 }
 .mr-monitor .mr-phone { width: auto; height: 100%; max-width: 100%; min-width: 0; }
 
-.mr-scrub { width: 100%; }
+.mr-scrub { width: 100%; flex: none; }
 /* Deck: HUD readout — brass inset frame, amber at rest, record-red rolling. */
 .mr-deck {
   display: flex; justify-content: center; align-items: baseline; gap: 7px;
@@ -7997,9 +7937,6 @@ const APP_CSS: &str = r#"
   flex: none; margin-bottom: 1px; font-size: 12px;
   white-space: nowrap;
 }
-.mr-clip-info h3 { margin: 0 0 4px 0; font-size: 14px; overflow-wrap: anywhere; }
-.mr-clip-info .mr-ctx-tag { vertical-align: 2px; }
-.mr-clip-info p { margin: 0; font-size: 12px; }
 .mr-danger { color: var(--mor-destructive); }
 .mr-reset { align-self: flex-start; font-size: 11px; }
 .mr-keys { margin-top: auto; font-size: 11px; }
@@ -8129,12 +8066,7 @@ const APP_CSS: &str = r#"
   opacity: 0.38; filter: saturate(0.55);
 }
 
-/* Phase-driven inspector: header + stacked action buttons for Add/Export. */
-.mr-phase-head {
-  margin: 0 0 8px; font-size: 12px; font-weight: 700;
-  letter-spacing: 0.08em; text-transform: uppercase;
-  color: var(--mor-accent);
-}
+/* Phase-driven inspector: stacked action buttons for Add/Export. */
 .mr-phase-actions { display: flex; flex-direction: column; gap: 8px; }
 .mr-phase-actions .mor-btn { width: 100%; }
 
