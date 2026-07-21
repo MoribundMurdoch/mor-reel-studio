@@ -66,6 +66,28 @@ fn main() {
     let is_native = mode.is_native();
     let cfg = Config::new()
         .with_menu(None::<dioxus::desktop::muda::Menu>)
+        // Swallow keystrokes that originate in a text field before Dioxus's
+        // delegated (bubbling) listener on the app root can turn them into
+        // shortcuts — so typing a title never plays, deletes, or switches
+        // workspaces. A head <script> is guaranteed to run at load, unlike a
+        // use_effect eval; the capture-phase window listener fires before the
+        // root's bubble listener, and stopPropagation leaves typing intact.
+        .with_custom_head(
+            r#"<script>
+            if (!window.__morShortcutGuard) {
+              window.__morShortcutGuard = true;
+              window.addEventListener('keydown', function (e) {
+                var t = e.target;
+                if (!t) return;
+                var tag = t.tagName;
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable) {
+                  e.stopPropagation();
+                }
+              }, true);
+            }
+            </script>"#
+                .to_string(),
+        )
         .with_window(
             WindowBuilder::new()
                 .with_title("MorReel Studio")
