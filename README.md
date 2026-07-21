@@ -94,6 +94,11 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   in the monitor as you scrub — ported from
   [moranima](../moranima)'s camera moves; one ffmpeg filter each, identical in
   preview and export, with a strength slider that interpolates to identity.
+- **Grade** — a light primary colour correction in the Style › Look tab:
+  exposure, contrast, saturation and warmth sliders on any V1 clip or V2
+  cutaway. Runs *before* the effect look (correct first, stylise on top),
+  compiles to one `eq` + `colortemperature` pass, and rides the same chain as
+  everything else — so it is identical in preview and export.
 - **Safe-area guides** (`G`) — shaded bands showing where a phone app's own
   header, action rail and caption block sit over the frame. Worst case across
   TikTok / Reels / Shorts, so clearing them clears all three.

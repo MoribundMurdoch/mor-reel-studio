@@ -380,6 +380,76 @@ pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
     c + ",setsar=1"
 }
 
+/// A light primary colour grade — GIMP's Curves/Levels reduced to the four knobs
+/// a phone reel actually reaches for, each mapped to what ffmpeg does cheaply in
+/// one pass. It rides the same [`Clip::look`] chain as the effect presets — the
+/// grade runs *before* the look, so you correct the exposure and then stylise on
+/// top — which keeps it WYSIWYG and back-compatible: an old project with no
+/// `grade` loads as the identity (every field `#[serde(default)]`), and the
+/// identity emits no filter at all.
+///
+/// ponytail: static, not [`Animated`] — a graded reel wants one steady look, not
+/// a colour that drifts. Make the fields curves the day a fade-to-mono needs it.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Grade {
+    /// `eq` brightness: -1..1, 0 = untouched.
+    #[serde(default)]
+    pub exposure: f64,
+    /// `eq` contrast: 0..2, 1 = untouched.
+    #[serde(default = "unit")]
+    pub contrast: f64,
+    /// `eq` saturation: 0..3, 1 = untouched.
+    #[serde(default = "unit")]
+    pub saturation: f64,
+    /// White balance in Kelvin: below 6500 warms, above cools, 6500 = untouched.
+    #[serde(default = "neutral_k")]
+    pub warmth: f64,
+}
+
+fn neutral_k() -> f64 {
+    6500.0
+}
+
+impl Default for Grade {
+    fn default() -> Self {
+        Self { exposure: 0.0, contrast: 1.0, saturation: 1.0, warmth: 6500.0 }
+    }
+}
+
+impl Grade {
+    /// True when every knob is at neutral — the whole grade emits nothing.
+    pub fn is_identity(&self) -> bool {
+        self.exposure.abs() < 1e-4
+            && (self.contrast - 1.0).abs() < 1e-4
+            && (self.saturation - 1.0).abs() < 1e-4
+            && (self.warmth - 6500.0).abs() < 1.0
+    }
+
+    /// ffmpeg chain for the grade, or "" when it is the identity. `eq` carries
+    /// exposure/contrast/saturation together; `colortemperature` carries warmth.
+    /// Each half is dropped at neutral, so a one-knob grade stays a one-filter
+    /// chain.
+    pub fn chain(&self) -> String {
+        if self.is_identity() {
+            return String::new();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.exposure.abs() >= 1e-4
+            || (self.contrast - 1.0).abs() >= 1e-4
+            || (self.saturation - 1.0).abs() >= 1e-4
+        {
+            parts.push(format!(
+                "eq=brightness={:.3}:contrast={:.3}:saturation={:.3}",
+                self.exposure, self.contrast, self.saturation
+            ));
+        }
+        if (self.warmth - 6500.0).abs() >= 1.0 {
+            parts.push(format!("colortemperature={:.0}", self.warmth));
+        }
+        parts.join(",")
+    }
+}
+
 /// A rectangle to align against, in the same normalized frame space as
 /// [`Transform::x`]/[`y`]: the frame spans `[-0.5, 0.5]` on each axis, `(0,0)`
 /// is dead centre, `+x` is right and `+y` is down. So an offset computed here
@@ -616,6 +686,10 @@ pub struct ClipSpec {
     pub effect: String,
     /// How the source fills 9:16: "Crop" (default), "Fit" (letterbox), "Zoom".
     pub framing: String,
+    /// Colour behind the picture where it doesn't fill 9:16 — fills the "Fit"
+    /// letterbox. (A banded/shrunk clip's surround is filled by its transform
+    /// pad separately, from the same `Bg`.)
+    pub bg: Bg,
     /// Playback rate: 0.5 is half speed (slow motion), 2.0 is double.
     pub speed: f64,
     /// Gain on this clip's own audio; 0.0 mutes it.
@@ -638,6 +712,7 @@ impl Default for ClipSpec {
             has_audio: false,
             effect: String::new(),
             framing: String::new(),
+            bg: Bg::Black,
             speed: 1.0,
             volume: 1.0,
             transition: String::new(),
@@ -914,11 +989,22 @@ pub struct AudioSpec {
     pub fade_in: f64,
     /// Fade out to silence at the end of the kept span (seconds).
     pub fade_out: f64,
-    /// Spectral denoise strength 0..=1 (`afftdn`).
+    /// Spectral denoise strength 0..=1 (`afftdn` `nr`, mapped to 4..=24 dB).
     pub denoise: f64,
+    /// Noise floor in dB, afftdn `nf` (−80..=−20). The sensitivity knob:
+    /// higher (closer to −20) treats more of the signal as noise.
+    pub noise_floor: f64,
+    /// Adaptively track the noise floor over the clip (afftdn `tn`). ffmpeg's
+    /// stand-in for a learned noise profile — no fixed noise-only region needed.
+    pub track_noise: bool,
     /// Broadband compression amount 0..=1 (skipped when the treatment already
     /// bakes a compressor, e.g. Podcast).
     pub compress: f64,
+    /// Noise gate amount 0..=1 (`agate`). Silences everything below a threshold
+    /// that rises with the knob — kills room tone between words on phone VO.
+    pub gate: f64,
+    /// De-click strength 0..=1 (`adeclick`). Repairs pops/clicks in field audio.
+    pub declick: f64,
     /// One of [`AUDIO_TREATS`].
     pub treat: String,
     /// Mix bus: 1 = A1, 2 = A2. Both mix under V1; the split is editorial.
@@ -938,7 +1024,11 @@ impl Default for AudioSpec {
             fade_in: 0.0,
             fade_out: 0.0,
             denoise: 0.0,
+            noise_floor: -25.0,
+            track_noise: false,
             compress: 0.0,
+            gate: 0.0,
+            declick: 0.0,
             treat: "None".into(),
             lane: 1,
         }
@@ -979,10 +1069,36 @@ fn duck_chain(amount: f64) -> String {
 /// Denoise → treat → compress fragment (no volume/fades/delay).
 fn audio_process_chain(a: &AudioSpec) -> String {
     let mut parts: Vec<String> = Vec::new();
+    // De-click first: repair transients before denoise smears them. Lower
+    // threshold catches more clicks, so aggressive = lower.
+    let dc = a.declick.clamp(0.0, 1.0);
+    if dc > 0.001 {
+        parts.push(format!("adeclick=threshold={:.2}", 3.5 - 2.0 * dc));
+    }
     let d = a.denoise.clamp(0.0, 1.0);
     if d > 0.001 {
-        // afftdn: nr is noise reduction in dB (gentle → aggressive).
-        parts.push(format!("afftdn=nr={:.1}:nf=-25", 4.0 + 20.0 * d));
+        // afftdn: nr is noise reduction in dB (gentle → aggressive); nf is the
+        // noise floor (sensitivity); tn adaptively tracks the noise over time.
+        let mut fx = format!(
+            "afftdn=nr={:.1}:nf={:.0}",
+            4.0 + 20.0 * d,
+            a.noise_floor.clamp(-80.0, -20.0)
+        );
+        if a.track_noise {
+            fx.push_str(":tn=1");
+        }
+        parts.push(fx);
+    }
+    // Gate after denoise, before EQ/compress — so the compressor never pumps on
+    // room tone the gate is about to remove. Threshold rises from −50 dB (gentle)
+    // to −20 dB (aggressive); a moderate ratio + slow release keeps word tails.
+    let g = a.gate.clamp(0.0, 1.0);
+    if g > 0.001 {
+        let thr_db = -50.0 + 30.0 * g;
+        parts.push(format!(
+            "agate=threshold={:.5}:ratio=3:attack=5:release=150",
+            10f64.powf(thr_db / 20.0)
+        ));
     }
     let treat = audio_treat_chain(&a.treat);
     if !treat.is_empty() {
@@ -1462,7 +1578,24 @@ pub async fn frame_data_uri(
     effect: &str,
     over: Over,
 ) -> Result<String, String> {
-    let mut chain = frame_chain(framing, w, h, "m");
+    frame_data_uri_fill(path, t, w, h, framing, effect, over, "black").await
+}
+
+/// [`frame_data_uri`] with an explicit letterbox `fill` for "Fit" framing, so a
+/// scrub of the composed reel shows the chosen Background behind a landscape
+/// clip — matching what the export bakes in (preview == export).
+#[allow(clippy::too_many_arguments)]
+pub async fn frame_data_uri_fill(
+    path: &str,
+    t: f64,
+    w: u32,
+    h: u32,
+    framing: &str,
+    effect: &str,
+    over: Over,
+    fill: &str,
+) -> Result<String, String> {
+    let mut chain = frame_chain_fill(framing, w, h, "m", fill);
     if !effect.is_empty() {
         // Seeking restarts the filter clock at 0, which would freeze every
         // time-based effect at its t=0 pose — most visible on a still, where
@@ -1494,7 +1627,7 @@ pub async fn frame_data_uri(
             cmd.args(["-loop", "1"]);
         }
         cmd.args(["-ss", &format!("{bt:.3}"), "-i", bpath]);
-        let mut bchain = frame_chain(bframing, w, h, "b");
+        let mut bchain = frame_chain_fill(bframing, w, h, "b", fill);
         if !beffect.is_empty() {
             bchain = format!("{bchain},setpts=PTS+{bt:.3}/TB,{beffect},setpts=PTS-{bt:.3}/TB");
         }
@@ -1619,10 +1752,18 @@ fn eff(effect: &str) -> String {
 /// collide across items without it. Pass the item's index; linear framings ignore it.
 // ponytail: fixed 1.5× zoom / sigma — a per-clip slider when someone asks.
 fn frame_chain(framing: &str, w: u32, h: u32, tag: &str) -> String {
+    frame_chain_fill(framing, w, h, tag, "black")
+}
+
+/// Like [`frame_chain`] but the "Fit" letterbox takes `fill` instead of black,
+/// so a chosen Background shows behind a letterboxed landscape clip — the same
+/// colour `transform_chain` pads a *banded* clip with. Every other framing
+/// covers the frame, so `fill` is a no-op there.
+fn frame_chain_fill(framing: &str, w: u32, h: u32, tag: &str, fill: &str) -> String {
     match framing {
         "Fit" => format!(
             "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
-             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
+             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={fill}"
         ),
         "Zoom" => format!(
             "scale={}:{}:force_original_aspect_ratio=increase,crop={w}:{h}",
@@ -1706,7 +1847,7 @@ pub fn build_filter(
             c.in_s,
             c.out_s,
             c.speed.max(0.01),
-            frame_chain(&c.framing, W, H, &format!("c{i}")),
+            frame_chain_fill(&c.framing, W, H, &format!("c{i}"), c.bg.color()),
             eff(&c.effect)
         );
         f += &clip_audio(i, c);
@@ -1885,6 +2026,42 @@ pub async fn render_audio_mix(
     Ok(())
 }
 
+/// Integrated loudness (LUFS) of `path`'s span `[in_s, out_s]`, measured with
+/// ffmpeg's `loudnorm` first pass. This is what "Normalize" keys off: measure a
+/// clip, then set its gain so it lands on a target level (the reference level
+/// for the platform, e.g. −14 LUFS). No encode — a null muxer, so it's quick.
+pub async fn measure_loudness(path: &str, in_s: f64, out_s: f64) -> Result<f64, String> {
+    let span = (out_s - in_s).max(0.05);
+    let ss = format!("{:.3}", in_s.max(0.0));
+    let t = format!("{span:.3}");
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostats", "-ss", &ss, "-i", path, "-t", &t])
+        .args(["-af", "loudnorm=print_format=json", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+    // loudnorm prints its JSON block on stderr, after the log. Grab the value on
+    // the "input_i" line rather than parsing the whole object.
+    let log = String::from_utf8_lossy(&out.stderr);
+    parse_loudnorm_i(&log).ok_or_else(|| "could not measure loudness".to_string())
+}
+
+/// Pull `input_i` (integrated LUFS) out of a loudnorm JSON dump on stderr.
+pub fn parse_loudnorm_i(log: &str) -> Option<f64> {
+    let line = log.lines().find(|l| l.contains("\"input_i\""))?;
+    let val = line.split(':').nth(1)?.trim().trim_matches(|c| c == '"' || c == ',');
+    val.parse::<f64>().ok()
+}
+
+/// Linear gain that moves a clip measured at `measured_lufs` onto `target_lufs`.
+/// Clamped so near-silent material (very low LUFS) can't be boosted into a wall
+/// of noise, and so an already-hot clip is pulled down rather than clipped.
+pub fn normalize_gain(measured_lufs: f64, target_lufs: f64) -> f64 {
+    let db = target_lufs - measured_lufs;
+    10f64.powf(db / 20.0).clamp(0.05, 4.0)
+}
+
 /// Play `path` from `start` seconds, sound only, no window. Returns the child
 /// so pausing can kill it; the child is also killed if dropped.
 pub fn launch_audio(path: &Path, start: f64) -> Result<tokio::process::Child, String> {
@@ -2013,6 +2190,142 @@ pub fn keep_loud_ranges(
         keeps.push((t, out_s));
     }
     keeps
+}
+
+/// Pull a BPM out of a filename like `house_128bpm_master.wav` or `track 90 BPM.mp3`
+/// — the digits immediately before "bpm". Reel music libraries name files this way,
+/// so it's a free, exact tempo when present.
+pub fn bpm_from_filename(name: &str) -> Option<f64> {
+    let low = name.to_ascii_lowercase();
+    let idx = low.find("bpm")?;
+    let head = low[..idx].trim_end();
+    let rev: String = head.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    let n: f64 = rev.chars().rev().collect::<String>().parse().ok()?;
+    (40.0..=300.0).contains(&n).then_some(n)
+}
+
+/// Fold a tempo into the [70, 160) BPM octave — kills the half/double-time
+/// ambiguity autocorrelation can land on.
+fn fold_bpm(mut b: f64) -> f64 {
+    while b < 70.0 {
+        b *= 2.0;
+    }
+    while b >= 160.0 {
+        b /= 2.0;
+    }
+    b
+}
+
+/// Tempo from the dominant lag in an onset envelope's autocorrelation, searched
+/// over 70–160 BPM.
+fn autocorr_bpm(env: &[f32], env_hz: f64) -> f64 {
+    let lag_min = ((env_hz * 60.0 / 160.0).floor() as usize).max(1);
+    let lag_max = ((env_hz * 60.0 / 70.0).ceil() as usize).min(env.len().saturating_sub(1));
+    let mut best_lag = lag_min;
+    let mut best = f64::MIN;
+    for lag in lag_min..=lag_max {
+        let mut sum = 0.0;
+        for i in lag..env.len() {
+            sum += env[i] as f64 * env[i - lag] as f64;
+        }
+        let score = sum / (env.len() - lag) as f64; // normalize so long lags aren't penalized
+        if score > best {
+            best = score;
+            best_lag = lag;
+        }
+    }
+    env_hz * 60.0 / best_lag as f64
+}
+
+/// Estimate tempo (BPM) and beat positions from an onset-strength envelope
+/// sampled at `env_hz`. `hint_bpm` (e.g. from the filename) pins the tempo when
+/// present; otherwise it's found by autocorrelation. Returns (bpm, beat times in
+/// seconds from the envelope's start).
+// ponytail: naive single-tempo tracker — one global BPM, autocorr peak, best
+// constant phase. Enough to seed markers you then nudge; upgrade to a
+// dynamic-programming beat tracker only if drift or octave errors actually bite.
+pub fn beats_from_envelope(env: &[f32], env_hz: f64, hint_bpm: Option<f64>) -> (f64, Vec<f64>) {
+    if env.len() < 8 || env_hz <= 0.0 {
+        return (0.0, Vec::new());
+    }
+    let bpm = hint_bpm
+        .filter(|b| (40.0..=300.0).contains(b))
+        .map(fold_bpm)
+        .unwrap_or_else(|| autocorr_bpm(env, env_hz));
+    if bpm <= 0.0 {
+        return (0.0, Vec::new());
+    }
+    let period = env_hz * 60.0 / bpm; // frames per beat
+    // Best constant phase: the pulse-train offset that collects the most onset.
+    let steps = (env.len() as f64 / period).floor().max(1.0) as usize;
+    let mut best_off = 0usize;
+    let mut best_score = f64::MIN;
+    for off in 0..period.ceil() as usize {
+        let mut score = 0.0;
+        for k in 0..=steps {
+            let idx = (off as f64 + k as f64 * period).round() as usize;
+            if idx < env.len() {
+                score += env[idx] as f64;
+            }
+        }
+        if score > best_score {
+            best_score = score;
+            best_off = off;
+        }
+    }
+    let mut beats = Vec::new();
+    let mut t = best_off as f64;
+    while (t as usize) < env.len() {
+        beats.push(t / env_hz);
+        t += period;
+    }
+    (bpm, beats)
+}
+
+/// Detect the beat grid of a music bed. Decodes the [`in_s`, `out_s`] span to a
+/// mono onset envelope and returns (bpm, beat times in *source* seconds). A
+/// "<n>bpm" in the filename pins the tempo; the phase is always found from the
+/// signal so beat 1 lands on a real onset.
+pub async fn detect_beats(path: &str, in_s: f64, out_s: f64) -> Result<(f64, Vec<f64>), String> {
+    const SR: u32 = 11025;
+    const HOP: usize = 110; // ~100 Hz onset envelope
+    let span = (out_s - in_s).max(0.5);
+    let ss = format!("{:.3}", in_s.max(0.0));
+    let t = format!("{span:.3}");
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostats", "-ss", &ss, "-i", path, "-t", &t])
+        .args(["-ac", "1", "-ar", &SR.to_string(), "-f", "f32le", "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+    if out.stdout.is_empty() {
+        return Err("could not decode audio for beat detection".into());
+    }
+    let samples: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    if samples.len() < HOP * 8 {
+        return Err("clip too short to detect beats".into());
+    }
+    // Per-hop rectified-energy onset envelope: a beat is a rise in energy.
+    let env_hz = SR as f64 / HOP as f64;
+    let mut env = Vec::with_capacity(samples.len() / HOP);
+    let mut prev = 0.0f32;
+    for frame in samples.chunks(HOP) {
+        let e: f32 = frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32;
+        env.push((e - prev).max(0.0));
+        prev = e;
+    }
+    let hint = Path::new(path).file_name().and_then(|n| n.to_str()).and_then(bpm_from_filename);
+    let (bpm, beats) = beats_from_envelope(&env, env_hz, hint);
+    if beats.is_empty() {
+        return Err("no beat detected".into());
+    }
+    Ok((bpm, beats.into_iter().map(|b| in_s + b).collect()))
 }
 
 /// Waveform strip of a file's audio (bright teal on transparent) as a data: URI.
@@ -2365,6 +2678,57 @@ noise
         assert!(keep_loud_ranges(0.0, 5.0, &[(0.0, 5.0)], 0.0, 0.2).is_empty());
         // No silence → one full keep.
         assert_eq!(keep_loud_ranges(1.0, 4.0, &[], 0.0, 0.2), vec![(1.0, 4.0)]);
+    }
+
+    #[test]
+    fn bpm_from_filename_reads_common_shapes() {
+        assert_eq!(bpm_from_filename("house_128bpm_master.wav"), Some(128.0));
+        assert_eq!(bpm_from_filename("track 90 BPM.mp3"), Some(90.0));
+        assert_eq!(bpm_from_filename("no tempo here.wav"), None);
+        assert_eq!(bpm_from_filename("bpm_only.wav"), None); // no digits before "bpm"
+    }
+
+    #[test]
+    fn beats_from_envelope_recovers_a_known_tempo() {
+        // Onset pulses every 50 frames at 100 Hz = 120 BPM, phase offset 7.
+        let env_hz = 100.0;
+        let period = env_hz * 60.0 / 120.0; // 50
+        let mut env = vec![0.0f32; 2000];
+        let mut i = 7.0;
+        while (i as usize) < env.len() {
+            env[i as usize] = 1.0;
+            i += period;
+        }
+        let (bpm, beats) = beats_from_envelope(&env, env_hz, None);
+        assert!((bpm - 120.0).abs() < 3.0, "bpm {bpm}");
+        // Beat 1 lands on the planted phase, spacing matches the period.
+        assert!((beats[0] * env_hz - 7.0).abs() <= 1.0, "phase {}", beats[0] * env_hz);
+        assert!(((beats[1] - beats[0]) * env_hz - period).abs() < 2.0, "spacing off");
+        // A filename hint pins tempo even against a noisier signal.
+        let (bpm, _) = beats_from_envelope(&env, env_hz, Some(100.0));
+        assert!((bpm - 100.0).abs() < 0.001, "hint ignored: {bpm}");
+    }
+
+    #[tokio::test]
+    async fn detect_beats_finds_the_tempo_of_a_click_track() {
+        let dir = std::env::temp_dir().join("morreel-beat-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("clicks.m4a").display().to_string();
+        // A 1 kHz click every 0.5s for 8s = 120 BPM.
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi",
+            "-i", "aevalsrc=exprs='sin(2*PI*1000*t)*lt(mod(t,0.5),0.02)':d=8:s=44100",
+            "-c:a", "aac", &src,
+        ])
+        .await
+        .unwrap();
+        let (bpm, beats) = detect_beats(&src, 0.0, 8.0).await.unwrap();
+        assert!((bpm - 120.0).abs() < 6.0, "expected ~120 BPM, got {bpm}");
+        assert!(beats.len() >= 12, "expected a beat per click, got {}", beats.len());
+        // Beats step by ~0.5s.
+        let dt = beats[2] - beats[1];
+        assert!((dt - 0.5).abs() < 0.08, "beat spacing {dt}");
     }
 
     #[tokio::test]
@@ -3344,13 +3708,39 @@ noise
             fade_in: 0.5,
             fade_out: 0.75,
             denoise: 0.5,
+            noise_floor: -25.0,
+            track_noise: false,
             compress: 0.4,
+            gate: 0.0,
+            declick: 0.0,
             treat: "Voice enhance".into(),
             duck: 0.0,
             lane: 1,
         };
         let f = build_filter(&clips, &[], &[], &[bed], ExportOpts::default());
         assert!(f.contains("afftdn=nr="), "denoise missing: {f}");
+        assert!(f.contains("nf=-25"), "noise floor missing: {f}");
+        assert!(!f.contains(":tn=1"), "track_noise off should omit tn: {f}");
+        // Floor + adaptive tracking flow through to the afftdn args.
+        let bed2 = AudioSpec {
+            denoise: 0.5,
+            noise_floor: -55.0,
+            track_noise: true,
+            ..AudioSpec::default()
+        };
+        let f2 = build_filter(&[], &[], &[], &[bed2], ExportOpts::default());
+        assert!(f2.contains("nf=-55") && f2.contains(":tn=1"), "adaptive floor missing: {f2}");
+        // Gate + de-click appear only when their knobs are up, and de-click sits
+        // ahead of the denoiser so clicks are repaired before it smears them.
+        assert!(!f.contains("agate=") && !f.contains("adeclick="), "fx present at zero: {f}");
+        let bed3 = AudioSpec { gate: 0.5, declick: 1.0, denoise: 0.5, ..AudioSpec::default() };
+        let f3 = build_filter(&[], &[], &[], &[bed3], ExportOpts::default());
+        assert!(f3.contains("agate=threshold="), "gate missing: {f3}");
+        assert!(f3.contains("adeclick=threshold=1.50"), "declick missing/miscalibrated: {f3}");
+        assert!(
+            f3.find("adeclick=").unwrap() < f3.find("afftdn=").unwrap(),
+            "de-click must precede denoise: {f3}"
+        );
         assert!(f.contains("highpass=f=80"), "voice treat missing: {f}");
         assert!(f.contains("acompressor="), "compress missing: {f}");
         assert!(f.contains("volume='0.8000+(0.2000-0.8000)*t/"), "vol ramp missing: {f}");
@@ -3814,8 +4204,47 @@ noise
     }
 
     #[test]
+    fn grade_is_identity_by_default_and_loads_old_projects() {
+        // The whole back-compat contract: an element saved before grades existed
+        // has no `grade`, so it deserialises to the default, which emits nothing.
+        let g: Grade = serde_json::from_str("{}").unwrap();
+        assert_eq!(g, Grade::default());
+        assert!(g.is_identity());
+        assert_eq!(g.chain(), "");
+
+        // A neutral grade set field-by-field still emits nothing.
+        assert!(Grade { exposure: 0.0, contrast: 1.0, saturation: 1.0, warmth: 6500.0 }
+            .chain()
+            .is_empty());
+    }
+
+    #[test]
+    fn grade_emits_only_the_knobs_that_moved() {
+        // Warmth alone is one filter, not an eq with default args riding along.
+        let warm = Grade { warmth: 4500.0, ..Default::default() };
+        assert_eq!(warm.chain(), "colortemperature=4500");
+
+        // eq carries the three tone knobs in one pass; warmth stays out of it.
+        let tone = Grade { exposure: 0.1, contrast: 1.2, saturation: 1.3, ..Default::default() };
+        assert_eq!(tone.chain(), "eq=brightness=0.100:contrast=1.200:saturation=1.300");
+
+        // Both halves present join with a comma, tone before temperature.
+        let both = Grade { saturation: 0.5, warmth: 8000.0, ..Default::default() };
+        assert_eq!(both.chain(), "eq=brightness=0.000:contrast=1.000:saturation=0.500,colortemperature=8000");
+    }
+
+    #[test]
     fn framing_chains() {
         assert!(frame_chain("Fit", 1080, 1920, "c0").contains("pad=1080:1920"));
+        // A "Fit" letterbox is black by default but takes the chosen Background,
+        // so a landscape clip's bands honour it the same way a banded clip's do.
+        assert!(frame_chain("Fit", 1080, 1920, "c0").contains(":color=black"));
+        assert!(frame_chain_fill("Fit", 1080, 1920, "c0", "white").contains(":color=white"));
+        // Covering framings ignore the fill — there's nothing to letterbox.
+        assert_eq!(
+            frame_chain_fill("Crop", 1080, 1920, "c0", "white"),
+            frame_chain("Crop", 1080, 1920, "c0")
+        );
         assert!(frame_chain("Zoom", 1080, 1920, "c0").starts_with("scale=1620:2880"));
         // default and unknown names center-crop
         assert_eq!(frame_chain("", 1080, 1920, "c0"), frame_chain("Crop", 1080, 1920, "c0"));
@@ -3856,6 +4285,19 @@ noise
 
         // no A1 degenerates to the concat fed straight through
         assert!(build_audio_filter(&clips, &[]).ends_with("[ac]anull[aout]"));
+    }
+
+    #[test]
+    fn loudness_measure_and_gain() {
+        // parse the value off loudnorm's JSON dump, ignoring the log above it
+        let log = "  size=N/A time=00:00:01\n{\n\t\"input_i\" : \"-23.45\",\n\t\"input_tp\" : \"-3.0\"\n}";
+        assert_eq!(parse_loudnorm_i(log), Some(-23.45));
+        assert_eq!(parse_loudnorm_i("nothing here"), None);
+        // quieter-than-target clip is boosted (>1x); already at target ≈ unity
+        assert!(normalize_gain(-23.0, -14.0) > 1.0);
+        assert!((normalize_gain(-14.0, -14.0) - 1.0).abs() < 1e-9);
+        // a near-silent clip can't be boosted past the ceiling
+        assert_eq!(normalize_gain(-90.0, -14.0), 4.0);
     }
 
     #[tokio::test]

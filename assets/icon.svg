@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1a28"/>
+      <stop offset="0.55" stop-color="#101018"/>
+      <stop offset="1" stop-color="#0b0b11"/>
+    </linearGradient>
+    <linearGradient id="phoneFace" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2440"/>
+      <stop offset="0.45" stop-color="#18122a"/>
+      <stop offset="1" stop-color="#12101c"/>
+    </linearGradient>
+    <linearGradient id="playGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c4b4ff"/>
+      <stop offset="0.5" stop-color="#8f7bf0"/>
+      <stop offset="1" stop-color="#6b54d4"/>
+    </linearGradient>
+    <linearGradient id="goldEdge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f0d78a"/>
+      <stop offset="0.5" stop-color="#d7af5f"/>
+      <stop offset="1" stop-color="#9a7430"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.38" r="0.55">
+      <stop offset="0" stop-color="#8f7bf0" stop-opacity="0.35"/>
+      <stop offset="0.55" stop-color="#8f7bf0" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#8f7bf0" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="10" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- App plate -->
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#plate)"/>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#glow)"/>
+  <rect x="24" y="24" width="464" height="464" rx="100" fill="none"
+        stroke="url(#goldEdge)" stroke-width="10"/>
+  <rect x="40" y="40" width="432" height="432" rx="88" fill="none"
+        stroke="#050508" stroke-width="5" opacity="0.55"/>
+
+  <!-- Portrait phone / reel frame (9:16 silhouette) -->
+  <rect x="168" y="78" width="176" height="300" rx="36"
+        fill="url(#phoneFace)" stroke="#3dd6c8" stroke-width="8"/>
+  <!-- Inner screen -->
+  <rect x="184" y="104" width="144" height="232" rx="18" fill="#0b0b14"/>
+  <!-- Status bar notch hint -->
+  <rect x="226" y="114" width="60" height="8" rx="4" fill="#2a2836"/>
+
+  <!-- Play triangle (center of screen) -->
+  <g filter="url(#softGlow)">
+    <path d="M 230 168 L 230 272 L 306 220 Z" fill="url(#playGrad)"/>
+  </g>
+
+  <!-- Mini timeline bars under play (editor cue) -->
+  <rect x="196" y="292" width="48" height="12" rx="4" fill="#8f7bf0"/>
+  <rect x="250" y="292" width="28" height="12" rx="4" fill="#3dd6c8"/>
+  <rect x="284" y="292" width="32" height="12" rx="4" fill="#E8C060"/>
+
+  <!-- Home indicator -->
+  <rect x="228" y="348" width="56" height="8" rx="4" fill="#413e4f"/>
+
+  <!-- Accent film dots (reel motif) -->
+  <circle cx="120" cy="200" r="10" fill="#E8C060" opacity="0.85"/>
+  <circle cx="120" cy="248" r="10" fill="#E8C060" opacity="0.55"/>
+  <circle cx="120" cy="296" r="10" fill="#E8C060" opacity="0.35"/>
+  <circle cx="392" cy="200" r="10" fill="#3dd6c8" opacity="0.85"/>
+  <circle cx="392" cy="248" r="10" fill="#3dd6c8" opacity="0.55"/>
+  <circle cx="392" cy="296" r="10" fill="#3dd6c8" opacity="0.35"/>
+
+  <!-- Record / playhead gem at bottom -->
+  <circle cx="256" cy="422" r="18" fill="#e5484d"/>
+  <circle cx="256" cy="422" r="8" fill="#ff8a8e"/>
+</svg>

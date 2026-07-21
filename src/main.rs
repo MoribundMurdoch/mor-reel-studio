@@ -7,6 +7,8 @@ mod bevel;
 mod engine;
 mod keyframe;
 
+use dioxus::desktop::tao::window::Icon;
+use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
 use dioxus::html::HasFileData;
 use dioxus::prelude::*;
 use engine::{AudioSpec, ClipSpec, OverlaySpec, TitleSpec};
@@ -38,11 +40,40 @@ padding_base  = "8px"
 border_radius = "7px"
 destructive   = "#e5484d"
 success       = "#3dd6c8"
-warning       = "#e8c060"
+warning       = "#e86aa6"
 "##;
 
+/// Window / taskbar icon (128px RGBA PNG).
+fn window_icon() -> Option<Icon> {
+    let img = image::load_from_memory(include_bytes!("../assets/icons/morreel-studio-128.png"))
+        .ok()?
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    Icon::from_rgba(img.into_raw(), w, h).ok()
+}
+
+/// Titlebar system-menu icon as a data URL (64px PNG, base64).
+fn system_icon_src() -> String {
+    format!(
+        "data:image/png;base64,{}",
+        include_str!("../assets/icons/morreel-studio-64.b64").trim()
+    )
+}
+
 fn main() {
-    let cfg = UiMode::launch_config("MorReel Studio");
+    let mode = UiMode::resolve();
+    mode.apply_env();
+    let is_native = mode.is_native();
+    let cfg = Config::new()
+        .with_menu(None::<dioxus::desktop::muda::Menu>)
+        .with_window(
+            WindowBuilder::new()
+                .with_title("MorReel Studio")
+                .with_inner_size(LogicalSize::new(1100.0, 720.0))
+                .with_decorations(is_native)
+                .with_transparent(!is_native)
+                .with_window_icon(window_icon()),
+        );
     dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(App);
 }
 
@@ -613,6 +644,21 @@ fn transform_knobs(t: &engine::Transform, with_opacity: bool) -> Vec<XformKnob> 
     knobs
 }
 
+/// One row of the grade panel: label, current value, min, max, step, and how to
+/// write it back — the same shape as [`XformKnob`], so both drive the identical
+/// slider loop. Ranges are the reel-sane subset of each ffmpeg control.
+type GradeKnob = (&'static str, f64, f64, f64, f64, fn(&mut engine::Grade, f64));
+
+fn grade_knobs(g: &engine::Grade) -> Vec<GradeKnob> {
+    let set_exp: fn(&mut engine::Grade, f64) = |x, v| x.exposure = v;
+    vec![
+        ("Exposure", g.exposure, -0.3, 0.3, 0.01, set_exp),
+        ("Contrast", g.contrast, 0.5, 1.8, 0.01, |x, v| x.contrast = v),
+        ("Saturation", g.saturation, 0.0, 2.5, 0.01, |x, v| x.saturation = v),
+        ("Warmth (K)", g.warmth, 4000.0, 9000.0, 100.0, |x, v| x.warmth = v),
+    ]
+}
+
 /// One row of the bevel panel: label, current value, max, step, and how to
 /// write it back. A table beats seven near-identical slider blocks, and the
 /// ranges are the designer app's.
@@ -737,6 +783,10 @@ struct Clip {
     /// Where the picture sits in the frame — scale, position, rotation.
     #[serde(default)]
     transform: engine::AnimatedTransform,
+    /// Primary colour grade — exposure/contrast/saturation/warmth. Runs before
+    /// the effect preset in `look()`; identity by default so old projects load.
+    #[serde(default)]
+    grade: engine::Grade,
     /// Playback rate: 0.5 is slow motion, 2.0 is double speed.
     #[serde(default = "unity")]
     speed: f64,
@@ -771,6 +821,7 @@ impl Clip {
             has_audio: self.has_audio,
             effect: self.look(),
             framing: self.framing.clone(),
+            bg: self.transform.bg,
             speed: self.speed,
             volume: self.volume,
             transition: self.transition.clone(),
@@ -783,7 +834,7 @@ impl Clip {
     /// drift apart.
     fn look(&self) -> String {
         join_chain(
-            self.transform.chain(engine::W, engine::H, false),
+            join_chain(self.transform.chain(engine::W, engine::H, false), self.grade.chain()),
             effect_filter_amt(&self.effect, self.effect_amount),
         )
     }
@@ -841,6 +892,9 @@ struct OverlayItem {
     /// picture-in-picture, since V2 composites over V1.
     #[serde(default)]
     transform: engine::AnimatedTransform,
+    /// Primary colour grade — same as a V1 clip, runs before the effect look.
+    #[serde(default)]
+    grade: engine::Grade,
     /// Playback rate, same as a V1 clip: 0.5 is slow motion.
     #[serde(default = "unity")]
     speed: f64,
@@ -860,7 +914,7 @@ impl OverlayItem {
     /// picture vacates is transparent, so V1 shows through around it.
     fn look(&self) -> String {
         join_chain(
-            self.transform.chain(engine::W, engine::H, true),
+            join_chain(self.transform.chain(engine::W, engine::H, true), self.grade.chain()),
             effect_filter_amt(&self.effect, self.effect_amount),
         )
     }
@@ -876,6 +930,11 @@ fn audio_lane_default() -> u8 {
 /// Sentinel for "volume end equals volume start" so older projects stay flat.
 fn vol_end_default() -> f64 {
     -1.0
+}
+/// afftdn noise floor for projects saved before the knob existed — the value
+/// that was hardcoded, so old projects denoise exactly as they used to.
+fn noise_floor_default() -> f64 {
+    -25.0
 }
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -904,9 +963,21 @@ struct AudioItem {
     /// Spectral denoise 0..=1.
     #[serde(default)]
     denoise: f64,
+    /// afftdn noise floor in dB (−80..=−20); the sensitivity knob.
+    #[serde(default = "noise_floor_default")]
+    noise_floor: f64,
+    /// Adaptively track the noise floor over the clip (afftdn `tn`).
+    #[serde(default)]
+    track_noise: bool,
     /// Broadband compression 0..=1.
     #[serde(default)]
     compress: f64,
+    /// Noise gate 0..=1 (`agate`) — kills room tone between words.
+    #[serde(default)]
+    gate: f64,
+    /// De-click strength 0..=1 (`adeclick`) — pops in field audio.
+    #[serde(default)]
+    declick: f64,
     /// One of engine::AUDIO_TREATS — EQ / voice shaping.
     #[serde(default = "none_label")]
     treat: String,
@@ -935,6 +1006,69 @@ impl AudioItem {
 
     fn span(&self) -> f64 {
         (self.out_s - self.in_s).max(0.01)
+    }
+}
+
+/// One mixer channel: a gain fader, a mute, and a solo. The three strips the
+/// mixer holds are V1 (every clip's own audio), A1 and A2 (the two beds).
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Strip {
+    #[serde(default = "unity")]
+    gain: f64,
+    #[serde(default)]
+    mute: bool,
+    #[serde(default)]
+    solo: bool,
+}
+impl Default for Strip {
+    fn default() -> Self {
+        Strip { gain: 1.0, mute: false, solo: false }
+    }
+}
+
+/// Track index into [`Mixer::tracks`]. Kept as plain constants — three fixed
+/// buses, not a growing list, so an enum would be ceremony.
+const MIX_V1: usize = 0;
+const MIX_A1: usize = 1;
+const MIX_A2: usize = 2;
+const MIX_LABELS: [&str; 3] = ["V1", "A1", "A2"];
+
+/// A tiny 3-channel mixer plus a master fader. It is the one place track-level
+/// level, mute and solo live; per-clip gain still rides on top. Applied once in
+/// `gather_specs`, so preview and export hear exactly the same balance.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Mixer {
+    #[serde(default)]
+    tracks: [Strip; 3],
+    #[serde(default = "unity")]
+    master: f64,
+}
+impl Default for Mixer {
+    fn default() -> Self {
+        Mixer { tracks: Default::default(), master: 1.0 }
+    }
+}
+impl Mixer {
+    fn any_solo(&self) -> bool {
+        self.tracks.iter().any(|s| s.solo)
+    }
+    /// Effective linear gain for track `i`, folding in mute, solo and master.
+    /// 0.0 means silent — muted, or soloed-out while another track solos.
+    fn gain_of(&self, i: usize) -> f64 {
+        let s = &self.tracks[i];
+        if s.mute || (self.any_solo() && !s.solo) {
+            0.0
+        } else {
+            (s.gain * self.master).max(0.0)
+        }
+    }
+    /// Track index for an audio bed's lane number (1 = A1, ≥2 = A2).
+    fn lane_track(lane: u8) -> usize {
+        if lane >= 2 {
+            MIX_A2
+        } else {
+            MIX_A1
+        }
     }
 }
 
@@ -1010,6 +1144,64 @@ fn save_presets(all: &[TitlePreset]) -> Result<(), String> {
     std::fs::write(presets_path(), json).map_err(|e| e.to_string())
 }
 
+/// The out-of-the-box title look every new card and every built-in style starts
+/// from. Callers override `text`/`at`/`dur` per instance.
+fn base_title() -> TitleItem {
+    TitleItem {
+        text: "Text".to_string(),
+        at: 0.0,
+        dur: 3.0,
+        font_size: 110.0,
+        color: "White".to_string(),
+        pos: "Middle".to_string(),
+        // Flat by default: bevel is an opt-in effect, not the default look. An
+        // outline still carries legibility on its own.
+        bevel: "Off".to_string(),
+        bevel_size: 21.0,
+        font: "Sans".to_string(),
+        align: "Centre".to_string(),
+        anim: "None".to_string(),
+        reveal: false,
+        kind: "Text".to_string(),
+        shape_w: 0.6,
+        shape_h: 0.12,
+        shape_x: 0.0,
+        // Transparent + outline: the video shows through with no opaque plate.
+        boxed: false,
+        outline: 4.0,
+        outline_color: "Black".to_string(),
+        soften: 4.0,
+        depth: 100.0,
+        angle: 120.0,
+        altitude: 30.0,
+        hi_opacity: 0.75,
+        sh_opacity: 0.75,
+        caption: false,
+        pngs: Vec::new(),
+        group: 0,
+    }
+}
+
+/// Ready-made looks offered above the user's saved presets — the starter
+/// gallery OpenShot/kdenlive ship, but built from MorReel's own knobs so every
+/// one renders through the real title engine. `restyle` keeps each card's own
+/// words and timing; only the look is copied.
+fn builtin_title_styles() -> Vec<TitlePreset> {
+    let named = |name: &str, style: TitleItem| TitlePreset { name: name.to_string(), style };
+    vec![
+        // The punchy phone caption: big, heavy outline, sat in the lower third.
+        named("Bold caption", TitleItem { font_size: 150.0, outline: 12.0, pos: "Lower third".into(), ..base_title() }),
+        // News lower-third: opaque plate instead of an outline.
+        named("Lower-third box", TitleItem { boxed: true, outline: 0.0, font_size: 90.0, pos: "Lower third".into(), ..base_title() }),
+        // The embossed look — MorReel's signature bevel, in gold.
+        named("Gold chisel", TitleItem { color: "Gold".into(), bevel: "Cameo".into(), outline: 0.0, font_size: 130.0, ..base_title() }),
+        named("Neon pop", TitleItem { color: "Cyan".into(), outline: 8.0, font_size: 130.0, ..base_title() }),
+        named("Red alert", TitleItem { color: "Red".into(), outline_color: "White".into(), outline: 6.0, font_size: 140.0, ..base_title() }),
+        // Carved into the video rather than standing off it.
+        named("Carved", TitleItem { bevel: "Intaglio".into(), outline: 0.0, font_size: 130.0, ..base_title() }),
+    ]
+}
+
 /// A named workspace arrangement. In this app the Inspector is the only panel
 /// that docks/floats/hides, so a "layout" is just its state — no per-panel
 /// registry until a second dockable panel exists (see the View menu comment).
@@ -1081,6 +1273,10 @@ struct Snapshot {
     /// media, they are just the places you want cuts to land.
     #[serde(default)]
     markers: Vec<f64>,
+    /// Track mixer (V1/A1/A2 level, mute, solo + master). Older projects load
+    /// with a flat, un-muted mixer.
+    #[serde(default)]
+    mixer: Mixer,
 }
 
 /// Whether `current` differs from the last-saved baseline JSON — the "● Edited"
@@ -1689,7 +1885,16 @@ fn Editor() -> Element {
                     // during extraction panics (AlreadyBorrowedMut → abort).
                     let next = pending.write().take();
                     let Some((p, t, fr, e, ov)) = next else { break };
-                    if let Ok(uri) = engine::frame_data_uri(&p, t, 540, 960, &fr, &e, ov).await {
+                    // Background is global (the Bg swatch sets every clip at once),
+                    // so any clip's bg is the reel's — first() is representative and
+                    // fills a "Fit" letterbox to match the export.
+                    // ponytail: reads first(), not the playhead clip; identical while
+                    // bg stays uniform, which the only bg control guarantees.
+                    let fill = clips
+                        .read()
+                        .first()
+                        .map_or("black", |c| c.transform.bg.color());
+                    if let Ok(uri) = engine::frame_data_uri_fill(&p, t, 540, 960, &fr, &e, ov, fill).await {
                         preview.set(uri);
                     }
                 }
@@ -1805,6 +2010,23 @@ fn Editor() -> Element {
         });
     };
 
+    // Rendering a PNG per keystroke makes the text field lag and fight the caret:
+    // each render finishes async and re-renders the inspector, resetting the
+    // input's value mid-type. Debounce — the caller updates the text now (cheap),
+    // the render fires once typing settles. A generation counter drops every
+    // render a newer keystroke supersedes, so only the last one runs.
+    let mut title_render_gen = use_signal(|| 0u64);
+    let mut rerender_title_soon = move |k: usize| {
+        let g = title_render_gen() + 1;
+        title_render_gen.set(g);
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            if title_render_gen() == g {
+                rerender_title(k);
+            }
+        });
+    };
+
     let start_of = move |i: usize| -> f64 {
         extents(&clips.read()).iter().take(i).sum()
     };
@@ -1864,12 +2086,14 @@ fn Editor() -> Element {
     // grid you actually want to cut on. They are snap targets, so a dragged
     // item lands on the beat instead of near it.
     let mut markers = use_signal(Vec::<f64>::new);
+    let mut mixer = use_signal(Mixer::default);
     let snapshot = move || Snapshot {
         clips: clips(),
         overlays: overlays(),
         audios: audios(),
         titles: titles(),
         markers: markers(),
+        mixer: mixer(),
     };
     // Unsaved-changes tracking. Baseline = the reel's serialized form as last
     // saved or opened; None means never saved this session. Comparing the *JSON*
@@ -1883,6 +2107,7 @@ fn Editor() -> Element {
         audios.set(s.audios);
         titles.set(s.titles);
         markers.set(s.markers);
+        mixer.set(s.mixer);
         // Indices just moved under us; a stale selection would edit the wrong item.
         selected.set(None);
         marked.write().clear();
@@ -2407,6 +2632,7 @@ fn Editor() -> Element {
             effect_amount: 1.0,
             framing: "Crop".to_string(),
             transform: engine::AnimatedTransform::default(),
+            grade: engine::Grade::default(),
             speed: 1.0,
             volume: 1.0,
             transition: "None".to_string(),
@@ -2503,6 +2729,7 @@ fn Editor() -> Element {
                         effect_amount: 1.0,
                         framing: "Crop".to_string(),
                         transform: engine::AnimatedTransform::default(),
+                        grade: engine::Grade::default(),
                         speed: 1.0,
                         proxy: String::new(),
                         group: 0,
@@ -2557,7 +2784,11 @@ fn Editor() -> Element {
                         fade_in: 0.0,
                         fade_out: 0.0,
                         denoise: 0.0,
+                        noise_floor: noise_floor_default(),
+                        track_noise: false,
                         compress: 0.0,
+                        gate: 0.0,
+                        declick: 0.0,
                         treat: "None".into(),
                         lane: bus,
                         wave: String::new(),
@@ -2608,40 +2839,7 @@ fn Editor() -> Element {
             return;
         }
         push_undo("");
-        titles.write().push(TitleItem {
-            text: "Text".to_string(),
-            at: playhead(),
-            dur: 3.0,
-            font_size: 110.0,
-            color: "White".to_string(),
-            pos: "Middle".to_string(),
-            // Flat by default: bevel is an opt-in effect in the inspector, not the
-            // out-of-the-box look. An outline still carries legibility on its own.
-            bevel: "Off".to_string(),
-            bevel_size: 21.0,
-            font: "Sans".to_string(),
-            align: "Centre".to_string(),
-            anim: "None".to_string(),
-            reveal: false,
-            kind: "Text".to_string(),
-            shape_w: 0.6,
-            shape_h: 0.12,
-            shape_x: 0.0,
-            // Transparent by default: the video shows through, and the outline
-            // carries legibility without an opaque plate.
-            boxed: false,
-            outline: 4.0,
-            outline_color: "Black".to_string(),
-            soften: 4.0,
-            depth: 100.0,
-            angle: 120.0,
-            altitude: 30.0,
-            hi_opacity: 0.75,
-            sh_opacity: 0.75,
-            caption: false,
-            pngs: Vec::new(),
-            group: 0,
-        });
+        titles.write().push(TitleItem { at: playhead(), ..base_title() });
         let k = titles.read().len() - 1;
         selected.set(Some(Sel::Title(k)));
         rerender_title(k);
@@ -2649,7 +2847,20 @@ fn Editor() -> Element {
     };
 
     let gather_specs = move || -> (Vec<ClipSpec>, Vec<OverlaySpec>, Vec<TitleSpec>, Vec<AudioSpec>) {
-        let specs = clips.read().iter().map(Clip::spec).collect();
+        // The mixer folds in once, here: V1 gain scales every clip's own audio;
+        // A1/A2 gain scales (or, when muted/soloed-out, drops) each bed. Both
+        // preview and export come through this function, so they stay in step.
+        let m = mixer();
+        let gv1 = m.gain_of(MIX_V1);
+        let specs = clips
+            .read()
+            .iter()
+            .map(Clip::spec)
+            .map(|mut s| {
+                s.volume *= gv1;
+                s
+            })
+            .collect();
         let ospecs = overlays
             .read()
             .iter()
@@ -2687,20 +2898,33 @@ fn Editor() -> Element {
         let aspecs = audios
             .read()
             .iter()
-            .map(|a| AudioSpec {
-                path: a.path.clone(),
-                in_s: a.in_s,
-                out_s: a.out_s,
-                at: a.at,
-                volume: a.volume,
-                vol_end: a.vol_end,
-                duck: a.duck,
-                fade_in: a.fade_in,
-                fade_out: a.fade_out,
-                denoise: a.denoise,
-                compress: a.compress,
-                treat: a.treat.clone(),
-                lane: a.lane,
+            .filter_map(|a| {
+                let g = m.gain_of(Mixer::lane_track(a.lane));
+                // A muted or soloed-out bed drops out of the mix entirely rather
+                // than riding along at volume 0 — fewer inputs into amix.
+                if g <= 0.0 {
+                    return None;
+                }
+                Some(AudioSpec {
+                    path: a.path.clone(),
+                    in_s: a.in_s,
+                    out_s: a.out_s,
+                    at: a.at,
+                    volume: a.volume * g,
+                    // Keep the "same as start" sentinel; a real end gain scales too.
+                    vol_end: if a.vol_end < 0.0 { -1.0 } else { a.vol_end * g },
+                    duck: a.duck,
+                    fade_in: a.fade_in,
+                    fade_out: a.fade_out,
+                    denoise: a.denoise,
+                    noise_floor: a.noise_floor,
+                    track_noise: a.track_noise,
+                    compress: a.compress,
+                    gate: a.gate,
+                    declick: a.declick,
+                    treat: a.treat.clone(),
+                    lane: a.lane,
+                })
             })
             .collect();
         (specs, ospecs, tspecs, aspecs)
@@ -3212,7 +3436,11 @@ fn Editor() -> Element {
             fade_in: 0.0,
             fade_out: 0.0,
             denoise: 0.0,
+            noise_floor: noise_floor_default(),
+            track_noise: false,
             compress: 0.0,
+            gate: 0.0,
+            declick: 0.0,
             treat: "None".into(),
             lane: 1,
             wave: wave.clone(),
@@ -3297,6 +3525,32 @@ fn Editor() -> Element {
         }
     };
 
+    // The selected element's grade, whichever lane it is on. Mirrors
+    // selected_xf so the one grade panel drives both V1 and V2.
+    let selected_grade = move || match selected() {
+        Some(Sel::Main(i)) => clips.read().get(i).map(|c| c.grade),
+        Some(Sel::Over(j)) => overlays.read().get(j).map(|o| o.grade),
+        _ => None,
+    };
+    let mut set_selected_grade = move |g: engine::Grade| {
+        let target = match selected() {
+            Some(Sel::Main(i)) if i < clips.read().len() => {
+                let mut cl = clips.write();
+                cl[i].grade = g;
+                Some((cl[i].scrub_path(), cl[i].in_s, cl[i].framing.clone(), cl[i].look()))
+            }
+            Some(Sel::Over(j)) if j < overlays.read().len() => {
+                let mut ov = overlays.write();
+                ov[j].grade = g;
+                Some((ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look()))
+            }
+            _ => None,
+        };
+        if let Some((path, at, fr, look)) = target {
+            request_preview(path, at, fr, look, engine::Over::default());
+        }
+    };
+
     // Snap the selected element's placement to the frame — or to the phone-UI
     // safe area when its guides are on — GIMP-style. Reuses the `safe_area`
     // signal as the reference toggle: aligning to the zones you can see is the
@@ -3354,6 +3608,36 @@ fn Editor() -> Element {
                 )));
             }
         });
+    };
+
+    // The Grade panel — a light primary colour correction that rides the same
+    // look() chain as the effect presets, so it is WYSIWYG. One definition
+    // serves V1 and V2: both write through the selection.
+    let grade_panel = move || {
+        let Some(g) = selected_grade() else {
+            return rsx! {};
+        };
+        rsx! {
+            h4 { class: "mr-fx-cat", "Grade" }
+            for (label, value, min, max, step, set) in grade_knobs(&g) {
+                Slider {
+                    key: "{label}",
+                    label: Some(label),
+                    min, max, step,
+                    precision: if step < 1.0 { 2 } else { 0 },
+                    value,
+                    oninput: Some(EventHandler::new(move |v: f64| {
+                        push_undo(&format!("grade-{label}"));
+                        // Read live, not the render-captured grade, so a drag
+                        // never writes back a stale sibling knob.
+                        if let Some(mut g) = selected_grade() {
+                            set(&mut g, v);
+                            set_selected_grade(g);
+                        }
+                    })),
+                }
+            }
+        }
     };
 
     // The Transform panel. A V1 clip and a V2 cutaway differ only in whether
@@ -3484,6 +3768,47 @@ fn Editor() -> Element {
         status.set("Markers cleared.".to_string());
     };
 
+    // Analyse the music bed and fill the marker grid automatically — the tap-M
+    // workflow, minus the tapping. Target is the selected A-item, else the first
+    // bed on A1. Beats become snap targets like any marker, so items drawn or
+    // dragged afterwards land on the beat.
+    let mut analyze_beats = move |_: ()| {
+        let target = match selected() {
+            Some(Sel::Aud(k)) => audios.read().get(k).cloned(),
+            _ => audios.read().iter().find(|a| a.lane == 1).cloned(),
+        };
+        let Some(a) = target else {
+            status.set("Add a music bed on A1 (or select an audio item) first.".into());
+            return;
+        };
+        status.set("Analysing music for beats…".into());
+        spawn(async move {
+            match engine::detect_beats(&a.path, a.in_s, a.out_s).await {
+                Ok((bpm, src_beats)) => {
+                    // Source seconds → timeline seconds, clipped to the item's span.
+                    let span_end = a.at + (a.out_s - a.in_s);
+                    let mut m: Vec<f64> = src_beats
+                        .into_iter()
+                        .map(|s| a.at + (s - a.in_s))
+                        .filter(|&t| t >= a.at - 1e-6 && t <= span_end + 1e-6)
+                        .collect();
+                    if m.is_empty() {
+                        status.set("No beats found in that clip.".into());
+                        return;
+                    }
+                    push_undo("");
+                    m.sort_by(f64::total_cmp);
+                    let n = m.len();
+                    markers.set(m);
+                    status.set(format!(
+                        "{n} beat markers at ~{bpm:.0} BPM — drag items to snap to them, Shift+M clears."
+                    ));
+                }
+                Err(e) => status.set(format!("Beat detection failed: {e}")),
+            }
+        });
+    };
+
     // Safe-area guides over the monitor — the portrait editor's ruler for
     // "will this caption survive the app's own buttons". (Signal declared above,
     // near the project settings that seed it.)
@@ -3523,6 +3848,7 @@ fn Editor() -> Element {
     use_shortcut(Some("T".into()), Some(EventHandler::new(move |()| toggle_handles(()))));
     use_shortcut(Some("M".into()), Some(EventHandler::new(move |()| drop_marker(()))));
     use_shortcut(Some("SHIFT+M".into()), Some(EventHandler::new(move |()| clear_markers(()))));
+    use_shortcut(Some("B".into()), Some(EventHandler::new(move |()| analyze_beats(()))));
     // The menu item binds "~"; this covers layouts where ~ is Shift+` and the
     // combo therefore arrives as SHIFT+~.
     use_shortcut(Some("SHIFT+~".into()), Some(EventHandler::new(move |()| toggle_magnet(()))));
@@ -3655,6 +3981,14 @@ fn Editor() -> Element {
     // total px travelled). `drag_moved` swallows the click after a real drag.
     let mut drag = use_signal(|| Option::<(Sel, f64, f64, f64)>::None);
     let mut drag_moved = use_signal(|| false);
+    // On-lane audio handles. Fade: (audio index, is_out, grab x, fade at grab).
+    // Volume: (audio index, grab y, volume at grab). Both are separate from the
+    // move-drag above so grabbing a corner shapes the clip instead of sliding it.
+    let mut fade_drag = use_signal(|| Option::<(usize, bool, f64, f64)>::None);
+    let mut vol_drag = use_signal(|| Option::<(usize, f64, f64)>::None);
+    // Title length: (title index, grab x, dur at grab). Separate from the move-drag
+    // so grabbing the right edge stretches the title instead of sliding it.
+    let mut len_drag = use_signal(|| Option::<(usize, f64, f64)>::None);
     // Ruler scrub: mousedown on the ruler seeks and keeps seeking while held.
     let mut scrubbing = use_signal(|| false);
 
@@ -3850,6 +4184,7 @@ fn Editor() -> Element {
                 format!("{} · 9:16", settings().title.trim())
             }),
             app_name: "MorReel Studio".to_string(),
+            system_icon: Some(system_icon_src()),
             menu: Some(rsx! {
                 MorMenuDropdown { label: "File".to_string(),
                     MenuItem {
@@ -4018,6 +4353,12 @@ fn Editor() -> Element {
                         label: "Add beat marker at playhead".to_string(),
                         shortcut: Some("M".to_string()),
                         on_action: move |_| drop_marker(()),
+                    }
+                    MenuItem {
+                        label: "Detect beats from music".to_string(),
+                        shortcut: Some("B".to_string()),
+                        disabled: audios.read().is_empty(),
+                        on_action: move |_| analyze_beats(()),
                     }
                     MenuItem {
                         label: format!("Clear {} marker(s)", markers.read().len()),
@@ -4522,9 +4863,15 @@ fn Editor() -> Element {
                             }
                             button {
                                 class: "mor-btn",
-                                title: "Browse looks for the selected V1 or V2 item",
+                                title: "Browse the effects for this workspace",
                                 onclick: move |_| show_effects.set(true),
-                                "✦ Effects"
+                                {match active_phase() {
+                                    Phase::Cut => "⇄ Transitions",
+                                    Phase::Text => "✦ Text FX",
+                                    Phase::Audio => "♪ Audio FX",
+                                    Phase::Background => "▧ Backgrounds",
+                                    _ => "✦ Effects",
+                                }}
                             }
                             button {
                                 class: "mor-btn mr-export",
@@ -4586,8 +4933,77 @@ fn Editor() -> Element {
                                 }
                             }
                         } else {
+                        // Track mixer: shown for the whole Audio phase, not tied to
+                        // a selection. Level, mute and solo per bus, plus a master.
+                        {if active_phase() == Phase::Audio {
+                            let mx = mixer();
+                            rsx! {
+                                h4 { class: "mr-fx-cat", "Mixer" }
+                                div { class: "mr-mixer",
+                                    for i in 0..3usize {
+                                        div { key: "{i}", class: "mr-mixer-row",
+                                            span { class: "mr-mixer-tag", "{MIX_LABELS[i]}" }
+                                            button {
+                                                class: if mx.tracks[i].mute { "mr-mixer-btn on m" } else { "mr-mixer-btn m" },
+                                                title: "Mute this track",
+                                                onclick: move |_| {
+                                                    push_undo("");
+                                                    let on = mixer.read().tracks[i].mute;
+                                                    mixer.write().tracks[i].mute = !on;
+                                                },
+                                                "M"
+                                            }
+                                            button {
+                                                class: if mx.tracks[i].solo { "mr-mixer-btn on s" } else { "mr-mixer-btn s" },
+                                                title: "Solo — hear only the soloed tracks",
+                                                onclick: move |_| {
+                                                    push_undo("");
+                                                    let on = mixer.read().tracks[i].solo;
+                                                    mixer.write().tracks[i].solo = !on;
+                                                },
+                                                "S"
+                                            }
+                                            input {
+                                                class: "mr-mixer-fader",
+                                                r#type: "range", min: "0", max: "2", step: "0.05",
+                                                value: "{mx.tracks[i].gain}",
+                                                onkeydown: move |evt| evt.stop_propagation(),
+                                                oninput: move |evt| {
+                                                    if let Ok(v) = evt.value().parse::<f64>() {
+                                                        push_undo(&format!("mixg{i}"));
+                                                        mixer.write().tracks[i].gain = v;
+                                                    }
+                                                },
+                                            }
+                                            span { class: "mr-mixer-val", "{(mx.tracks[i].gain * 100.0) as i32}%" }
+                                        }
+                                    }
+                                    div { class: "mr-mixer-row",
+                                        span { class: "mr-mixer-tag", "Mst" }
+                                        input {
+                                            class: "mr-mixer-fader",
+                                            r#type: "range", min: "0", max: "2", step: "0.05",
+                                            value: "{mx.master}",
+                                            onkeydown: move |evt| evt.stop_propagation(),
+                                            oninput: move |evt| {
+                                                if let Ok(v) = evt.value().parse::<f64>() {
+                                                    push_undo("mixmaster");
+                                                    mixer.write().master = v;
+                                                }
+                                            },
+                                        }
+                                        span { class: "mr-mixer-val", "{(mx.master * 100.0) as i32}%" }
+                                    }
+                                }
+                                p { class: "mor-statusbar-muted mr-export-blurb",
+                                    "V1 is every clip's own sound; A1/A2 are the beds. Solo one to audition it. Applies to preview and export alike."
+                                }
+                            }
+                        } else {
+                            rsx! {}
+                        }}
                         {match selected() {
-                            Some(Sel::Main(i)) if i < clips.read().len() => {
+                            Some(Sel::Main(i)) if i < clips.read().len() && active_phase() != Phase::Text => {
                                 let c = clips.read()[i].clone();
                                 rsx! {
                                     div { class: "mr-clip-info",
@@ -4647,6 +5063,7 @@ fn Editor() -> Element {
                                             oninput: Some(EventHandler::new(move |v: f64| set_effect_amount(v))),
                                         }
                                     }
+                                    {grade_panel()}
                                     MorSelect {
                                         label: "Framing (9:16)".to_string(),
                                         value: c.framing.clone(),
@@ -4831,7 +5248,7 @@ fn Editor() -> Element {
                                     }
                                 }
                             }
-                            Some(Sel::Over(j)) if j < overlays.read().len() => {
+                            Some(Sel::Over(j)) if j < overlays.read().len() && active_phase() != Phase::Text => {
                                 let o = overlays.read()[j].clone();
                                 rsx! {
                                     div { class: "mr-clip-info",
@@ -4937,6 +5354,7 @@ fn Editor() -> Element {
                                             oninput: Some(EventHandler::new(move |v: f64| set_effect_amount(v))),
                                         }
                                     }
+                                    {grade_panel()}
                                     MorSelect {
                                         label: "Framing (9:16)".to_string(),
                                         value: o.framing.clone(),
@@ -4987,6 +5405,10 @@ fn Editor() -> Element {
                                             if t.pngs.is_empty() { " • rendering…" }
                                         }
                                     }
+                                    div { class: "mr-toolbar mr-text-nav",
+                                        button { class: "mor-btn", onclick: move |_| selected.set(None), "← All text" }
+                                        button { class: "mor-btn", onclick: move |_| add_title(()), "＋ Add another" }
+                                    }
                                     MorSelect {
                                         label: "Card".to_string(),
                                         value: t.kind.clone(),
@@ -5025,16 +5447,27 @@ fn Editor() -> Element {
                                         }
                                     }
                                     if t.kind == "Text" {
-                                    mor_rust_dioxus_ui_kit::MorTextInput {
-                                        label: "Text (type \\n for a line break)".to_string(),
-                                        value: t.text.clone(),
-                                        onchange: move |v: String| {
-                                            if let Some(item) = titles.write().get_mut(k) {
-                                                item.text = v;
-                                                item.pngs.clear();
-                                            }
-                                            rerender_title(k);
-                                        },
+                                    // A real multi-line field: Enter makes a line break,
+                                    // no magic "\n" to type. The render is debounced and
+                                    // the old card is left on the monitor while typing, so
+                                    // the caret never fights an async re-render.
+                                    div { class: "mor-input-wrapper",
+                                        div { class: "mor-input-label", "Text — Enter for a new line" }
+                                        textarea {
+                                            class: "mor-input mr-text-area",
+                                            rows: "3",
+                                            value: "{t.text}",
+                                            // Typing must never reach the shortcut root — a
+                                            // single-letter bind would fire on each keystroke.
+                                            onkeydown: move |evt| evt.stop_propagation(),
+                                            oninput: move |evt| {
+                                                let v = evt.value();
+                                                if let Some(item) = titles.write().get_mut(k) {
+                                                    item.text = v;
+                                                }
+                                                rerender_title_soon(k);
+                                            },
+                                        }
                                     }
                                     Slider {
                                         label: Some("Position on timeline"),
@@ -5235,24 +5668,30 @@ fn Editor() -> Element {
                                             }
                                         }
                                     }
-                                    if !presets.read().is_empty() {
-                                        MorSelect {
-                                            label: "Apply a saved style".to_string(),
-                                            value: "—".to_string(),
-                                            options: std::iter::once("—".to_string())
-                                                .chain(presets.read().iter().map(|p| p.name.clone()))
-                                                .collect::<Vec<_>>(),
-                                            onchange: move |v: String| {
-                                                let found = presets.read().iter().find(|p| p.name == v).cloned();
-                                                let Some(p) = found else { return };
-                                                push_undo("");
-                                                if let Some(item) = titles.write().get_mut(k) {
-                                                    *item = restyle(item, &p.style);
-                                                }
-                                                rerender_title(k);
-                                                status.set(format!("Applied \"{}\".", p.name));
-                                            },
-                                        }
+                                    // Built-in starter looks first, then the user's
+                                    // saved styles — the gallery OpenShot/kdenlive ship,
+                                    // as a one-click list that works before you've saved
+                                    // anything of your own.
+                                    MorSelect {
+                                        label: "Apply a style".to_string(),
+                                        value: "—".to_string(),
+                                        options: std::iter::once("—".to_string())
+                                            .chain(builtin_title_styles().iter().map(|p| p.name.clone()))
+                                            .chain(presets.read().iter().map(|p| p.name.clone()))
+                                            .collect::<Vec<_>>(),
+                                        onchange: move |v: String| {
+                                            let found = builtin_title_styles()
+                                                .into_iter()
+                                                .chain(presets.read().iter().cloned())
+                                                .find(|p| p.name == v);
+                                            let Some(p) = found else { return };
+                                            push_undo("");
+                                            if let Some(item) = titles.write().get_mut(k) {
+                                                *item = restyle(item, &p.style);
+                                            }
+                                            rerender_title(k);
+                                            status.set(format!("Applied \"{}\".", p.name));
+                                        },
                                     }
                                     button {
                                         class: "mor-btn mr-reset",
@@ -5289,7 +5728,7 @@ fn Editor() -> Element {
                                     }
                                 }
                             }
-                            Some(Sel::Aud(k)) if k < audios.read().len() => {
+                            Some(Sel::Aud(k)) if k < audios.read().len() && active_phase() != Phase::Text => {
                                 let a = audios.read()[k].clone();
                                 let span = a.span();
                                 let vend = a.end_gain();
@@ -5303,6 +5742,22 @@ fn Editor() -> Element {
                                         }
                                         p { class: "mor-statusbar-muted",
                                             "Mixed under V1 from {fmt_t(a.at)} for {fmt_t(span)}."
+                                        }
+                                    }
+
+                                    // Whole-source waveform with the kept window bright
+                                    // and the trimmed ends and fade ramps shaded — the
+                                    // same picture the lane shows, sized to read here.
+                                    if !a.wave.is_empty() {
+                                        div { class: "mr-insp-wave", style: "background-image:url({a.wave});",
+                                            div { class: "mr-insp-trim", style: "left:0; width:{a.in_s / a.duration.max(0.01) * 100.0}%" }
+                                            div { class: "mr-insp-trim", style: "right:0; width:{(a.duration - a.out_s).max(0.0) / a.duration.max(0.01) * 100.0}%" }
+                                            if a.fade_in > 0.0 {
+                                                div { class: "mr-insp-fadein", style: "left:{a.in_s / a.duration.max(0.01) * 100.0}%; width:{a.fade_in / a.duration.max(0.01) * 100.0}%" }
+                                            }
+                                            if a.fade_out > 0.0 {
+                                                div { class: "mr-insp-fadeout", style: "left:{(a.out_s - a.fade_out) / a.duration.max(0.01) * 100.0}%; width:{a.fade_out / a.duration.max(0.01) * 100.0}%" }
+                                            }
                                         }
                                     }
 
@@ -5342,6 +5797,34 @@ fn Editor() -> Element {
                                     }
                                     p { class: "mor-statusbar-muted mr-export-blurb",
                                         "Start and end equal = flat gain. Differ them for a linear volume ramp across the clip."
+                                    }
+                                    div { class: "mr-toolbar",
+                                        button {
+                                            class: "mor-btn",
+                                            title: "Measure this clip and set its gain to a standard −14 LUFS loudness",
+                                            onclick: move |_| {
+                                                let (path, in_s, out_s) = match audios.read().get(k) {
+                                                    Some(a) => (a.path.clone(), a.in_s, a.out_s),
+                                                    None => return,
+                                                };
+                                                push_undo("");
+                                                status.set("Measuring loudness…".to_string());
+                                                spawn(async move {
+                                                    match engine::measure_loudness(&path, in_s, out_s).await {
+                                                        Ok(lufs) => {
+                                                            let g = engine::normalize_gain(lufs, -14.0);
+                                                            if let Some(a) = audios.write().get_mut(k) {
+                                                                a.volume = g;
+                                                                a.vol_end = -1.0;
+                                                            }
+                                                            status.set(format!("Normalized to −14 LUFS (was {lufs:.1}; gain {g:.2}×)."));
+                                                        }
+                                                        Err(e) => status.set(format!("Normalize failed: {e}")),
+                                                    }
+                                                });
+                                            },
+                                            "⚖ Normalize to −14 LUFS"
+                                        }
                                     }
                                     Slider {
                                         label: Some("Duck under video"),
@@ -5435,6 +5918,30 @@ fn Editor() -> Element {
                                             audios.write()[k].denoise = v;
                                         })),
                                     }
+                                    if a.denoise > 0.001 {
+                                        // Sensitivity: how loud a bin must be to
+                                        // count as signal. Higher = removes more.
+                                        Slider {
+                                            label: Some("Noise floor (dB)"),
+                                            min: -80.0,
+                                            max: -20.0,
+                                            step: 1.0,
+                                            precision: 0,
+                                            value: a.noise_floor,
+                                            oninput: Some(EventHandler::new(move |v: f64| {
+                                                push_undo(&format!("anf{k}"));
+                                                audios.write()[k].noise_floor = v;
+                                            })),
+                                        }
+                                        MorCheckbox {
+                                            label: "Adaptive (track the noise across the clip)".to_string(),
+                                            checked: a.track_noise,
+                                            onchange: move |on: bool| {
+                                                push_undo(&format!("atn{k}"));
+                                                audios.write()[k].track_noise = on;
+                                            },
+                                        }
+                                    }
                                     Slider {
                                         label: Some("Compression"),
                                         min: 0.0,
@@ -5450,6 +5957,40 @@ fn Editor() -> Element {
                                     if a.treat == "Podcast" {
                                         p { class: "mor-statusbar-muted mr-export-blurb",
                                             "Podcast already includes gentle compression — the slider is ignored so it doesn't double-glue."
+                                        }
+                                    }
+                                    Slider {
+                                        label: Some("Noise gate"),
+                                        min: 0.0,
+                                        max: 1.0,
+                                        step: 0.05,
+                                        precision: 2,
+                                        value: a.gate,
+                                        oninput: Some(EventHandler::new(move |v: f64| {
+                                            push_undo(&format!("agate{k}"));
+                                            audios.write()[k].gate = v;
+                                        })),
+                                    }
+                                    if a.gate > 0.001 {
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "Silences room tone between words — raise it just until the gaps go quiet, not so far it clips word tails."
+                                        }
+                                    }
+                                    Slider {
+                                        label: Some("De-click"),
+                                        min: 0.0,
+                                        max: 1.0,
+                                        step: 0.05,
+                                        precision: 2,
+                                        value: a.declick,
+                                        oninput: Some(EventHandler::new(move |v: f64| {
+                                            push_undo(&format!("adeclk{k}"));
+                                            audios.write()[k].declick = v;
+                                        })),
+                                    }
+                                    if a.declick > 0.001 {
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "Repairs clicks and pops in field audio — mouth clicks, cable crackle, edit ticks."
                                         }
                                     }
                                     button {
@@ -5544,13 +6085,48 @@ fn Editor() -> Element {
                                 }
                             }
                             _ => if active_phase() == Phase::Text {
+                                // Snapshot the T lane so the list can be clicked
+                                // without holding a read borrow across the rsx.
+                                let text_items: Vec<(usize, String, f64)> = titles
+                                    .read()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(k, t)| {
+                                        let label = if t.kind != "Text" {
+                                            t.kind.clone()
+                                        } else if t.text.trim().is_empty() {
+                                            "(empty)".to_string()
+                                        } else {
+                                            t.text.replace('\n', " ")
+                                        };
+                                        (k, label, t.at)
+                                    })
+                                    .collect();
                                 rsx! {
                                     p { class: "mor-statusbar-muted",
-                                        "Add text or a caption, then pick one on the T lane to style it here."
+                                        "Add a text card or caption, then pick one below — or on the T lane — to style it."
                                     }
                                     div { class: "mr-phase-actions",
                                         button { class: "mor-btn primary", onclick: move |_| add_title(()), "T Add text / caption" }
                                         button { class: "mor-btn", disabled: no_clips || transcribing(), onclick: move |_| auto_captions(()), "✎ Auto-caption from audio" }
+                                    }
+                                    if text_items.is_empty() {
+                                        p { class: "mor-statusbar-muted mr-text-empty",
+                                            "No text on the reel yet — add one above."
+                                        }
+                                    } else {
+                                        div { class: "mr-text-list",
+                                            for (k, label, at) in text_items {
+                                                button {
+                                                    key: "{k}",
+                                                    class: "mr-text-row",
+                                                    onclick: move |_| { selected.set(Some(Sel::Title(k))); seek_to(at); },
+                                                    span { class: "mr-ctx-tag title", "T" }
+                                                    span { class: "mr-text-row-label", "{label}" }
+                                                    span { class: "mr-text-row-time", "{fmt_t(at)}" }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             } else if active_phase() == Phase::Audio {
@@ -5623,6 +6199,41 @@ fn Editor() -> Element {
                             ));
                             return;
                         }
+                        // Fade corner: horizontal drag away from the edge grows
+                        // the fade; toward it shrinks. Capped at half the span so
+                        // in and out can't cross.
+                        if let Some((k, is_out, grab_x, at_grab)) = fade_drag() {
+                            let dt = (p.x - grab_x) / calc_scale();
+                            let mut au = audios.write();
+                            if let Some(a) = au.get_mut(k) {
+                                let cap = a.span() * 0.49;
+                                let v = if is_out { at_grab - dt } else { at_grab + dt };
+                                let v = v.clamp(0.0, cap);
+                                if is_out { a.fade_out = v } else { a.fade_in = v }
+                            }
+                            return;
+                        }
+                        // Volume line: drag up = louder. ~180px sweeps the full
+                        // 0..2 range, which feels neither twitchy nor sluggish.
+                        if let Some((k, grab_y, at_grab)) = vol_drag() {
+                            let g = (at_grab - (p.y - grab_y) / 90.0).clamp(0.0, 2.0);
+                            let mut au = audios.write();
+                            if let Some(a) = au.get_mut(k) {
+                                a.volume = g;
+                                if a.vol_end >= 0.0 {
+                                    a.vol_end = g;
+                                }
+                            }
+                            return;
+                        }
+                        // Title length: drag the right edge to stretch or shorten.
+                        if let Some((k, grab_x, dur_at)) = len_drag() {
+                            let dt = (p.x - grab_x) / calc_scale();
+                            if let Some(t) = titles.write().get_mut(k) {
+                                t.dur = (dur_at + dt).max(0.3);
+                            }
+                            return;
+                        }
                         let Some((target, last_x, t0, acc)) = drag() else { return };
                         let dx = p.x - last_x;
                         if dx == 0.0 {
@@ -5690,12 +6301,23 @@ fn Editor() -> Element {
                                 drag_moved.set(true); // swallow the click that follows
                             }
                         }
+                        // A completed handle drag also swallows the trailing click
+                        // so it doesn't re-seek the playhead to the clip start.
+                        if fade_drag().is_some() || vol_drag().is_some() || len_drag().is_some() {
+                            drag_moved.set(true);
+                        }
                         drag.set(None);
+                        fade_drag.set(None);
+                        vol_drag.set(None);
+                        len_drag.set(None);
                         pan.set(None);
                         scrubbing.set(false);
                     },
                     onmouseleave: move |_| {
                         drag.set(None);
+                        fade_drag.set(None);
+                        vol_drag.set(None);
+                        len_drag.set(None);
                         pan.set(None);
                         scrubbing.set(false);
                     },
@@ -5783,6 +6405,17 @@ fn Editor() -> Element {
                                                     selected.set(Some(Sel::Title(k)));
                                                     open_ctx(evt, Ctx::Title(k));
                                                 },
+                                                // Right-edge grip: drag to stretch or shorten the title.
+                                                div {
+                                                    class: "mr-len-grip",
+                                                    title: "Drag to change how long the title shows",
+                                                    onmousedown: move |evt| {
+                                                        evt.stop_propagation();
+                                                        push_undo(&format!("tlen{k}"));
+                                                        let d = titles.read().get(k).map_or(3.0, |t| t.dur);
+                                                        len_drag.set(Some((k, evt.client_coordinates().x, d)));
+                                                    },
+                                                }
                                                 if t.group != 0 {
                                                     span { class: "mr-group-dot", style: "background: hsl({(t.group * 67) % 360}, 70%, 60%)" }
                                                 }
@@ -5978,10 +6611,51 @@ fn Editor() -> Element {
                                                         selected.set(Some(Sel::Aud(k)));
                                                         open_ctx(evt, Ctx::Aud(k));
                                                     },
+                                                    // Fade ramps drawn as shaded wedges — dark at the
+                                                    // silent edge, clear where the bed is at full level.
+                                                    if a.fade_in > 0.0 {
+                                                        div { class: "mr-fade-in", style: "width: {a.fade_in * scale}px" }
+                                                    }
+                                                    if a.fade_out > 0.0 {
+                                                        div { class: "mr-fade-out", style: "width: {a.fade_out * scale}px" }
+                                                    }
+                                                    // Volume line: drag up/down to set the bed's level.
+                                                    div {
+                                                        class: "mr-vol-line",
+                                                        style: "bottom: {a.volume / 2.0 * 100.0}%",
+                                                        title: "Drag up or down to set volume",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            push_undo(&format!("avol{k}"));
+                                                            let g = audios.read().get(k).map_or(1.0, |a| a.volume);
+                                                            vol_drag.set(Some((k, evt.client_coordinates().y, g)));
+                                                        },
+                                                    }
+                                                    // Corner grips: drag inward to fade from/to silence.
+                                                    div {
+                                                        class: "mr-fade-grip in",
+                                                        title: "Drag right to fade in",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            push_undo(&format!("afin{k}"));
+                                                            let v = audios.read().get(k).map_or(0.0, |a| a.fade_in);
+                                                            fade_drag.set(Some((k, false, evt.client_coordinates().x, v)));
+                                                        },
+                                                    }
+                                                    div {
+                                                        class: "mr-fade-grip out",
+                                                        title: "Drag left to fade out",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            push_undo(&format!("afout{k}"));
+                                                            let v = audios.read().get(k).map_or(0.0, |a| a.fade_out);
+                                                            fade_drag.set(Some((k, true, evt.client_coordinates().x, v)));
+                                                        },
+                                                    }
                                                     if a.group != 0 {
                                                         span { class: "mr-group-dot", style: "background: hsl({(a.group * 67) % 360}, 70%, 60%)" }
                                                     }
-                                                    if a.fade_in > 0.0 || a.fade_out > 0.0 || a.duck > 0.0 || a.denoise > 0.0 || a.treat != "None" {
+                                                    if a.fade_in > 0.0 || a.fade_out > 0.0 || a.duck > 0.0 || a.denoise > 0.0 || a.gate > 0.0 || a.declick > 0.0 || a.treat != "None" {
                                                         span { class: "mr-audio-fx", title: "Processing or fades active", "✦" }
                                                     }
                                                     "♪ {a.name}"
@@ -6464,56 +7138,159 @@ fn Editor() -> Element {
         }
         Modal {
             open: show_effects,
-            title: "Effects palette".to_string(),
+            title: match active_phase() {
+                Phase::Cut => "Transitions".to_string(),
+                Phase::Text => "Text effects".to_string(),
+                Phase::Audio => "Audio effects".to_string(),
+                Phase::Background => "Backgrounds".to_string(),
+                _ => "Effects palette".to_string(),
+            },
             style: "min-width:480px; max-width:720px;".to_string(),
             {
-                let cur = match selected() {
-                    Some(Sel::Main(i)) => clips.read().get(i).map(|c| (c.effect.clone(), c.effect_amount)),
-                    Some(Sel::Over(j)) => overlays.read().get(j).map(|o| (o.effect.clone(), o.effect_amount)),
-                    _ => None,
-                };
-                match cur {
-                    Some((current, amount)) => {
-                        let thumbs = fx_thumbs();
-                        let cats = {
-                            let mut v: Vec<&str> = Vec::new();
-                            for &(c, _, _) in EFFECTS {
-                                if !v.contains(&c) {
-                                    v.push(c);
-                                }
-                            }
-                            v
+                // Each workspace browses its own effect family: filters in Style,
+                // transitions in Cut, entrances in Text, EQ in Audio, colours in
+                // Background. Same apply-paths as the inline inspector controls.
+                match active_phase() {
+                    Phase::Cut => {
+                        let sel = match selected() {
+                            Some(Sel::Main(i)) if i > 0 && i < clips.read().len() => Some(i),
+                            _ => None,
                         };
-                        rsx! {
-                            div { class: "mr-fx-dialog",
-                                p { class: "mor-statusbar-muted mr-export-blurb",
-                                    "Looks apply to the selected V1 clip or V2 overlay. Motion looks animate as you scrub."
-                                }
-                                if current != "None" {
-                                    Slider {
-                                        label: Some("Effect strength"),
-                                        min: 0.0,
-                                        max: 1.0,
-                                        step: 0.05,
-                                        precision: 2,
-                                        value: amount,
-                                        oninput: Some(EventHandler::new(move |v: f64| set_effect_amount(v))),
+                        match sel {
+                            Some(i) => {
+                                let current = clips.read()[i].transition.clone();
+                                rsx! {
+                                    div { class: "mr-fx-dialog",
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "How the selected clip eases in from the one before it. A crossfade overlaps them, so the reel gets a little shorter."
+                                        }
+                                        div { class: "mr-fx-grid",
+                                            for (label, _) in engine::TRANSITIONS.iter().copied() {
+                                                button {
+                                                    key: "{label}",
+                                                    class: if current == label { "mr-fx-tile active" } else { "mr-fx-tile" },
+                                                    onclick: move |_| {
+                                                        push_undo("");
+                                                        let old = spans();
+                                                        clips.write()[i].transition = label.to_string();
+                                                        ride(old, &|k| Some(start_of(k)));
+                                                        seek_to(playhead().min(total_of()));
+                                                    },
+                                                    div { class: "mr-fx-ph" }
+                                                    span { "{label}" }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                for cat in cats {
-                                    h4 { class: "mr-fx-cat", "{cat}" }
-                                    div { class: "mr-fx-grid",
-                                        for (_, name, _) in EFFECTS.iter().copied().filter(move |&(c, _, _)| c == cat) {
-                                            button {
-                                                key: "{name}",
-                                                class: if current == name { "mr-fx-tile active" } else { "mr-fx-tile" },
-                                                onclick: move |_| apply_effect(name.to_string()),
-                                                if let Some(uri) = thumbs.get(name) {
-                                                    img { src: "{uri}" }
-                                                } else {
+                            }
+                            None => rsx! {
+                                p { class: "mor-statusbar-muted",
+                                    "Select a V1 clip other than the first — a transition joins it to the clip before it."
+                                }
+                            },
+                        }
+                    }
+                    Phase::Text => {
+                        let sel = match selected() {
+                            Some(Sel::Title(k)) if k < titles.read().len() => Some(k),
+                            _ => None,
+                        };
+                        match sel {
+                            Some(k) => {
+                                let current = titles.read()[k].anim.clone();
+                                rsx! {
+                                    div { class: "mr-fx-dialog",
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "How the selected text card arrives on screen."
+                                        }
+                                        div { class: "mr-fx-grid",
+                                            for name in engine::TITLE_ANIMS.iter().copied() {
+                                                button {
+                                                    key: "{name}",
+                                                    class: if current == name { "mr-fx-tile active" } else { "mr-fx-tile" },
+                                                    onclick: move |_| {
+                                                        push_undo("");
+                                                        titles.write()[k].anim = name.to_string();
+                                                    },
                                                     div { class: "mr-fx-ph" }
+                                                    span { "{name}" }
                                                 }
-                                                span { "{name}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => rsx! {
+                                p { class: "mor-statusbar-muted",
+                                    "Select a text card on the T lane to give it an entrance."
+                                }
+                            },
+                        }
+                    }
+                    Phase::Audio => {
+                        let sel = match selected() {
+                            Some(Sel::Aud(k)) if k < audios.read().len() => Some(k),
+                            _ => None,
+                        };
+                        match sel {
+                            Some(k) => {
+                                let current = audios.read()[k].treat.clone();
+                                rsx! {
+                                    div { class: "mr-fx-dialog",
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "Voice shaping and EQ for the selected bed. Same in preview and export."
+                                        }
+                                        div { class: "mr-fx-grid",
+                                            for name in engine::AUDIO_TREATS.iter().copied() {
+                                                button {
+                                                    key: "{name}",
+                                                    class: if current == name { "mr-fx-tile active" } else { "mr-fx-tile" },
+                                                    onclick: move |_| {
+                                                        push_undo("");
+                                                        audios.write()[k].treat = name.to_string();
+                                                    },
+                                                    div { class: "mr-fx-ph" }
+                                                    span { "{name}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => rsx! {
+                                p { class: "mor-statusbar-muted",
+                                    "Select an A1 or A2 clip to shape its sound."
+                                }
+                            },
+                        }
+                    }
+                    Phase::Background => {
+                        if clips.read().is_empty() {
+                            rsx! {
+                                p { class: "mor-statusbar-muted",
+                                    "Add a clip first — the background shows wherever the picture doesn't fill the 9:16 frame."
+                                }
+                            }
+                        } else {
+                            let current = clips.read().first().map(|c| c.transform.bg);
+                            rsx! {
+                                div { class: "mr-fx-dialog",
+                                    p { class: "mor-statusbar-muted mr-export-blurb",
+                                        "The colour behind a banded or shrunk clip. Applies to the whole reel."
+                                    }
+                                    div { class: "mr-fx-grid",
+                                        for b in engine::Bg::ALL {
+                                            button {
+                                                key: "{b.label()}",
+                                                class: if current == Some(b) { "mr-fx-tile active" } else { "mr-fx-tile" },
+                                                onclick: move |_| {
+                                                    push_undo("bg");
+                                                    for c in clips.write().iter_mut() { c.transform.bg = b; }
+                                                    seek_to(playhead());
+                                                },
+                                                div { class: "mr-fx-ph", style: "background: {b.color()}" }
+                                                span { "{b.label()}" }
                                             }
                                         }
                                     }
@@ -6521,11 +7298,69 @@ fn Editor() -> Element {
                             }
                         }
                     }
-                    None => rsx! {
-                        p { class: "mor-statusbar-muted",
-                            "Effects apply to video — select a V1 clip or V2 overlay on the timeline, then open this palette again. Motion looks are ports of moranima's camera moves."
+                    // Style (and the non-editing steps) browse the video look filters.
+                    _ => {
+                        let cur = match selected() {
+                            Some(Sel::Main(i)) => clips.read().get(i).map(|c| (c.effect.clone(), c.effect_amount)),
+                            Some(Sel::Over(j)) => overlays.read().get(j).map(|o| (o.effect.clone(), o.effect_amount)),
+                            _ => None,
+                        };
+                        match cur {
+                            Some((current, amount)) => {
+                                let thumbs = fx_thumbs();
+                                let cats = {
+                                    let mut v: Vec<&str> = Vec::new();
+                                    for &(c, _, _) in EFFECTS {
+                                        if !v.contains(&c) {
+                                            v.push(c);
+                                        }
+                                    }
+                                    v
+                                };
+                                rsx! {
+                                    div { class: "mr-fx-dialog",
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            "Looks apply to the selected V1 clip or V2 overlay. Motion looks animate as you scrub."
+                                        }
+                                        if current != "None" {
+                                            Slider {
+                                                label: Some("Effect strength"),
+                                                min: 0.0,
+                                                max: 1.0,
+                                                step: 0.05,
+                                                precision: 2,
+                                                value: amount,
+                                                oninput: Some(EventHandler::new(move |v: f64| set_effect_amount(v))),
+                                            }
+                                        }
+                                        for cat in cats {
+                                            h4 { class: "mr-fx-cat", "{cat}" }
+                                            div { class: "mr-fx-grid",
+                                                for (_, name, _) in EFFECTS.iter().copied().filter(move |&(c, _, _)| c == cat) {
+                                                    button {
+                                                        key: "{name}",
+                                                        class: if current == name { "mr-fx-tile active" } else { "mr-fx-tile" },
+                                                        onclick: move |_| apply_effect(name.to_string()),
+                                                        if let Some(uri) = thumbs.get(name) {
+                                                            img { src: "{uri}" }
+                                                        } else {
+                                                            div { class: "mr-fx-ph" }
+                                                        }
+                                                        span { "{name}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            None => rsx! {
+                                p { class: "mor-statusbar-muted",
+                                    "Effects apply to video — select a V1 clip or V2 overlay on the timeline, then open this palette again. Motion looks are ports of moranima's camera moves."
+                                }
+                            },
                         }
-                    },
+                    }
                 }
             }
         }
@@ -6577,6 +7412,7 @@ fn Editor() -> Element {
                     ("G", "Toggle safe-area guides (phone UI zones)"),
                     ("T", "Toggle on-screen transform handles"),
                     ("M / Shift+M", "Drop a beat marker at the playhead / clear them all"),
+                    ("B", "Detect beats from the music bed → fill markers"),
                     ("Home / End", "Jump to start / end"),
                     ("Ctrl+O", "Add clips"),
                     ("Ctrl+Shift+O / Ctrl+S", "Open / save project"),
@@ -6939,7 +7775,7 @@ const APP_CSS: &str = r#"
 .mr-xf-e.tall { width: 17px; height: 9px; margin: -5px 0 0 -9px; cursor: ns-resize; }
 .mr-xf-rot {
   position: absolute; width: 13px; height: 13px; margin: -22px 0 0 -7px; box-sizing: border-box;
-  background: radial-gradient(circle at 35% 30%, #fff6c8, var(--mor-warning) 55%, #a07820);
+  background: radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--mor-warning) 35%, white), var(--mor-warning) 55%, color-mix(in srgb, var(--mor-warning) 55%, black));
   border: 1px solid #0f0f12; border-radius: 50%;
   pointer-events: auto; cursor: grab;
   box-shadow: 0 1px 3px rgba(0,0,0,0.6), 0 0 8px color-mix(in srgb, var(--mor-warning) 45%, transparent);
@@ -6982,9 +7818,7 @@ const APP_CSS: &str = r#"
 .mr-deck {
   display: flex; justify-content: center; align-items: baseline; gap: 7px;
   margin-bottom: 4px; padding: 5px 14px 6px;
-  background: linear-gradient(180deg, rgba(18, 18, 26, 0.72), rgba(8, 8, 12, 0.78));
-  backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.25);
-  -webkit-backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.25);
+  background: linear-gradient(180deg, #12121a, #08080c);
   border: 1px solid color-mix(in srgb, var(--mor-accent) 35%, var(--mor-border));
   border-radius: 8px;
   box-shadow:
@@ -7133,6 +7967,15 @@ const APP_CSS: &str = r#"
   border-color: var(--mor-accent);
   box-shadow: 0 0 14px color-mix(in srgb, var(--mor-accent) 28%, transparent);
 }
+/* The title text field is a textarea; inherit the input look, allow wrapping
+   and a vertical drag to grow, and keep the editor font rather than monospace. */
+.mr-text-area {
+  min-height: 3.4em;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
 .mr-status-click { cursor: pointer; }
 .mr-status-click:hover { filter: brightness(1.1); }
 .mr-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -7144,7 +7987,7 @@ const APP_CSS: &str = r#"
 .mr-toolbar .mr-export:hover:not(:disabled) {
   border-color: var(--mor-warning);
   box-shadow: 0 0 12px color-mix(in srgb, var(--mor-warning) 30%, transparent);
-  color: #fff4c8;
+  color: color-mix(in srgb, var(--mor-warning) 25%, white);
 }
 .mr-field-row {
   display: flex; align-items: flex-end; gap: 8px;
@@ -7191,7 +8034,7 @@ const APP_CSS: &str = r#"
   color: #141417;
 }
 .mr-add-tag.audio { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
-.mr-add-tag.title { background: linear-gradient(180deg, #f0d078, var(--mor-warning)); }
+.mr-add-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
 .mr-add-extra { justify-content: flex-start; }
 .mr-fx-dialog { display: flex; flex-direction: column; gap: 8px; }
 
@@ -7294,6 +8137,36 @@ const APP_CSS: &str = r#"
 }
 .mr-phase-actions { display: flex; flex-direction: column; gap: 8px; }
 .mr-phase-actions .mor-btn { width: 100%; }
+
+/* Text workspace: browse the T lane as a pick-to-edit list. */
+.mr-text-nav { margin: 2px 0 6px; }
+.mr-text-nav .mor-btn { flex: 1; font-size: 12px; }
+.mr-text-empty { margin-top: 12px; opacity: 0.8; }
+.mr-text-list { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+.mr-text-row {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 10px; text-align: left; cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
+  border-radius: 8px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-btn) 92%, white), var(--mor-btn));
+  color: var(--mor-text);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
+  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.14s ease, filter 0.14s ease;
+}
+.mr-text-row:hover {
+  border-color: var(--mor-accent);
+  transform: translateX(2px);
+  filter: brightness(1.05);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3), 0 0 12px color-mix(in srgb, var(--mor-accent) 22%, transparent);
+}
+.mr-text-row-label {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px;
+}
+.mr-text-row-time {
+  flex: none; font-size: 11px; color: var(--mor-text-muted);
+  font-variant-numeric: tabular-nums;
+}
 /* Style sub-tabs sit above the panel's controls with a little room. */
 .mr-inspector .mor-tabs { margin: 4px 0 12px; }
 /* Band presets + background swatches. */
@@ -7389,7 +8262,7 @@ const APP_CSS: &str = r#"
   color: #141417; pointer-events: none;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
 }
-.mr-lane-tag.title { background: linear-gradient(180deg, #f0d078, var(--mor-warning)); }
+.mr-lane-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
 .mr-lane-a1 .mr-lane-tag { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
 /* Taller audio lanes so the waveform envelope has room to read and is an easier
    drag/trim target. */
@@ -7400,6 +8273,77 @@ const APP_CSS: &str = r#"
   text-shadow: 0 0 6px color-mix(in srgb, var(--mor-accent) 50%, transparent);
   pointer-events: none;
 }
+
+/* On-lane audio handles: fade wedges, corner grips, a volume line. */
+.mr-fade-in, .mr-fade-out {
+  position: absolute; top: 0; bottom: 0; z-index: 2; pointer-events: none;
+}
+.mr-fade-in { left: 0; background: linear-gradient(to right, rgba(0,0,0,0.6), transparent); }
+.mr-fade-out { right: 0; background: linear-gradient(to left, rgba(0,0,0,0.6), transparent); }
+.mr-fade-grip {
+  position: absolute; top: 0; bottom: 0; width: 9px; z-index: 4;
+  cursor: ew-resize; opacity: 0; transition: opacity 0.15s ease;
+  background: color-mix(in srgb, var(--mor-success) 70%, white);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-success) 60%, transparent);
+}
+.mr-fade-grip.in { left: 0; border-radius: 5px 0 0 5px; }
+.mr-fade-grip.out { right: 0; border-radius: 0 5px 5px 0; }
+.mr-lane-item.audio:hover .mr-fade-grip { opacity: 0.55; }
+.mr-fade-grip:hover { opacity: 0.95 !important; }
+.mr-len-grip {
+  position: absolute; top: 0; bottom: 0; right: 0; width: 9px; z-index: 4;
+  cursor: ew-resize; opacity: 0; transition: opacity 0.15s ease;
+  border-radius: 0 5px 5px 0;
+  background: color-mix(in srgb, var(--mor-title, gold) 75%, white);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-title, gold) 60%, transparent);
+}
+.mr-lane-item.title:hover .mr-len-grip { opacity: 0.6; }
+.mr-len-grip:hover { opacity: 0.95 !important; }
+.mr-vol-line {
+  position: absolute; left: 0; right: 0; height: 3px; z-index: 3;
+  margin-bottom: -1.5px; cursor: ns-resize;
+  background: color-mix(in srgb, var(--mor-warning) 85%, white);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--mor-warning) 70%, transparent);
+  opacity: 0.35; transition: opacity 0.15s ease;
+}
+.mr-lane-item.audio:hover .mr-vol-line { opacity: 0.85; }
+.mr-vol-line:hover { opacity: 1; height: 4px; }
+
+/* Track mixer strip in the Audio inspector. */
+.mr-mixer { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
+.mr-mixer-row { display: flex; align-items: center; gap: 8px; }
+.mr-mixer-tag {
+  flex: none; width: 26px; font-size: 10px; font-weight: 600; letter-spacing: 0.5px;
+  color: var(--mor-text-muted); text-align: center;
+}
+.mr-mixer-fader { flex: 1; min-width: 0; }
+.mr-mixer-btn {
+  flex: none; width: 22px; height: 20px; border-radius: 4px; font-size: 10px;
+  font-weight: 700; cursor: pointer; line-height: 1;
+  border: 1px solid var(--mor-border-light);
+  background: color-mix(in srgb, var(--mor-panel) 88%, white);
+  color: var(--mor-text-muted);
+}
+.mr-mixer-btn.on.m {
+  background: var(--mor-danger); border-color: var(--mor-danger); color: #140b0b;
+}
+.mr-mixer-btn.on.s {
+  background: var(--mor-warning); border-color: var(--mor-warning); color: #141002;
+}
+.mr-mixer-val { flex: none; width: 34px; font-size: 10px; text-align: right; color: var(--mor-text-muted); }
+
+/* Inspector waveform: whole source, kept window bright, trims/fades shaded. */
+.mr-insp-wave {
+  position: relative; height: 46px; width: 100%; margin: 6px 0 2px;
+  border-radius: 5px; background-repeat: no-repeat; background-size: 100% 100%;
+  background-color: color-mix(in srgb, #061412 75%, var(--mor-success));
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--mor-success) 35%, transparent),
+    inset 0 -6px 10px color-mix(in srgb, var(--mor-success) 18%, transparent);
+}
+.mr-insp-trim { position: absolute; top: 0; bottom: 0; background: rgba(0,0,0,0.58); }
+.mr-insp-fadein { position: absolute; top: 0; bottom: 0; background: linear-gradient(to right, rgba(0,0,0,0.5), transparent); }
+.mr-insp-fadeout { position: absolute; top: 0; bottom: 0; background: linear-gradient(to left, rgba(0,0,0,0.5), transparent); }
 
 /* Lane items: embossed inventory-slot feel. */
 .mr-lane-item {
@@ -7557,7 +8501,7 @@ const APP_CSS: &str = r#"
   color: #141417;
 }
 .mr-ctx-tag.audio { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
-.mr-ctx-tag.title { background: linear-gradient(180deg, #f0d078, var(--mor-warning)); }
+.mr-ctx-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
 .mr-ctx-name {
   font-size: 11px; color: var(--mor-text-muted);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -7670,8 +8614,10 @@ const APP_CSS: &str = r#"
     transition: none !important; animation: none !important;
   }
   .mr-drop, .mr-deck.playing, .mr-progress > div, .mr-float-panel { animation: none !important; }
+  .mr-text-row { transition: none !important; }
   .mr-root .mor-btn:hover:not(:disabled),
-  .mr-fx-tile:hover, .mr-add-card:hover:not(:disabled) { transform: none; }
+  .mr-fx-tile:hover, .mr-add-card:hover:not(:disabled),
+  .mr-text-row:hover { transform: none; }
 }
 "#;
 
@@ -7691,6 +8637,7 @@ mod tests {
             effect_amount: 1.0,
             framing: "Crop".to_string(),
             transform: engine::AnimatedTransform::default(),
+            grade: engine::Grade::default(),
             speed: 1.0,
             volume: 1.0,
             transition: "None".to_string(),
@@ -7749,6 +8696,28 @@ mod tests {
         assert!(fade_in(&greedy, 1) < 1.0, "not clamped: {}", fade_in(&greedy, 1));
         assert!(extents(&greedy).iter().all(|d| *d > 0.0), "{:?}", extents(&greedy));
         assert!(extents(&greedy).iter().sum::<f64>() > 0.0);
+    }
+
+    #[test]
+    fn builtin_styles_use_real_palette_values_and_keep_the_words() {
+        let colors: Vec<&str> = TITLE_COLORS.iter().map(|(n, _)| *n).collect();
+        let bevels: Vec<&str> = BEVELS.iter().map(|(v, _)| *v).collect();
+        let positions: Vec<&str> = TITLE_POS.iter().map(|(n, _)| *n).collect();
+        let builtins = builtin_title_styles();
+        assert!(builtins.len() >= 4, "expected a real gallery");
+        for p in &builtins {
+            // A typo here would silently fall back to white / no bevel / mid.
+            assert!(colors.contains(&p.style.color.as_str()), "{}: bad colour {}", p.name, p.style.color);
+            assert!(colors.contains(&p.style.outline_color.as_str()), "{}: bad outline colour", p.name);
+            assert!(bevels.contains(&p.style.bevel.as_str()), "{}: bad bevel {}", p.name, p.style.bevel);
+            assert!(positions.contains(&p.style.pos.as_str()), "{}: bad position {}", p.name, p.style.pos);
+        }
+        // Applying a style keeps the card's own words and timing, takes the look.
+        let card = TitleItem { text: "Keep me".into(), at: 4.0, dur: 9.0, ..base_title() };
+        let styled = restyle(&card, &builtins[0].style);
+        assert_eq!(styled.text, "Keep me");
+        assert_eq!((styled.at, styled.dur), (4.0, 9.0));
+        assert_eq!(styled.outline, builtins[0].style.outline);
     }
 
     #[test]
@@ -8062,7 +9031,7 @@ mod tests {
 
     #[test]
     fn dirty_tracks_disk_state_not_runtime_fields() {
-        let empty = Snapshot { clips: vec![], overlays: vec![], audios: vec![], titles: vec![], markers: vec![] };
+        let empty = Snapshot { clips: vec![], overlays: vec![], audios: vec![], titles: vec![], markers: vec![], mixer: Mixer::default() };
         // Never saved: empty is clean, any content is unsaved.
         assert!(!timeline_dirty(&empty, None));
         let mut one = empty.clone();
@@ -8117,6 +9086,7 @@ mod tests {
             audios: vec![],
             titles: vec![title],
             markers: vec![],
+            mixer: Mixer::default(),
         };
 
         let doc: serde_json::Value = serde_json::from_str(&snapshot_to_otio(&snap, "reel", 30.0)).unwrap();
@@ -8174,7 +9144,7 @@ mod tests {
         c.volume = 0.25;
         c.thumb = "data:image/jpeg;base64,AAAA".to_string(); // derived, must not persist
         c.proxy = "/cache/proxy.mp4".to_string();
-        let snap = Snapshot { clips: vec![c], overlays: vec![], audios: vec![], titles: vec![], markers: vec![2.5] };
+        let snap = Snapshot { clips: vec![c], overlays: vec![], audios: vec![], titles: vec![], markers: vec![2.5], mixer: Mixer::default() };
 
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("base64"), "thumbnail leaked into the project file");

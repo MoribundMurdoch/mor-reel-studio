@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=MorReel Studio
+GenericName=Portrait Video Editor
+Comment=Portrait-only (9:16) video editor for phone reels
+Exec=morreel-studio
+Icon=morreel-studio
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+Keywords=reel;portrait;video;editor;ffmpeg;shorts;tiktok;
+StartupWMClass=morreel-studio
+MimeType=application/x-morreel;
