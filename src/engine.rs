@@ -2,6 +2,7 @@
 // engine.rs — MorReel's media engine: the ffmpeg/ffprobe CLIs.
 // Same split kdenlive (MLT) and openshot (libopenshot) use, minus the C++ library.
 
+use crate::keyframe::{Animated, Interp, Key};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -18,6 +19,40 @@ const FPS: u32 = 30;
 /// look effects, so it composes with both.
 // ponytail: no anchor point. It only earns its keep once rotation can be
 // keyframed, and nothing here animates yet.
+/// The colour that fills the frame wherever a clip doesn't cover it — behind a
+/// shrunk or banded clip on V1 (a landscape band with a coloured surround is the
+/// reel look). A `Copy` enum, not a `String`, so `Transform` stays `Copy` and
+/// every caller that builds one is unaffected.
+#[derive(Clone, Copy, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum Bg {
+    #[default]
+    Black,
+    White,
+    Charcoal,
+    Gray,
+}
+
+impl Bg {
+    pub const ALL: [Bg; 4] = [Bg::Black, Bg::White, Bg::Charcoal, Bg::Gray];
+    /// ffmpeg pad colour.
+    pub fn color(self) -> &'static str {
+        match self {
+            Bg::Black => "black",
+            Bg::White => "white",
+            Bg::Charcoal => "#14141c",
+            Bg::Gray => "#8a8a8a",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Bg::Black => "Black",
+            Bg::White => "White",
+            Bg::Charcoal => "Charcoal",
+            Bg::Gray => "Gray",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Transform {
     /// The master size, the way Final Cut's "Scale All" works: 1.0 fills the
@@ -47,9 +82,21 @@ pub struct Transform {
     #[serde(default)]
     pub rotation: f64,
     /// Only means anything where the layer composites over something else — a
-    /// V2 cutaway over V1. On V1 there is nothing underneath but black.
+    /// V2 cutaway over V1. On V1 there is nothing underneath but the background.
     #[serde(default = "unit")]
     pub opacity: f64,
+    /// What fills the frame where the picture doesn't reach (V1 only). Ignored
+    /// when the transform covers the whole frame — no padding, nothing to fill.
+    #[serde(default)]
+    pub bg: Bg,
+    /// Fill the scaled box by cover-cropping the picture undistorted instead of
+    /// stretching it to fit. What makes a landscape band show real footage rather
+    /// than a vertically-squished frame: the box is still `scale_x`×`scale_y`, but
+    /// the picture inside keeps its aspect and the overflow is cropped. Off by
+    /// default, so a free Stretch (`scale_x` ≠ `scale_y`) still distorts on purpose
+    /// and old projects load exactly as saved.
+    #[serde(default)]
+    pub cover: bool,
 }
 
 fn unit() -> f64 {
@@ -68,7 +115,189 @@ impl Default for Transform {
             y: 0.0,
             rotation: 0.0,
             opacity: 1.0,
+            bg: Bg::Black,
+            cover: false,
         }
+    }
+}
+
+/// The animatable form of [`Transform`]: every numeric field is an
+/// [`Animated<f64>`]. A still clip stores plain scalars — byte-identical to the
+/// old static `Transform` on disk, since a constant serialises as the bare number
+/// — and only a field the user keyframes grows into a curve. Flip flags don't
+/// animate; a mirror is a cut, not a move.
+///
+/// The editor works on a single static pose ([`pose`](AnimatedTransform::pose) /
+/// [`set_pose`](AnimatedTransform::set_pose)); the engine samples the whole thing
+/// to a `Transform` at a given time via [`at`](AnimatedTransform::at). Both
+/// preview and export build their chain from a sampled `Transform`, so the
+/// preview == export invariant holds field-for-field.
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AnimatedTransform {
+    #[serde(default = "anim_one")]
+    pub scale: Animated<f64>,
+    #[serde(default = "anim_one")]
+    pub scale_x: Animated<f64>,
+    #[serde(default = "anim_one")]
+    pub scale_y: Animated<f64>,
+    #[serde(default)]
+    pub flip_h: bool,
+    #[serde(default)]
+    pub flip_v: bool,
+    #[serde(default = "anim_zero")]
+    pub x: Animated<f64>,
+    #[serde(default = "anim_zero")]
+    pub y: Animated<f64>,
+    #[serde(default = "anim_zero")]
+    pub rotation: Animated<f64>,
+    #[serde(default = "anim_one")]
+    pub opacity: Animated<f64>,
+    /// Frame background — not animated, a colour is a colour.
+    #[serde(default)]
+    pub bg: Bg,
+    /// Cover-crop the box instead of stretching — not animated, a fit is a fit.
+    #[serde(default)]
+    pub cover: bool,
+}
+
+fn anim_one() -> Animated<f64> {
+    Animated::Const(1.0)
+}
+fn anim_zero() -> Animated<f64> {
+    Animated::Const(0.0)
+}
+
+impl Default for AnimatedTransform {
+    fn default() -> Self {
+        Self::from(Transform::default())
+    }
+}
+
+impl From<Transform> for AnimatedTransform {
+    /// A fully static (un-keyframed) transform — every field a constant.
+    fn from(p: Transform) -> Self {
+        Self {
+            scale: Animated::Const(p.scale),
+            scale_x: Animated::Const(p.scale_x),
+            scale_y: Animated::Const(p.scale_y),
+            flip_h: p.flip_h,
+            flip_v: p.flip_v,
+            x: Animated::Const(p.x),
+            y: Animated::Const(p.y),
+            rotation: Animated::Const(p.rotation),
+            opacity: Animated::Const(p.opacity),
+            bg: p.bg,
+            cover: p.cover,
+        }
+    }
+}
+
+impl AnimatedTransform {
+    /// The static pose at clip-local time `t` — what the engine renders that
+    /// frame. This is the single sampling point every chain builder goes through.
+    pub fn at(&self, t: f64) -> Transform {
+        Transform {
+            scale: self.scale.sample(t),
+            scale_x: self.scale_x.sample(t),
+            scale_y: self.scale_y.sample(t),
+            flip_h: self.flip_h,
+            flip_v: self.flip_v,
+            x: self.x.sample(t),
+            y: self.y.sample(t),
+            rotation: self.rotation.sample(t),
+            opacity: self.opacity.sample(t),
+            bg: self.bg,
+            cover: self.cover,
+        }
+    }
+
+    /// The pose the inspector shows and edits: the value at the clip's start.
+    pub fn pose(&self) -> Transform {
+        self.at(0.0)
+    }
+
+    /// Replace every field with a constant — how a slider or on-screen drag edit
+    /// lands today.
+    ///
+    /// ponytail: this flattens any animation. Keyframe-aware editing (insert a key
+    /// at the playhead rather than overwrite) supersedes it once the keyframe UI
+    /// exists; until then nothing creates a curve, so nothing is lost.
+    pub fn set_pose(&mut self, p: Transform) {
+        *self = Self::from(p);
+    }
+
+    /// The ffmpeg geometry chain, animated where it can be.
+    ///
+    /// The common, un-keyframed case returns the proven static [`transform_chain`]
+    /// **byte-for-byte** — its "crop provably inside the padded picture" safety is
+    /// untouched. Only when `scale` is keyframed does this take the animated
+    /// branch: a Ken Burns zoom compiled to `zoompan`, the exact mechanism the
+    /// Motion presets use, so preview and export animate through the one string.
+    ///
+    /// ponytail: zoom only goes in (z≥1). A keyframed shrink, non-uniform stretch,
+    /// keyframed rotation, flip and opacity aren't expressible in this branch, so
+    /// they take the start pose. Generalising them means migrating the whole
+    /// geometry onto zoompan and trading away that safety proof — deferred until a
+    /// reel actually needs it; presets + this cover the Ken Burns case today.
+    pub fn chain(&self, w: u32, h: u32, alpha: bool) -> String {
+        if !self.scale.is_animated() {
+            return transform_chain(&self.pose(), w, h, alpha);
+        }
+        let p = self.pose();
+        let z = curve_expr(&self.scale, "it");
+        let mut c = String::new();
+        if alpha {
+            c += "format=rgba,";
+        }
+        if p.flip_h {
+            c += "hflip,";
+        }
+        if p.flip_v {
+            c += "vflip,";
+        }
+        // z clamped ≥1: zoompan can't zoom out past the source frame.
+        c += &format!(
+            "zoompan=z='max({z},1)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps=30"
+        );
+        if p.rotation.abs() > 1e-6 {
+            c += &format!(",rotate={:.5}:c=black", p.rotation.to_radians());
+        }
+        if alpha && p.opacity < 0.999 {
+            c += &format!(",colorchannelmixer=aa={:.3}", p.opacity.clamp(0.0, 1.0));
+        }
+        c + ",setsar=1"
+    }
+}
+
+/// Compile an animated parameter to an ffmpeg expression in `var` (e.g. `"it"`,
+/// input time in seconds). A constant is just its number; a curve becomes a
+/// nested `if()` that clamps to the endpoints and interpolates each segment with
+/// its own easing — the same shape the Motion presets hand ffmpeg, built from the
+/// user's keyframes.
+fn curve_expr(p: &Animated<f64>, var: &str) -> String {
+    let keys = match p {
+        Animated::Const(v) => return format!("{v:.5}"),
+        Animated::Curve(k) => k,
+    };
+    // Innermost fallback: hold the last value once past the final key.
+    let mut expr = format!("{:.5}", keys[keys.len() - 1].v);
+    // Fold segments last→first: below b.t use the segment, else what's above it.
+    for w in keys.windows(2).rev() {
+        expr = format!("if(lt({var},{:.5}),{},{expr})", w[1].t, segment_expr(w[0], w[1], var));
+    }
+    // Clamp before the first key to its value.
+    format!("if(lt({var},{:.5}),{:.5},{expr})", keys[0].t, keys[0].v)
+}
+
+/// One segment `a`→`b` as an expression in `var`, eased per `b.interp`.
+fn segment_expr(a: Key<f64>, b: Key<f64>, var: &str) -> String {
+    let span = (b.t - a.t).max(1e-6);
+    let f = format!("(({var}-{:.5})/{:.5})", a.t, span); // 0..1 across the segment
+    let d = b.v - a.v;
+    match b.interp {
+        Interp::Hold => format!("{:.5}", a.v),
+        Interp::Linear => format!("({:.5}+{:.5}*{f})", a.v, d),
+        Interp::Smooth => format!("({:.5}+{:.5}*({f}*{f}*(3-2*{f})))", a.v, d),
     }
 }
 
@@ -109,7 +338,9 @@ pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
     // clean off the edge of the frame instead of jamming against it.
     let pw = even((sw as f64).max(w as f64 + 2.0 * dx.abs() as f64)).max(sw).max(w);
     let ph = even((sh as f64).max(h as f64 + 2.0 * dy.abs() as f64)).max(sh).max(h);
-    let fill = if alpha { "black@0" } else { "black" };
+    // A composited layer (V2) pads transparent; V1 pads with the chosen colour,
+    // which is what shows behind a banded or shrunk clip.
+    let fill = if alpha { "black@0" } else { t.bg.color() };
 
     let mut c = String::new();
     if alpha {
@@ -122,7 +353,15 @@ pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
     if t.flip_v {
         c += "vflip,";
     }
-    c += &format!("scale={sw}:{sh}");
+    // Fill the sw×sh box: cover-crop keeps the picture's aspect (a real
+    // landscape band), a plain scale stretches it to fit (the Stretch sliders).
+    // `increase` scales until the box is covered, then the crop takes the centre —
+    // the scaled picture is ≥ the box on both axes, so the crop is provably inside.
+    if t.cover {
+        c += &format!("scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh}");
+    } else {
+        c += &format!("scale={sw}:{sh}");
+    }
     if t.rotation.abs() > 1e-6 {
         // rotate keeps the input size, so the corners it opens up take the fill.
         c += &format!(",rotate={:.5}:c={fill}", t.rotation.to_radians());
@@ -139,6 +378,142 @@ pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
         c += &format!(",colorchannelmixer=aa={:.3}", t.opacity.clamp(0.0, 1.0));
     }
     c + ",setsar=1"
+}
+
+/// A light primary colour grade — GIMP's Curves/Levels reduced to the four knobs
+/// a phone reel actually reaches for, each mapped to what ffmpeg does cheaply in
+/// one pass. It rides the same [`Clip::look`] chain as the effect presets — the
+/// grade runs *before* the look, so you correct the exposure and then stylise on
+/// top — which keeps it WYSIWYG and back-compatible: an old project with no
+/// `grade` loads as the identity (every field `#[serde(default)]`), and the
+/// identity emits no filter at all.
+///
+/// ponytail: static, not [`Animated`] — a graded reel wants one steady look, not
+/// a colour that drifts. Make the fields curves the day a fade-to-mono needs it.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Grade {
+    /// `eq` brightness: -1..1, 0 = untouched.
+    #[serde(default)]
+    pub exposure: f64,
+    /// `eq` contrast: 0..2, 1 = untouched.
+    #[serde(default = "unit")]
+    pub contrast: f64,
+    /// `eq` saturation: 0..3, 1 = untouched.
+    #[serde(default = "unit")]
+    pub saturation: f64,
+    /// White balance in Kelvin: below 6500 warms, above cools, 6500 = untouched.
+    #[serde(default = "neutral_k")]
+    pub warmth: f64,
+}
+
+fn neutral_k() -> f64 {
+    6500.0
+}
+
+impl Default for Grade {
+    fn default() -> Self {
+        Self { exposure: 0.0, contrast: 1.0, saturation: 1.0, warmth: 6500.0 }
+    }
+}
+
+impl Grade {
+    /// True when every knob is at neutral — the whole grade emits nothing.
+    pub fn is_identity(&self) -> bool {
+        self.exposure.abs() < 1e-4
+            && (self.contrast - 1.0).abs() < 1e-4
+            && (self.saturation - 1.0).abs() < 1e-4
+            && (self.warmth - 6500.0).abs() < 1.0
+    }
+
+    /// ffmpeg chain for the grade, or "" when it is the identity. `eq` carries
+    /// exposure/contrast/saturation together; `colortemperature` carries warmth.
+    /// Each half is dropped at neutral, so a one-knob grade stays a one-filter
+    /// chain.
+    pub fn chain(&self) -> String {
+        if self.is_identity() {
+            return String::new();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.exposure.abs() >= 1e-4
+            || (self.contrast - 1.0).abs() >= 1e-4
+            || (self.saturation - 1.0).abs() >= 1e-4
+        {
+            parts.push(format!(
+                "eq=brightness={:.3}:contrast={:.3}:saturation={:.3}",
+                self.exposure, self.contrast, self.saturation
+            ));
+        }
+        if (self.warmth - 6500.0).abs() >= 1.0 {
+            parts.push(format!("colortemperature={:.0}", self.warmth));
+        }
+        parts.join(",")
+    }
+}
+
+/// A rectangle to align against, in the same normalized frame space as
+/// [`Transform::x`]/[`y`]: the frame spans `[-0.5, 0.5]` on each axis, `(0,0)`
+/// is dead centre, `+x` is right and `+y` is down. So an offset computed here
+/// drops straight into a pose.
+///
+/// GIMP's align tool calls this the "reference" — the thing targets snap to.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct AlignBox {
+    pub left: f64,
+    pub right: f64,
+    pub top: f64,
+    pub bottom: f64,
+}
+
+impl AlignBox {
+    /// The whole 9:16 frame.
+    pub const FRAME: AlignBox = AlignBox { left: -0.5, right: 0.5, top: -0.5, bottom: 0.5 };
+    /// Inside the phone-UI safe areas — the exact insets the on-screen guides
+    /// draw (header 8% top, caption 24% bottom, action rail 18% right, nothing
+    /// on the left). Aligning here parks a band clear of the chrome that every
+    /// platform paints over a reel.
+    // ponytail: these four numbers are the .mr-safe-* CSS heights. If the guide
+    // geometry ever moves, move it here too — one reel, two places, on purpose:
+    // the guides are DOM, this is frame maths, and neither imports the other.
+    pub const SAFE: AlignBox =
+        AlignBox { left: -0.5, right: 0.5 - 0.18, top: -0.5 + 0.08, bottom: 0.5 - 0.24 };
+}
+
+/// GIMP's six align operations. A horizontal one moves only `x`, a vertical one
+/// only `y`, so a Left then a Top compose into a corner. No distribute: this app
+/// layers elements rather than tiling three-plus of them, so there is nothing to
+/// space out — add it the day a reel holds a row of independent boxes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Align {
+    Left,
+    HCenter,
+    Right,
+    Top,
+    VCenter,
+    Bottom,
+}
+
+impl Transform {
+    /// Snap this transform's placement to `r`, GIMP-style: the element's edge —
+    /// or centre — meets the reference's. Only the axis the op acts on changes;
+    /// scale, the other axis, rotation and the rest stay put.
+    ///
+    /// The on-frame picture is `scale·scale_x` wide and `scale·scale_y` tall
+    /// (see [`transform_chain`]), so half of each is its reach from centre.
+    /// Because the offset comes from the *actual* box, a band lands flush at any
+    /// height — which is the whole reason this beats a fixed `y` preset that is
+    /// only correct at one `scale_y`.
+    pub fn align_to(&mut self, op: Align, r: AlignBox) {
+        let hw = (self.scale * self.scale_x).abs() / 2.0;
+        let hh = (self.scale * self.scale_y).abs() / 2.0;
+        match op {
+            Align::Left => self.x = r.left + hw,
+            Align::HCenter => self.x = (r.left + r.right) / 2.0,
+            Align::Right => self.x = r.right - hw,
+            Align::Top => self.y = r.top + hh,
+            Align::VCenter => self.y = (r.top + r.bottom) / 2.0,
+            Align::Bottom => self.y = r.bottom - hh,
+        }
+    }
 }
 
 /// What the file dialogs offer, and the single source of truth for what counts
@@ -311,6 +686,10 @@ pub struct ClipSpec {
     pub effect: String,
     /// How the source fills 9:16: "Crop" (default), "Fit" (letterbox), "Zoom".
     pub framing: String,
+    /// Colour behind the picture where it doesn't fill 9:16 — fills the "Fit"
+    /// letterbox. (A banded/shrunk clip's surround is filled by its transform
+    /// pad separately, from the same `Bg`.)
+    pub bg: Bg,
     /// Playback rate: 0.5 is half speed (slow motion), 2.0 is double.
     pub speed: f64,
     /// Gain on this clip's own audio; 0.0 mutes it.
@@ -333,6 +712,7 @@ impl Default for ClipSpec {
             has_audio: false,
             effect: String::new(),
             framing: String::new(),
+            bg: Bg::Black,
             speed: 1.0,
             volume: 1.0,
             transition: String::new(),
@@ -559,17 +939,116 @@ impl OverlaySpec {
     }
 }
 
-/// A1: audio mixed under the main track starting at global time `at`.
+/// Named EQ / voice treatments applied before gain and fades. Plain English
+/// labels; the chains are fixed so a preset always sounds the same.
+pub const AUDIO_TREATS: &[&str] = &[
+    "None",
+    "Voice enhance",
+    "Warm",
+    "Bright",
+    "Bass cut",
+    "Podcast",
+];
+
+/// ffmpeg filter chain for a treatment label (no leading/trailing commas).
+pub fn audio_treat_chain(name: &str) -> &'static str {
+    match name {
+        // High-pass rumble, lift presence, dip a bit of mud.
+        "Voice enhance" => {
+            "highpass=f=80,equalizer=f=3000:t=q:w=1.2:g=3.5,equalizer=f=220:t=q:w=1:g=-2.5"
+        }
+        "Warm" => "equalizer=f=140:t=q:w=1:g=3,equalizer=f=4500:t=q:w=1:g=-2",
+        "Bright" => "treble=g=4,equalizer=f=180:t=q:w=1:g=-1.5",
+        "Bass cut" => "highpass=f=140",
+        // Broadcast-ish: clean lows, slight presence, gentle glue.
+        "Podcast" => {
+            "highpass=f=80,equalizer=f=2500:t=q:w=1:g=2,\
+             acompressor=threshold=-20dB:ratio=3:attack=8:release=80:makeup=2"
+        }
+        _ => "",
+    }
+}
+
+/// A1/A2: audio mixed under the main track starting at global time `at`.
 #[derive(Clone, PartialEq, Debug)]
 pub struct AudioSpec {
     pub path: String,
     pub in_s: f64,
     pub out_s: f64,
     pub at: f64,
+    /// Start gain (linear, 1.0 = unity). With `vol_end` this is also the start
+    /// of a linear volume automation ramp across the item.
     pub volume: f64,
+    /// End gain for volume automation. Negative means "same as `volume`" so
+    /// older projects without the field stay flat.
+    pub vol_end: f64,
     /// How hard to pull this bed down while the main track is talking.
     /// 0 = never; 1 = duck hard. The classic music-under-voiceover move.
     pub duck: f64,
+    /// Fade in from silence at the start of the kept span (seconds).
+    pub fade_in: f64,
+    /// Fade out to silence at the end of the kept span (seconds).
+    pub fade_out: f64,
+    /// Spectral denoise strength 0..=1 (`afftdn` `nr`, mapped to 4..=24 dB).
+    pub denoise: f64,
+    /// Noise floor in dB, afftdn `nf` (−80..=−20). The sensitivity knob:
+    /// higher (closer to −20) treats more of the signal as noise.
+    pub noise_floor: f64,
+    /// Adaptively track the noise floor over the clip (afftdn `tn`). ffmpeg's
+    /// stand-in for a learned noise profile — no fixed noise-only region needed.
+    pub track_noise: bool,
+    /// Broadband compression amount 0..=1 (skipped when the treatment already
+    /// bakes a compressor, e.g. Podcast).
+    pub compress: f64,
+    /// Noise gate amount 0..=1 (`agate`). Silences everything below a threshold
+    /// that rises with the knob — kills room tone between words on phone VO.
+    pub gate: f64,
+    /// De-click strength 0..=1 (`adeclick`). Repairs pops/clicks in field audio.
+    pub declick: f64,
+    /// One of [`AUDIO_TREATS`].
+    pub treat: String,
+    /// Mix bus: 1 = A1, 2 = A2. Both mix under V1; the split is editorial.
+    pub lane: u8,
+}
+
+impl Default for AudioSpec {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            in_s: 0.0,
+            out_s: 0.0,
+            at: 0.0,
+            volume: 1.0,
+            vol_end: -1.0,
+            duck: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            denoise: 0.0,
+            noise_floor: -25.0,
+            track_noise: false,
+            compress: 0.0,
+            gate: 0.0,
+            declick: 0.0,
+            treat: "None".into(),
+            lane: 1,
+        }
+    }
+}
+
+impl AudioSpec {
+    /// Effective end gain (resolves the "same as volume" sentinel).
+    pub fn end_gain(&self) -> f64 {
+        if self.vol_end < 0.0 {
+            self.volume
+        } else {
+            self.vol_end
+        }
+    }
+
+    /// Kept duration in source seconds.
+    pub fn span(&self) -> f64 {
+        (self.out_s - self.in_s).max(0.01)
+    }
 }
 
 /// A sidechain compressor keyed off the main track. The threshold decides how
@@ -585,6 +1064,85 @@ fn duck_chain(amount: f64) -> String {
         (0.1 - 0.085 * a).max(0.01),
         2.0 + 10.0 * a
     )
+}
+
+/// Denoise → treat → compress fragment (no volume/fades/delay).
+fn audio_process_chain(a: &AudioSpec) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // De-click first: repair transients before denoise smears them. Lower
+    // threshold catches more clicks, so aggressive = lower.
+    let dc = a.declick.clamp(0.0, 1.0);
+    if dc > 0.001 {
+        parts.push(format!("adeclick=threshold={:.2}", 3.5 - 2.0 * dc));
+    }
+    let d = a.denoise.clamp(0.0, 1.0);
+    if d > 0.001 {
+        // afftdn: nr is noise reduction in dB (gentle → aggressive); nf is the
+        // noise floor (sensitivity); tn adaptively tracks the noise over time.
+        let mut fx = format!(
+            "afftdn=nr={:.1}:nf={:.0}",
+            4.0 + 20.0 * d,
+            a.noise_floor.clamp(-80.0, -20.0)
+        );
+        if a.track_noise {
+            fx.push_str(":tn=1");
+        }
+        parts.push(fx);
+    }
+    // Gate after denoise, before EQ/compress — so the compressor never pumps on
+    // room tone the gate is about to remove. Threshold rises from −50 dB (gentle)
+    // to −20 dB (aggressive); a moderate ratio + slow release keeps word tails.
+    let g = a.gate.clamp(0.0, 1.0);
+    if g > 0.001 {
+        let thr_db = -50.0 + 30.0 * g;
+        parts.push(format!(
+            "agate=threshold={:.5}:ratio=3:attack=5:release=150",
+            10f64.powf(thr_db / 20.0)
+        ));
+    }
+    let treat = audio_treat_chain(&a.treat);
+    if !treat.is_empty() {
+        parts.push(treat.to_string());
+    }
+    // Podcast already glues; stacking another compressor muddies it.
+    let c = a.compress.clamp(0.0, 1.0);
+    if c > 0.001 && a.treat != "Podcast" {
+        parts.push(format!(
+            "acompressor=threshold={:.1}dB:ratio={:.2}:attack=12:release=120:makeup={:.1}",
+            -12.0 - 12.0 * c,
+            1.5 + 6.0 * c,
+            1.0 + 3.0 * c
+        ));
+    }
+    parts.join(",")
+}
+
+/// Volume (flat or linear ramp) + optional fades over the kept span.
+fn audio_gain_fades(a: &AudioSpec) -> String {
+    let dur = a.span();
+    let v0 = a.volume.max(0.0);
+    let v1 = a.end_gain().max(0.0);
+    let mut parts: Vec<String> = Vec::new();
+    if (v0 - v1).abs() < 0.001 {
+        parts.push(format!("volume={v0:.3}"));
+    } else {
+        // Frame-eval linear automation from start gain to end gain.
+        parts.push(format!(
+            "volume='{v0:.4}+({v1:.4}-{v0:.4})*t/{dur:.4}':eval=frame"
+        ));
+    }
+    let fin = a.fade_in.clamp(0.0, dur * 0.49);
+    let fout = a.fade_out.clamp(0.0, dur * 0.49);
+    if fin > 0.001 {
+        parts.push(format!("afade=t=in:st=0:d={fin:.3}:curve=tri"));
+    }
+    if fout > 0.001 {
+        parts.push(format!(
+            "afade=t=out:st={:.3}:d={fout:.3}:curve=tri",
+            (dur - fout).max(0.0)
+        ));
+    }
+    parts.join(",")
 }
 
 /// Mix the A1 beds under `main`, ducking the ones that ask for it, ending at
@@ -1020,7 +1578,24 @@ pub async fn frame_data_uri(
     effect: &str,
     over: Over,
 ) -> Result<String, String> {
-    let mut chain = frame_chain(framing, w, h);
+    frame_data_uri_fill(path, t, w, h, framing, effect, over, "black").await
+}
+
+/// [`frame_data_uri`] with an explicit letterbox `fill` for "Fit" framing, so a
+/// scrub of the composed reel shows the chosen Background behind a landscape
+/// clip — matching what the export bakes in (preview == export).
+#[allow(clippy::too_many_arguments)]
+pub async fn frame_data_uri_fill(
+    path: &str,
+    t: f64,
+    w: u32,
+    h: u32,
+    framing: &str,
+    effect: &str,
+    over: Over,
+    fill: &str,
+) -> Result<String, String> {
+    let mut chain = frame_chain_fill(framing, w, h, "m", fill);
     if !effect.is_empty() {
         // Seeking restarts the filter clock at 0, which would freeze every
         // time-based effect at its t=0 pose — most visible on a still, where
@@ -1052,7 +1627,7 @@ pub async fn frame_data_uri(
             cmd.args(["-loop", "1"]);
         }
         cmd.args(["-ss", &format!("{bt:.3}"), "-i", bpath]);
-        let mut bchain = frame_chain(bframing, w, h);
+        let mut bchain = frame_chain_fill(bframing, w, h, "b", fill);
         if !beffect.is_empty() {
             bchain = format!("{bchain},setpts=PTS+{bt:.3}/TB,{beffect},setpts=PTS-{bt:.3}/TB");
         }
@@ -1168,20 +1743,44 @@ fn eff(effect: &str) -> String {
 
 /// How a source fills the portrait frame — the same chain feeds preview,
 /// thumbnails and export, so framing always looks like it ships.
-/// "Crop" (default) covers and center-crops; "Fit" letterboxes on black;
-/// "Zoom" punches in 1.5× then crops.
-// ponytail: fixed 1.5× zoom — a per-clip zoom slider when someone asks.
-fn frame_chain(framing: &str, w: u32, h: u32) -> String {
+/// "Crop" (default) covers and center-crops; "Blur" fits the whole picture over
+/// a blurred, zoomed copy of itself (the reel look for landscape footage); "Fit"
+/// letterboxes on black; "Zoom" punches in 1.5× then crops.
+///
+/// `tag` uniquifies the filter labels the "Blur" branch splits into: every clip
+/// and overlay shares one filter_complex namespace, so `[bg]`/`[fg]` would
+/// collide across items without it. Pass the item's index; linear framings ignore it.
+// ponytail: fixed 1.5× zoom / sigma — a per-clip slider when someone asks.
+fn frame_chain(framing: &str, w: u32, h: u32, tag: &str) -> String {
+    frame_chain_fill(framing, w, h, tag, "black")
+}
+
+/// Like [`frame_chain`] but the "Fit" letterbox takes `fill` instead of black,
+/// so a chosen Background shows behind a letterboxed landscape clip — the same
+/// colour `transform_chain` pads a *banded* clip with. Every other framing
+/// covers the frame, so `fill` is a no-op there.
+fn frame_chain_fill(framing: &str, w: u32, h: u32, tag: &str, fill: &str) -> String {
     match framing {
         "Fit" => format!(
             "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
-             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
+             pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={fill}"
         ),
         "Zoom" => format!(
             "scale={}:{}:force_original_aspect_ratio=increase,crop={w}:{h}",
             w * 3 / 2,
             h * 3 / 2
         ),
+        "Blur" => {
+            // Blur scaled to the frame, so a 108px thumbnail isn't a smear and a
+            // 1080px export isn't under-blurred.
+            let sigma = (w as f64 / 45.0).max(2.0);
+            format!(
+                "split=2[bg{tag}][fg{tag}];\
+                 [bg{tag}]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},gblur=sigma={sigma:.1}[bb{tag}];\
+                 [fg{tag}]scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2[ff{tag}];\
+                 [bb{tag}][ff{tag}]overlay=(W-w)/2:(H-h)/2"
+            )
+        }
         _ => format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
     }
 }
@@ -1205,15 +1804,25 @@ fn clip_audio(i: usize, c: &ClipSpec) -> String {
     }
 }
 
-/// A1 chain for item `k` at input `idx`: trim, volume, delay to its timeline spot.
+/// A1/A2 chain for item `k` at input `idx`: trim → process → gain/fades → delay.
 fn a1_audio(idx: usize, k: usize, a: &AudioSpec) -> String {
+    let mut mid = String::new();
+    let proc = audio_process_chain(a);
+    if !proc.is_empty() {
+        mid.push(',');
+        mid.push_str(&proc);
+    }
+    let gain = audio_gain_fades(a);
+    if !gain.is_empty() {
+        mid.push(',');
+        mid.push_str(&gain);
+    }
     format!(
         "[{idx}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,\
-         aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,\
-         volume={:.2},adelay={}:all=1[au{k}];",
+         aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo\
+         {mid},adelay={}:all=1[au{k}];",
         a.in_s,
         a.out_s,
-        a.volume,
         (a.at * 1000.0).round() as u64
     )
 }
@@ -1238,7 +1847,7 @@ pub fn build_filter(
             c.in_s,
             c.out_s,
             c.speed.max(0.01),
-            frame_chain(&c.framing, W, H),
+            frame_chain_fill(&c.framing, W, H, &format!("c{i}"), c.bg.color()),
             eff(&c.effect)
         );
         f += &clip_audio(i, c);
@@ -1302,7 +1911,7 @@ pub fn build_filter(
             o.out_s,
             o.speed.max(0.01),
             o.at,
-            frame_chain(&o.framing, W, H),
+            frame_chain(&o.framing, W, H, &format!("o{j}")),
             eff(&o.effect)
         );
         f += &format!(
@@ -1417,6 +2026,42 @@ pub async fn render_audio_mix(
     Ok(())
 }
 
+/// Integrated loudness (LUFS) of `path`'s span `[in_s, out_s]`, measured with
+/// ffmpeg's `loudnorm` first pass. This is what "Normalize" keys off: measure a
+/// clip, then set its gain so it lands on a target level (the reference level
+/// for the platform, e.g. −14 LUFS). No encode — a null muxer, so it's quick.
+pub async fn measure_loudness(path: &str, in_s: f64, out_s: f64) -> Result<f64, String> {
+    let span = (out_s - in_s).max(0.05);
+    let ss = format!("{:.3}", in_s.max(0.0));
+    let t = format!("{span:.3}");
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostats", "-ss", &ss, "-i", path, "-t", &t])
+        .args(["-af", "loudnorm=print_format=json", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+    // loudnorm prints its JSON block on stderr, after the log. Grab the value on
+    // the "input_i" line rather than parsing the whole object.
+    let log = String::from_utf8_lossy(&out.stderr);
+    parse_loudnorm_i(&log).ok_or_else(|| "could not measure loudness".to_string())
+}
+
+/// Pull `input_i` (integrated LUFS) out of a loudnorm JSON dump on stderr.
+pub fn parse_loudnorm_i(log: &str) -> Option<f64> {
+    let line = log.lines().find(|l| l.contains("\"input_i\""))?;
+    let val = line.split(':').nth(1)?.trim().trim_matches(|c| c == '"' || c == ',');
+    val.parse::<f64>().ok()
+}
+
+/// Linear gain that moves a clip measured at `measured_lufs` onto `target_lufs`.
+/// Clamped so near-silent material (very low LUFS) can't be boosted into a wall
+/// of noise, and so an already-hot clip is pulled down rather than clipped.
+pub fn normalize_gain(measured_lufs: f64, target_lufs: f64) -> f64 {
+    let db = target_lufs - measured_lufs;
+    10f64.powf(db / 20.0).clamp(0.05, 4.0)
+}
+
 /// Play `path` from `start` seconds, sound only, no window. Returns the child
 /// so pausing can kill it; the child is also killed if dropped.
 pub fn launch_audio(path: &Path, start: f64) -> Result<tokio::process::Child, String> {
@@ -1442,13 +2087,265 @@ pub fn launch_audio(path: &Path, start: f64) -> Result<tokio::process::Child, St
     Err("no audio player found — install mpv or ffplay".into())
 }
 
-/// Waveform strip of a file's audio (teal on transparent) as a data: URI.
+/// Detect silent stretches in a file's audio via ffmpeg `silencedetect`.
+/// Returns `(start, end)` pairs in source seconds. `noise_db` is a negative
+/// threshold (e.g. −32); `min_dur` is the shortest silence worth reporting.
+pub async fn detect_silence(
+    path: &str,
+    noise_db: f64,
+    min_dur: f64,
+) -> Result<Vec<(f64, f64)>, String> {
+    let noise = noise_db.min(-1.0); // always treat as "below N dB"
+    let min_dur = min_dur.max(0.05);
+    let af = format!("silencedetect=noise={noise:.1}dB:d={min_dur:.3}");
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostats", "-i", path, "-af", &af, "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+    // silencedetect logs on stderr; exit can still be 0 with empty audio.
+    let log = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && !log.contains("silence_start") && !log.contains("silence_end") {
+        let err = log.trim();
+        if err.is_empty() {
+            return Err("silencedetect failed".into());
+        }
+        return Err(err.to_string());
+    }
+    Ok(parse_silence_log(&log))
+}
+
+/// Parse ffmpeg silencedetect stderr into (start, end) pairs.
+pub fn parse_silence_log(log: &str) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    let mut start: Option<f64> = None;
+    for line in log.lines() {
+        if let Some(rest) = line.split("silence_start:").nth(1) {
+            if let Ok(t) = rest.split_whitespace().next().unwrap_or("").parse::<f64>() {
+                start = Some(t);
+            }
+        }
+        if let Some(rest) = line.split("silence_end:").nth(1) {
+            if let Ok(t) = rest.split_whitespace().next().unwrap_or("").parse::<f64>() {
+                if let Some(s) = start.take() {
+                    if t > s {
+                        out.push((s, t));
+                    }
+                }
+            }
+        }
+    }
+    // File ends mid-silence: silencedetect may omit silence_end. Drop the open
+    // start — the caller clips against out_s and trailing silence is implied
+    // by "no keep after last end".
+    out
+}
+
+/// Invert silence ranges into keep-loud ranges within `[in_s, out_s]`.
+/// `pad` shrinks each silence (keeps a little room around speech);
+/// `min_keep` drops leftover scraps shorter than that.
+pub fn keep_loud_ranges(
+    in_s: f64,
+    out_s: f64,
+    silences: &[(f64, f64)],
+    pad: f64,
+    min_keep: f64,
+) -> Vec<(f64, f64)> {
+    if out_s - in_s < min_keep {
+        return Vec::new();
+    }
+    let pad = pad.max(0.0);
+    let min_keep = min_keep.max(0.05);
+    // Clip + shrink silences by pad so speech edges aren't bitten.
+    let mut sil: Vec<(f64, f64)> = silences
+        .iter()
+        .filter_map(|&(s, e)| {
+            let s = (s + pad).clamp(in_s, out_s);
+            let e = (e - pad).clamp(in_s, out_s);
+            (e > s).then_some((s, e))
+        })
+        .collect();
+    sil.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Merge overlaps.
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (s, e) in sil {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    let mut keeps = Vec::new();
+    let mut t = in_s;
+    for (s, e) in merged {
+        if s > t && s - t >= min_keep {
+            keeps.push((t, s));
+        }
+        t = e.max(t);
+    }
+    if out_s > t && out_s - t >= min_keep {
+        keeps.push((t, out_s));
+    }
+    keeps
+}
+
+/// Pull a BPM out of a filename like `house_128bpm_master.wav` or `track 90 BPM.mp3`
+/// — the digits immediately before "bpm". Reel music libraries name files this way,
+/// so it's a free, exact tempo when present.
+pub fn bpm_from_filename(name: &str) -> Option<f64> {
+    let low = name.to_ascii_lowercase();
+    let idx = low.find("bpm")?;
+    let head = low[..idx].trim_end();
+    let rev: String = head.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    let n: f64 = rev.chars().rev().collect::<String>().parse().ok()?;
+    (40.0..=300.0).contains(&n).then_some(n)
+}
+
+/// Fold a tempo into the [70, 160) BPM octave — kills the half/double-time
+/// ambiguity autocorrelation can land on.
+fn fold_bpm(mut b: f64) -> f64 {
+    while b < 70.0 {
+        b *= 2.0;
+    }
+    while b >= 160.0 {
+        b /= 2.0;
+    }
+    b
+}
+
+/// Tempo from the dominant lag in an onset envelope's autocorrelation, searched
+/// over 70–160 BPM.
+fn autocorr_bpm(env: &[f32], env_hz: f64) -> f64 {
+    let lag_min = ((env_hz * 60.0 / 160.0).floor() as usize).max(1);
+    let lag_max = ((env_hz * 60.0 / 70.0).ceil() as usize).min(env.len().saturating_sub(1));
+    let mut best_lag = lag_min;
+    let mut best = f64::MIN;
+    for lag in lag_min..=lag_max {
+        let mut sum = 0.0;
+        for i in lag..env.len() {
+            sum += env[i] as f64 * env[i - lag] as f64;
+        }
+        let score = sum / (env.len() - lag) as f64; // normalize so long lags aren't penalized
+        if score > best {
+            best = score;
+            best_lag = lag;
+        }
+    }
+    env_hz * 60.0 / best_lag as f64
+}
+
+/// Estimate tempo (BPM) and beat positions from an onset-strength envelope
+/// sampled at `env_hz`. `hint_bpm` (e.g. from the filename) pins the tempo when
+/// present; otherwise it's found by autocorrelation. Returns (bpm, beat times in
+/// seconds from the envelope's start).
+// ponytail: naive single-tempo tracker — one global BPM, autocorr peak, best
+// constant phase. Enough to seed markers you then nudge; upgrade to a
+// dynamic-programming beat tracker only if drift or octave errors actually bite.
+pub fn beats_from_envelope(env: &[f32], env_hz: f64, hint_bpm: Option<f64>) -> (f64, Vec<f64>) {
+    if env.len() < 8 || env_hz <= 0.0 {
+        return (0.0, Vec::new());
+    }
+    let bpm = hint_bpm
+        .filter(|b| (40.0..=300.0).contains(b))
+        .map(fold_bpm)
+        .unwrap_or_else(|| autocorr_bpm(env, env_hz));
+    if bpm <= 0.0 {
+        return (0.0, Vec::new());
+    }
+    let period = env_hz * 60.0 / bpm; // frames per beat
+    // Best constant phase: the pulse-train offset that collects the most onset.
+    let steps = (env.len() as f64 / period).floor().max(1.0) as usize;
+    let mut best_off = 0usize;
+    let mut best_score = f64::MIN;
+    for off in 0..period.ceil() as usize {
+        let mut score = 0.0;
+        for k in 0..=steps {
+            let idx = (off as f64 + k as f64 * period).round() as usize;
+            if idx < env.len() {
+                score += env[idx] as f64;
+            }
+        }
+        if score > best_score {
+            best_score = score;
+            best_off = off;
+        }
+    }
+    let mut beats = Vec::new();
+    let mut t = best_off as f64;
+    while (t as usize) < env.len() {
+        beats.push(t / env_hz);
+        t += period;
+    }
+    (bpm, beats)
+}
+
+/// Detect the beat grid of a music bed. Decodes the [`in_s`, `out_s`] span to a
+/// mono onset envelope and returns (bpm, beat times in *source* seconds). A
+/// "<n>bpm" in the filename pins the tempo; the phase is always found from the
+/// signal so beat 1 lands on a real onset.
+pub async fn detect_beats(path: &str, in_s: f64, out_s: f64) -> Result<(f64, Vec<f64>), String> {
+    const SR: u32 = 11025;
+    const HOP: usize = 110; // ~100 Hz onset envelope
+    let span = (out_s - in_s).max(0.5);
+    let ss = format!("{:.3}", in_s.max(0.0));
+    let t = format!("{span:.3}");
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostats", "-ss", &ss, "-i", path, "-t", &t])
+        .args(["-ac", "1", "-ar", &SR.to_string(), "-f", "f32le", "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+    if out.stdout.is_empty() {
+        return Err("could not decode audio for beat detection".into());
+    }
+    let samples: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    if samples.len() < HOP * 8 {
+        return Err("clip too short to detect beats".into());
+    }
+    // Per-hop rectified-energy onset envelope: a beat is a rise in energy.
+    let env_hz = SR as f64 / HOP as f64;
+    let mut env = Vec::with_capacity(samples.len() / HOP);
+    let mut prev = 0.0f32;
+    for frame in samples.chunks(HOP) {
+        let e: f32 = frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32;
+        env.push((e - prev).max(0.0));
+        prev = e;
+    }
+    let hint = Path::new(path).file_name().and_then(|n| n.to_str()).and_then(bpm_from_filename);
+    let (bpm, beats) = beats_from_envelope(&env, env_hz, hint);
+    if beats.is_empty() {
+        return Err("no beat detected".into());
+    }
+    Ok((bpm, beats.into_iter().map(|b| in_s + b).collect()))
+}
+
+/// Waveform strip of a file's audio (bright teal on transparent) as a data: URI.
 /// Drawn once for the whole source — timeline items window into it with
 /// background-size/position, so trims and splits need no re-render.
+///
+/// `scale=sqrt` + a mild pre-gain lifts quiet speech so the strip reads as a
+/// real envelope rather than a thin mid-line; `draw=full` fills to the peaks.
 pub async fn waveform_data_uri(path: &str) -> Result<String, String> {
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-i", path])
-        .args(["-filter_complex", "aformat=channel_layouts=mono,showwavespic=s=1200x56:colors=0x3dd6d0"])
+        .args([
+            "-filter_complex",
+            // Mono strip, dual-tone teal for depth. Rendered tall and dense
+            // (stretched to the lane height by wave_css), and with cbrt scaling +
+            // a hotter gain so quiet passages still fill the lane — the envelope
+            // reads thick and detailed rather than a thin centre thread.
+            "aformat=channel_layouts=mono,volume=6dB,\
+             showwavespic=s=2400x200:colors=0x7af5ee|0x3dd6c8:scale=cbrt:draw=full",
+        ])
         .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"])
         .stdin(Stdio::null())
         .output()
@@ -1721,7 +2618,14 @@ mod tests {
         ];
         let overlays = [OverlaySpec { path: "c.mp4".into(), in_s: 0.0, out_s: 1.0, at: 0.5, ..Default::default() }];
         let titles = [TitleSpec { png: "t.png".into(), at: 0.2, dur: 2.0, ..Default::default() }];
-        let audio = [AudioSpec { path: "m.mp3".into(), in_s: 0.0, out_s: 2.0, at: 1.0, volume: 0.5, duck: 0.0 }];
+        let audio = [AudioSpec {
+            path: "m.mp3".into(),
+            in_s: 0.0,
+            out_s: 2.0,
+            at: 1.0,
+            volume: 0.5,
+            ..Default::default()
+        }];
         let f = build_filter(&clips, &overlays, &titles, &audio, ExportOpts::default());
         assert!(f.contains("[0:v]trim=start=0.500:end=2.000"));
         assert!(f.contains("setsar=1,hue=s=0[v0]"));
@@ -1739,13 +2643,118 @@ mod tests {
              setpts=PTS+0.200/TB[ti0]"
         ));
         assert!(f.contains("[vx0][ti0]overlay=enable='between(t,0.200,2.200)'[vt0]"));
-        assert!(f.contains("[4:a]") && f.contains("volume=0.50,adelay=1000:all=1[au0]"));
+        assert!(f.contains("[4:a]") && f.contains("volume=0.500") && f.contains("adelay=1000:all=1[au0]"), "{f}");
         assert!(f.contains("[ac][au0]amix=inputs=2:duration=first:normalize=0[am]"));
         assert!(f.ends_with("[vt0]null[vout];[am]anull[aout]"));
 
         // no overlays / titles / audio degenerates to plain concat
         let f = build_filter(&clips, &[], &[], &[], ExportOpts::default());
         assert!(f.ends_with("[vc]null[vout];[ac]anull[aout]"));
+    }
+
+    #[test]
+    fn silence_log_parses_start_end_pairs() {
+        let log = "\
+[silencedetect @ 0x1] silence_start: 0.5
+[silencedetect @ 0x1] silence_end: 1.25 | silence_duration: 0.75
+noise
+[silencedetect @ 0x1] silence_start: 3.0
+[silencedetect @ 0x1] silence_end: 4.0 | silence_duration: 1.0
+";
+        assert_eq!(parse_silence_log(log), vec![(0.5, 1.25), (3.0, 4.0)]);
+        assert!(parse_silence_log("nothing here").is_empty());
+    }
+
+    #[test]
+    fn keep_loud_ranges_drops_silence_and_scraps() {
+        // 0—10 with silence 2—5 and 7—8 → keep 0—2, 5—7, 8—10
+        let sil = [(2.0, 5.0), (7.0, 8.0)];
+        let k = keep_loud_ranges(0.0, 10.0, &sil, 0.0, 0.2);
+        assert_eq!(k, vec![(0.0, 2.0), (5.0, 7.0), (8.0, 10.0)]);
+        // Pad 0.25 shrinks silence so keep edges breathe.
+        let k = keep_loud_ranges(0.0, 10.0, &sil, 0.25, 0.2);
+        assert_eq!(k, vec![(0.0, 2.25), (4.75, 7.25), (7.75, 10.0)]);
+        // Whole span silent → nothing to keep.
+        assert!(keep_loud_ranges(0.0, 5.0, &[(0.0, 5.0)], 0.0, 0.2).is_empty());
+        // No silence → one full keep.
+        assert_eq!(keep_loud_ranges(1.0, 4.0, &[], 0.0, 0.2), vec![(1.0, 4.0)]);
+    }
+
+    #[test]
+    fn bpm_from_filename_reads_common_shapes() {
+        assert_eq!(bpm_from_filename("house_128bpm_master.wav"), Some(128.0));
+        assert_eq!(bpm_from_filename("track 90 BPM.mp3"), Some(90.0));
+        assert_eq!(bpm_from_filename("no tempo here.wav"), None);
+        assert_eq!(bpm_from_filename("bpm_only.wav"), None); // no digits before "bpm"
+    }
+
+    #[test]
+    fn beats_from_envelope_recovers_a_known_tempo() {
+        // Onset pulses every 50 frames at 100 Hz = 120 BPM, phase offset 7.
+        let env_hz = 100.0;
+        let period = env_hz * 60.0 / 120.0; // 50
+        let mut env = vec![0.0f32; 2000];
+        let mut i = 7.0;
+        while (i as usize) < env.len() {
+            env[i as usize] = 1.0;
+            i += period;
+        }
+        let (bpm, beats) = beats_from_envelope(&env, env_hz, None);
+        assert!((bpm - 120.0).abs() < 3.0, "bpm {bpm}");
+        // Beat 1 lands on the planted phase, spacing matches the period.
+        assert!((beats[0] * env_hz - 7.0).abs() <= 1.0, "phase {}", beats[0] * env_hz);
+        assert!(((beats[1] - beats[0]) * env_hz - period).abs() < 2.0, "spacing off");
+        // A filename hint pins tempo even against a noisier signal.
+        let (bpm, _) = beats_from_envelope(&env, env_hz, Some(100.0));
+        assert!((bpm - 100.0).abs() < 0.001, "hint ignored: {bpm}");
+    }
+
+    #[tokio::test]
+    async fn detect_beats_finds_the_tempo_of_a_click_track() {
+        let dir = std::env::temp_dir().join("morreel-beat-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("clicks.m4a").display().to_string();
+        // A 1 kHz click every 0.5s for 8s = 120 BPM.
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi",
+            "-i", "aevalsrc=exprs='sin(2*PI*1000*t)*lt(mod(t,0.5),0.02)':d=8:s=44100",
+            "-c:a", "aac", &src,
+        ])
+        .await
+        .unwrap();
+        let (bpm, beats) = detect_beats(&src, 0.0, 8.0).await.unwrap();
+        assert!((bpm - 120.0).abs() < 6.0, "expected ~120 BPM, got {bpm}");
+        assert!(beats.len() >= 12, "expected a beat per click, got {}", beats.len());
+        // Beats step by ~0.5s.
+        let dt = beats[2] - beats[1];
+        assert!((dt - 0.5).abs() < 0.08, "beat spacing {dt}");
+    }
+
+    #[tokio::test]
+    async fn detect_silence_finds_a_gap_between_tones() {
+        let dir = std::env::temp_dir().join("morreel-sil-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("gap.m4a").display().to_string();
+        // 0.5s tone, 0.8s silence, 0.5s tone.
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
+            "-filter_complex",
+            "[1:a]atrim=0:0.8,asetpts=PTS-STARTPTS[s];\
+             [0:a][s][2:a]concat=n=3:v=0:a=1[a]",
+            "-map", "[a]", "-t", "1.8", "-c:a", "aac", &src,
+        ])
+        .await
+        .unwrap();
+        let sil = detect_silence(&src, -40.0, 0.25).await.unwrap();
+        assert!(!sil.is_empty(), "expected a silence gap, got {sil:?}");
+        // Gap should sit around 0.5–1.3.
+        let (s, e) = sil[0];
+        assert!(s > 0.3 && s < 0.8, "silence_start {s}");
+        assert!(e > 1.0 && e < 1.6, "silence_end {e}");
     }
 
     #[tokio::test]
@@ -2179,6 +3188,38 @@ mod tests {
             assert!(!AUDIO_EXT.contains(e), "{e} is listed as both image and audio");
             assert!(is_still(&format!("x.{e}")), "{e} should take the still path");
         }
+    }
+
+    #[test]
+    fn animated_transform_is_backcompat_and_samples_over_time() {
+        use crate::keyframe::{Animated, Interp, Key};
+
+        // A project written before keyframes existed stored a plain static
+        // Transform. That exact JSON must still load into an AnimatedTransform…
+        let legacy = r#"{"scale":0.5,"scale_x":1.0,"scale_y":1.0,"flip_h":true,
+                         "flip_v":false,"x":0.1,"y":0.0,"rotation":0.0,"opacity":1.0}"#;
+        let at: AnimatedTransform = serde_json::from_str(legacy).unwrap();
+        // …as a fully static pose, unchanged from what was saved.
+        assert_eq!(at.pose(), Transform { scale: 0.5, flip_h: true, x: 0.1, ..Default::default() });
+        // A static AnimatedTransform serialises back to bare scalars, so new saves
+        // are byte-identical to old ones for an un-keyframed clip.
+        assert_eq!(serde_json::to_string(&at.scale).unwrap(), "0.5");
+
+        // Sampling: a scale curve 1.0 → 1.2 is the Ken Burns zoom, and pose() is
+        // the value at the clip's start.
+        let mut anim = AnimatedTransform::default();
+        anim.scale = Animated::curve(vec![
+            Key { t: 0.0, v: 1.0, interp: Interp::Linear },
+            Key { t: 2.0, v: 1.2, interp: Interp::Linear },
+        ]);
+        assert_eq!(anim.pose().scale, 1.0); // start
+        assert_eq!(anim.at(1.0).scale, 1.1); // halfway
+        assert_eq!(anim.at(2.0).scale, 1.2); // end
+
+        // set_pose flattens any animation to constants (today's edit behaviour).
+        anim.set_pose(Transform { scale: 0.8, ..Default::default() });
+        assert_eq!(anim.at(0.0).scale, 0.8);
+        assert_eq!(anim.at(9.0).scale, 0.8);
     }
 
     #[test]
@@ -2621,6 +3662,7 @@ mod tests {
             at: 0.0,
             volume: 1.0,
             duck,
+            ..Default::default()
         };
 
         // Off: the mix is what it always was, with no sidechain anywhere.
@@ -2646,6 +3688,89 @@ mod tests {
             c.split("threshold=").nth(1).unwrap().split(':').next().unwrap().parse().unwrap()
         };
         assert!(thr(&hard) < thr(&soft), "harder ducking should trigger sooner");
+    }
+
+    #[test]
+    fn audio_beds_get_fades_eq_denoise_and_volume_ramps() {
+        let clips = [ClipSpec {
+            path: "a.mp4".into(),
+            out_s: 4.0,
+            has_audio: true,
+            ..Default::default()
+        }];
+        let bed = AudioSpec {
+            path: "m.mp3".into(),
+            in_s: 0.0,
+            out_s: 4.0,
+            at: 0.5,
+            volume: 0.8,
+            vol_end: 0.2,
+            fade_in: 0.5,
+            fade_out: 0.75,
+            denoise: 0.5,
+            noise_floor: -25.0,
+            track_noise: false,
+            compress: 0.4,
+            gate: 0.0,
+            declick: 0.0,
+            treat: "Voice enhance".into(),
+            duck: 0.0,
+            lane: 1,
+        };
+        let f = build_filter(&clips, &[], &[], &[bed], ExportOpts::default());
+        assert!(f.contains("afftdn=nr="), "denoise missing: {f}");
+        assert!(f.contains("nf=-25"), "noise floor missing: {f}");
+        assert!(!f.contains(":tn=1"), "track_noise off should omit tn: {f}");
+        // Floor + adaptive tracking flow through to the afftdn args.
+        let bed2 = AudioSpec {
+            denoise: 0.5,
+            noise_floor: -55.0,
+            track_noise: true,
+            ..AudioSpec::default()
+        };
+        let f2 = build_filter(&[], &[], &[], &[bed2], ExportOpts::default());
+        assert!(f2.contains("nf=-55") && f2.contains(":tn=1"), "adaptive floor missing: {f2}");
+        // Gate + de-click appear only when their knobs are up, and de-click sits
+        // ahead of the denoiser so clicks are repaired before it smears them.
+        assert!(!f.contains("agate=") && !f.contains("adeclick="), "fx present at zero: {f}");
+        let bed3 = AudioSpec { gate: 0.5, declick: 1.0, denoise: 0.5, ..AudioSpec::default() };
+        let f3 = build_filter(&[], &[], &[], &[bed3], ExportOpts::default());
+        assert!(f3.contains("agate=threshold="), "gate missing: {f3}");
+        assert!(f3.contains("adeclick=threshold=1.50"), "declick missing/miscalibrated: {f3}");
+        assert!(
+            f3.find("adeclick=").unwrap() < f3.find("afftdn=").unwrap(),
+            "de-click must precede denoise: {f3}"
+        );
+        assert!(f.contains("highpass=f=80"), "voice treat missing: {f}");
+        assert!(f.contains("acompressor="), "compress missing: {f}");
+        assert!(f.contains("volume='0.8000+(0.2000-0.8000)*t/"), "vol ramp missing: {f}");
+        assert!(f.contains("afade=t=in:st=0:d=0.500"), "fade in missing: {f}");
+        assert!(f.contains("afade=t=out:st=3.250:d=0.750"), "fade out missing: {f}");
+        assert!(f.contains("adelay=500:all=1[au0]"), "sync delay missing: {f}");
+
+        // Podcast already compresses — a second compressor would double-glue.
+        let pod = AudioSpec {
+            path: "v.m4a".into(),
+            out_s: 2.0,
+            treat: "Podcast".into(),
+            compress: 1.0,
+            ..Default::default()
+        };
+        let chain = a1_audio(0, 0, &pod);
+        assert!(chain.contains("acompressor="));
+        assert_eq!(
+            chain.matches("acompressor=").count(),
+            1,
+            "podcast + compress slider must not stack: {chain}"
+        );
+
+        for name in AUDIO_TREATS {
+            if *name == "None" {
+                assert!(audio_treat_chain(name).is_empty());
+            } else {
+                assert!(!audio_treat_chain(name).is_empty(), "{name}");
+            }
+        }
     }
 
     // A reel with both a transition and background music: the main track's
@@ -2686,6 +3811,7 @@ mod tests {
             at: 0.0,
             volume: 0.6,
             duck: 0.7,
+            ..Default::default()
         }];
         let out = dir.join("out.mp4");
         let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
@@ -2826,6 +3952,60 @@ mod tests {
     }
 
     #[test]
+    fn curve_compiles_to_a_clamped_piecewise_ffmpeg_expression() {
+        use crate::keyframe::{Animated, Interp, Key};
+
+        // A constant is just its number — no if() machinery.
+        assert_eq!(curve_expr(&Animated::Const(1.2), "it"), "1.20000");
+
+        // A 1.0 → 1.2 linear zoom over 0..2s: clamps below t0 and above the last
+        // key, and interpolates the segment in between.
+        let z = curve_expr(
+            &Animated::curve(vec![
+                Key { t: 0.0, v: 1.0, interp: Interp::Linear },
+                Key { t: 2.0, v: 1.2, interp: Interp::Linear },
+            ]),
+            "it",
+        );
+        assert!(z.contains("if(lt(it,0.00000),1.00000"), "missing pre-clamp: {z}");
+        assert!(z.contains("if(lt(it,2.00000)"), "missing segment split: {z}");
+        assert!(z.contains("1.20000"), "missing end value: {z}");
+
+        // A static AnimatedTransform emits the proven static chain byte-for-byte.
+        let s = AnimatedTransform::from(Transform { scale: 1.3, ..Default::default() });
+        assert_eq!(s.chain(W, H, false), transform_chain(&s.pose(), W, H, false));
+    }
+
+    #[tokio::test]
+    async fn a_keyframed_zoom_animates_in_the_shared_preview_export_chain() {
+        let dir = std::env::temp_dir().join("morreel-kb-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("photo.png").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=800x600:rate=1",
+            "-frames:v", "1", &png,
+        ])
+        .await
+        .unwrap();
+
+        // A Ken Burns zoom authored as a scale curve, 1.0 → 1.6 over 3s.
+        let mut kb = AnimatedTransform::default();
+        kb.scale = Animated::curve(vec![
+            Key { t: 0.0, v: 1.0, interp: Interp::Linear },
+            Key { t: 3.0, v: 1.6, interp: Interp::Linear },
+        ]);
+        let chain = kb.chain(W, H, false);
+        assert!(chain.contains("zoompan"), "animated scale must compile to zoompan: {chain}");
+
+        // The one chain feeds preview; rendered at two playhead times it must
+        // differ (the zoom moved) — the whole point of preview == export.
+        let early = frame_data_uri(&png, 0.0, 108, 192, "Crop", &chain, Over::default()).await.unwrap();
+        let later = frame_data_uri(&png, 2.5, 108, 192, "Crop", &chain, Over::default()).await.unwrap();
+        assert_ne!(early, later, "keyframed zoom froze at its opening pose");
+    }
+
+    #[test]
     fn shape_colours_come_out_as_numbers_geq_understands() {
         assert_eq!(rgb_of("black"), (0, 0, 0));
         assert_eq!(rgb_of("white"), (255, 255, 255));
@@ -2941,13 +4121,144 @@ mod tests {
         assert_ne!(composed, later, "title never composited onto the effect frame");
     }
 
+    #[tokio::test]
+    async fn blur_framing_renders_through_the_real_graph() {
+        let dir = std::env::temp_dir().join("morreel-blur-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("wide.png").display().to_string();
+        // A landscape source — exactly what Blur is for.
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=1280x720:rate=1",
+            "-frames:v", "1", &png,
+        ])
+        .await
+        .unwrap();
+        // Proves the split/overlay blur graph is valid ffmpeg once embedded in the
+        // shared filter_complex — the whole reason the labels carry a tag.
+        let uri = frame_data_uri(&png, 0.0, 540, 960, "Blur", "", Over::default()).await.unwrap();
+        assert!(uri.starts_with("data:image/jpeg;base64,"), "blur framing produced no frame");
+    }
+
+    #[test]
+    fn background_fills_the_pad_behind_a_banded_clip() {
+        // A band (scaled short) on V1 pads with the chosen colour.
+        let band = Transform { scale_y: 0.34, bg: Bg::White, ..Default::default() };
+        let chain = transform_chain(&band, W, H, false);
+        assert!(chain.contains("color=white"), "white background not in the pad: {chain}");
+        // Default (and every pre-Bg project) stays black.
+        assert!(transform_chain(&Transform { scale_y: 0.34, ..Default::default() }, W, H, false).contains("color=black"));
+        // A composited overlay ignores bg — it must pad transparent, or a PiP
+        // would black out the V1 clip beneath it.
+        assert!(transform_chain(&Transform { scale: 0.5, bg: Bg::White, ..Default::default() }, W, H, true).contains("color=black@0"));
+        // Background alone (full-frame clip) is still the identity — no padding,
+        // nothing to fill, so no filter is emitted.
+        assert!(Transform { bg: Bg::White, ..Default::default() }.is_identity());
+    }
+
+    #[test]
+    fn cover_band_crops_undistorted_instead_of_squishing() {
+        // A plain short band stretches the whole frame into the strip.
+        let squished = transform_chain(&Transform { scale_y: 0.34, ..Default::default() }, W, H, false);
+        assert!(squished.contains(&format!("scale={W}:{}", (H as f64 * 0.34).round() as u32 & !1)));
+        assert!(!squished.contains("force_original_aspect_ratio"), "stretch must not crop");
+        // The same band with cover keeps the picture's aspect: scale-to-cover the
+        // box, then crop it — the frame_chain "Crop" idiom, so no vertical squish.
+        let covered = transform_chain(&Transform { scale_y: 0.34, cover: true, ..Default::default() }, W, H, false);
+        let sh = (H as f64 * 0.34).round() as u32 & !1;
+        assert!(covered.contains(&format!("scale={W}:{sh}:force_original_aspect_ratio=increase,crop={W}:{sh}")), "{covered}");
+    }
+
+    #[test]
+    fn align_snaps_the_box_by_its_own_height() {
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // The point of the whole thing: two bands of different heights, both
+        // aligned to the bottom of the frame, land at *different* y — each half
+        // its own height up from the edge. A fixed preset would put both at one y
+        // and float the taller one off the bottom.
+        let mut short = Transform { scale_y: 0.34, ..Default::default() };
+        short.align_to(Align::Bottom, AlignBox::FRAME);
+        assert!(near(short.y, 0.5 - 0.17), "short band bottom: {}", short.y);
+        let mut tall = Transform { scale_y: 0.50, ..Default::default() };
+        tall.align_to(Align::Bottom, AlignBox::FRAME);
+        assert!(near(tall.y, 0.5 - 0.25), "tall band bottom: {}", tall.y);
+        assert!(short.y != tall.y, "different heights must give different offsets");
+
+        // Top to the safe area sits below the 8% header inset, not the frame edge.
+        let mut t = Transform { scale_y: 0.34, ..Default::default() };
+        t.align_to(Align::Top, AlignBox::SAFE);
+        assert!(near(t.y, -0.5 + 0.08 + 0.17), "safe top: {}", t.y);
+
+        // Centres are pure midpoints, independent of size; the untouched axis is
+        // left exactly where it was.
+        let mut c = Transform { scale: 0.5, x: 0.3, y: 0.3, ..Default::default() };
+        c.align_to(Align::VCenter, AlignBox::FRAME);
+        assert!(near(c.y, 0.0) && near(c.x, 0.3), "vcenter moved x: {c:?}");
+        c.align_to(Align::HCenter, AlignBox::SAFE);
+        assert!(near(c.x, (-0.5 + (0.5 - 0.18)) / 2.0), "safe hcenter: {}", c.x);
+
+        // A right-aligned PiP tucks its right edge against the reference.
+        let mut p = Transform { scale: 0.4, ..Default::default() };
+        p.align_to(Align::Right, AlignBox::SAFE);
+        assert!(near(p.x, (0.5 - 0.18) - 0.2), "safe right: {}", p.x);
+    }
+
+    #[test]
+    fn grade_is_identity_by_default_and_loads_old_projects() {
+        // The whole back-compat contract: an element saved before grades existed
+        // has no `grade`, so it deserialises to the default, which emits nothing.
+        let g: Grade = serde_json::from_str("{}").unwrap();
+        assert_eq!(g, Grade::default());
+        assert!(g.is_identity());
+        assert_eq!(g.chain(), "");
+
+        // A neutral grade set field-by-field still emits nothing.
+        assert!(Grade { exposure: 0.0, contrast: 1.0, saturation: 1.0, warmth: 6500.0 }
+            .chain()
+            .is_empty());
+    }
+
+    #[test]
+    fn grade_emits_only_the_knobs_that_moved() {
+        // Warmth alone is one filter, not an eq with default args riding along.
+        let warm = Grade { warmth: 4500.0, ..Default::default() };
+        assert_eq!(warm.chain(), "colortemperature=4500");
+
+        // eq carries the three tone knobs in one pass; warmth stays out of it.
+        let tone = Grade { exposure: 0.1, contrast: 1.2, saturation: 1.3, ..Default::default() };
+        assert_eq!(tone.chain(), "eq=brightness=0.100:contrast=1.200:saturation=1.300");
+
+        // Both halves present join with a comma, tone before temperature.
+        let both = Grade { saturation: 0.5, warmth: 8000.0, ..Default::default() };
+        assert_eq!(both.chain(), "eq=brightness=0.000:contrast=1.000:saturation=0.500,colortemperature=8000");
+    }
+
     #[test]
     fn framing_chains() {
-        assert!(frame_chain("Fit", 1080, 1920).contains("pad=1080:1920"));
-        assert!(frame_chain("Zoom", 1080, 1920).starts_with("scale=1620:2880"));
+        assert!(frame_chain("Fit", 1080, 1920, "c0").contains("pad=1080:1920"));
+        // A "Fit" letterbox is black by default but takes the chosen Background,
+        // so a landscape clip's bands honour it the same way a banded clip's do.
+        assert!(frame_chain("Fit", 1080, 1920, "c0").contains(":color=black"));
+        assert!(frame_chain_fill("Fit", 1080, 1920, "c0", "white").contains(":color=white"));
+        // Covering framings ignore the fill — there's nothing to letterbox.
+        assert_eq!(
+            frame_chain_fill("Crop", 1080, 1920, "c0", "white"),
+            frame_chain("Crop", 1080, 1920, "c0")
+        );
+        assert!(frame_chain("Zoom", 1080, 1920, "c0").starts_with("scale=1620:2880"));
         // default and unknown names center-crop
-        assert_eq!(frame_chain("", 1080, 1920), frame_chain("Crop", 1080, 1920));
-        assert!(frame_chain("Crop", 1080, 1920).ends_with("crop=1080:1920"));
+        assert_eq!(frame_chain("", 1080, 1920, "c0"), frame_chain("Crop", 1080, 1920, "c0"));
+        assert!(frame_chain("Crop", 1080, 1920, "c0").ends_with("crop=1080:1920"));
+
+        // Blur fits over a blurred zoomed copy; the split labels carry the tag so
+        // two clips in one filter_complex don't collide, and blur scales to size.
+        let b0 = frame_chain("Blur", 1080, 1920, "c0");
+        assert!(b0.contains("split=2[bgc0][fgc0]") && b0.contains("gblur=sigma=24.0"), "{b0}");
+        assert!(b0.trim_end().ends_with("overlay=(W-w)/2:(H-h)/2"), "{b0}");
+        let b1 = frame_chain("Blur", 1080, 1920, "c1");
+        assert!(!b1.contains("[bgc0]"), "labels must be unique per item");
+        // Smaller frame → gentler blur, so a thumbnail isn't a smear.
+        assert!(frame_chain("Blur", 108, 192, "m").contains("gblur=sigma=2.4"));
     }
 
     #[test]
@@ -2956,17 +4267,37 @@ mod tests {
             ClipSpec { path: "a.mp4".into(), in_s: 0.5, out_s: 2.0, has_audio: true, ..Default::default() },
             ClipSpec { path: "b.mp4".into(), in_s: 0.0, out_s: 1.0, has_audio: false, ..Default::default() },
         ];
-        let audio = [AudioSpec { path: "m.mp3".into(), in_s: 0.0, out_s: 2.0, at: 1.0, volume: 0.5, duck: 0.0 }];
+        let audio = [AudioSpec {
+            path: "m.mp3".into(),
+            in_s: 0.0,
+            out_s: 2.0,
+            at: 1.0,
+            volume: 0.5,
+            ..Default::default()
+        }];
         let f = build_audio_filter(&clips, &audio);
         assert!(f.contains("[0:a]atrim=start=0.500:end=2.000"));
         assert!(f.contains("anullsrc"));
         assert!(f.contains("[a0][a1]concat=n=2:v=0:a=1[ac]"));
         // audio inputs follow the clips: index 2, not 4 as in the full export graph
-        assert!(f.contains("[2:a]") && f.contains("volume=0.50,adelay=1000:all=1[au0]"));
+        assert!(f.contains("[2:a]") && f.contains("volume=0.500") && f.contains("adelay=1000:all=1[au0]"), "{f}");
         assert!(f.ends_with("amix=inputs=2:duration=first:normalize=0[aout]"));
 
         // no A1 degenerates to the concat fed straight through
         assert!(build_audio_filter(&clips, &[]).ends_with("[ac]anull[aout]"));
+    }
+
+    #[test]
+    fn loudness_measure_and_gain() {
+        // parse the value off loudnorm's JSON dump, ignoring the log above it
+        let log = "  size=N/A time=00:00:01\n{\n\t\"input_i\" : \"-23.45\",\n\t\"input_tp\" : \"-3.0\"\n}";
+        assert_eq!(parse_loudnorm_i(log), Some(-23.45));
+        assert_eq!(parse_loudnorm_i("nothing here"), None);
+        // quieter-than-target clip is boosted (>1x); already at target ≈ unity
+        assert!(normalize_gain(-23.0, -14.0) > 1.0);
+        assert!((normalize_gain(-14.0, -14.0) - 1.0).abs() < 1e-9);
+        // a near-silent clip can't be boosted past the ceiling
+        assert_eq!(normalize_gain(-90.0, -14.0), 4.0);
     }
 
     #[tokio::test]
@@ -3017,7 +4348,14 @@ mod tests {
             ClipSpec { path: b.clone(), in_s: 0.0, out_s: 1.0, has_audio: false, ..Default::default() },
         ];
         let overlays = [OverlaySpec { path: b, in_s: 0.0, out_s: 0.5, at: 0.2, effect: "vignette".into(), ..Default::default() }];
-        let audio = [AudioSpec { path: a, in_s: 0.0, out_s: 1.0, at: 0.5, volume: 0.6, duck: 0.0 }];
+        let audio = [AudioSpec {
+            path: a,
+            in_s: 0.0,
+            out_s: 1.0,
+            at: 0.5,
+            volume: 0.6,
+            ..Default::default()
+        }];
         // a beveled title card over the first second
         let png = render_title(&TitleStyle { text: "MorReel".into(), font_size: 120, bevel: "Cameo".into(), ..Default::default() }).await.unwrap();
         assert!(std::fs::metadata(&png).unwrap().len() > 0);
