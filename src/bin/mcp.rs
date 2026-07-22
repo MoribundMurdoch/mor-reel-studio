@@ -115,7 +115,71 @@ fn tool_specs() -> Value {
                 "zoom": {"type":"number"}, "center": {"type":"boolean"}
             })), "required": ["project","lane","index","samples"] },
         },
+        // The `edit` plugin — plain timeline verbs. These drive the *running*
+        // editor (start MorReel with MORREEL_LIVE=1); they need app state, not a
+        // file, so offline they return a message saying so.
+        {
+            "name": "set_effect",
+            "description": "Set a V1/V2 item's effect/look preset. effect is the preset name; amount (0..1, default 1) is its strength. Live editor only.",
+            "inputSchema": { "type": "object", "properties": merge(&target, &json!({
+                "effect": {"type":"string"}, "amount": {"type":"number"}
+            })), "required": ["lane","index","effect"] },
+        },
+        {
+            "name": "set_speed",
+            "description": "Retime a V1/V2 item: speed (0.1..10, 1=normal) and/or reverse (bool). At least one required. Live editor only.",
+            "inputSchema": { "type": "object", "properties": merge(&target, &json!({
+                "speed": {"type":"number"}, "reverse": {"type":"boolean"}
+            })), "required": ["lane","index"] },
+        },
+        {
+            "name": "trim",
+            "description": "Set a V1/V2 item's source trim: in and/or out, in seconds. Kept in order within the source duration. Live editor only.",
+            "inputSchema": { "type": "object", "properties": merge(&target, &json!({
+                "in": {"type":"number"}, "out": {"type":"number"}
+            })), "required": ["lane","index"] },
+        },
+        {
+            "name": "enable",
+            "description": "Enable/disable a V1/V2 item (invisible+silent, still on the timeline). on=<bool>. Live editor only.",
+            "inputSchema": { "type": "object", "properties": merge(&target, &json!({
+                "on": {"type":"boolean"}
+            })), "required": ["lane","index","on"] },
+        },
+        {
+            "name": "set_volume",
+            "description": "Set a V1 clip's audio gain: volume (0..2) and/or mute (bool). V1 only. Live editor only.",
+            "inputSchema": { "type": "object", "properties": merge(&target, &json!({
+                "volume": {"type":"number"}, "mute": {"type":"boolean"}
+            })), "required": ["lane","index"] },
+        },
+        {
+            "name": "remove",
+            "description": "Delete a V1/V2 item from its lane (later indices shift down). Live editor only.",
+            "inputSchema": { "type": "object", "properties": merge(&target, &json!({})),
+                "required": ["lane","index"] },
+        },
+        {
+            "name": "get_frame",
+            "description": "Render a V1/V2 clip's source frame and return the PNG file path — so you can SEE the shot (read the image) and then reframe it with place_box / place_point / track_point. This is how you 'Smart Conform' a horizontal clip into 9:16: look at the whole uncropped frame, find the subject, then place/track it. `at` = seconds into the source (default: clip midpoint). Live editor only.",
+            "inputSchema": { "type": "object", "properties": merge(&target, &json!({
+                "at": {"type":"number"}
+            })), "required": ["lane","index"] },
+        },
     ])
+}
+
+/// Which in-app plugin owns a tool name — so the live path forwards the call to
+/// the right handler. The `edit` verbs go to the edit plugin; everything else is
+/// coords. Kept in sync with [`crate::plugin`] by hand (two small lists).
+const EDIT_TOOLS: &[&str] = &["set_effect", "set_speed", "trim", "enable", "set_volume", "remove"];
+
+fn plugin_for(tool: &str) -> &'static str {
+    if EDIT_TOOLS.contains(&tool) {
+        "edit"
+    } else {
+        "coords"
+    }
 }
 
 fn merge(a: &Value, b: &Value) -> Value {
@@ -145,6 +209,13 @@ fn apply(name: &str, args: &Value) -> Result<String, String> {
     // of editing a file. `project` isn't needed — the app already has one loaded.
     if let Some(port) = live_port() {
         return call_live(port, name, args);
+    }
+    // The edit verbs (and get_frame) act on the live app, not a file — offline
+    // there's nothing to mutate or render, so say how to reach them.
+    if plugin_for(name) == "edit" || name == "get_frame" {
+        return Err(format!(
+            "'{name}' drives the running editor — start MorReel with MORREEL_LIVE=1 (or set MORREEL_LIVE_PORT). Offline, only the coords tools edit a .morreel file."
+        ));
     }
     let project = args.get("project").and_then(Value::as_str).ok_or("missing 'project' path")?.to_string();
     if name == "list_items" {
@@ -284,7 +355,7 @@ fn call_live(port: u16, tool: &str, args: &Value) -> Result<String, String> {
             json!({ "lane": lane.ok_or("missing 'lane'")?, "index": index.ok_or("missing 'index'")? }),
         );
     }
-    let req = json!({ "plugin": "coords", "tool": tool, "params": Value::Object(params) });
+    let req = json!({ "plugin": plugin_for(tool), "tool": tool, "params": Value::Object(params) });
 
     let stream = std::net::TcpStream::connect(("127.0.0.1", port))
         .map_err(|e| format!("MorReel live app not reachable on 127.0.0.1:{port} ({e}); start the editor or unset MORREEL_LIVE"))?;

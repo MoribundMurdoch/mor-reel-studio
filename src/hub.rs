@@ -98,6 +98,47 @@ pub fn set_hub_dir(dir: &Path) -> Result<(), String> {
     std::fs::write(hub_path_file(), dir.to_string_lossy().as_bytes()).map_err(|e| e.to_string())
 }
 
+/// The canonical hub repo — cloned on demand so a user doesn't have to `git clone`
+/// by hand before browsing plugins.
+const HUB_REPO: &str = "https://github.com/MoribundMurdoch/mor-reel-studio-plugin-hub";
+
+/// MorReel's own managed checkout of the hub, under the config dir. Kept separate
+/// from a user's hand-picked `set_hub_dir` folder so "fetch" only ever touches the
+/// clone it owns.
+fn managed_hub_dir() -> PathBuf {
+    config_dir().join("plugin-hub")
+}
+
+/// Clone the canonical hub (or `git pull` it if already fetched) and point MorReel
+/// at it. Shells out to `git` — same shell-over-engine stance as the ffmpeg engine,
+/// so no HTTP client or new dependency, and `pull` is the natural "check for new
+/// plugins". Only ever fetches manifests; installing a plugin stays a separate,
+/// consent-gated step. Returns the checkout dir for the caller to reload from.
+pub async fn fetch_hub() -> Result<PathBuf, String> {
+    let dir = managed_hub_dir();
+    if dir.join(".git").is_dir() {
+        run_git(&["-C", &dir.to_string_lossy(), "pull", "--ff-only"]).await?;
+    } else {
+        std::fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
+        run_git(&["clone", "--depth", "1", HUB_REPO, &dir.to_string_lossy()]).await?;
+    }
+    set_hub_dir(&dir)?;
+    Ok(dir)
+}
+
+async fn run_git(args: &[&str]) -> Result<(), String> {
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("can't run git ({e}) — install git, or clone the hub manually and choose its folder"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// Parse every `plugins/*.json` in the hub checkout. Bad files are skipped (with
 /// their name), never fatal — one broken manifest can't hide the rest.
 pub fn load_manifests(hub_dir: &Path) -> Vec<Manifest> {
@@ -175,7 +216,7 @@ impl InstallState {
 /// enabled** `mcp` plugin — the shape a Claude Code `.mcp.json` uses. The user
 /// points Claude Code at the written file (or copies an entry into their project
 /// `.mcp.json`); this is the consent boundary — MorReel never launches these.
-pub fn mcp_servers_doc(manifests: &[Manifest], state: &InstallState) -> serde_json::Value {
+fn mcp_servers_doc(manifests: &[Manifest], state: &InstallState) -> serde_json::Value {
     let mut servers = serde_json::Map::new();
     for m in manifests {
         if m.kind != Kind::Mcp || !state.is_enabled(&m.id) {

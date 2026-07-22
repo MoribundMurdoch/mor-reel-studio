@@ -83,7 +83,7 @@ impl<T: Copy> Animated<T> {
 /// Two keys closer than this in time are "the same" keyframe — one frame at
 /// 60fps. The diamond toggles the key at the playhead, and a click lands on
 /// whatever key is within a frame of it rather than stacking a second one.
-pub const KEY_EPS: f64 = 0.008;
+const KEY_EPS: f64 = 0.008;
 
 impl<T: Copy> Animated<T> {
     /// Current keys as an owned vec; a `Const` yields one implicit key at t=0.
@@ -138,23 +138,11 @@ where
     }
 }
 
-/// Values that can be interpolated between two keyframes. A 2D point (for a
-/// combined x/y Ken Burns move) implements this the same way once it's needed.
-pub trait Lerp {
-    fn lerp(self, to: Self, f: f64) -> Self;
-}
-
-impl Lerp for f64 {
-    fn lerp(self, to: f64, f: f64) -> f64 {
-        self + (to - self) * f
-    }
-}
-
-impl<T: Lerp + Copy> Animated<T> {
+impl Animated<f64> {
     /// The value at clip-local time `t`. Total by construction: a constant
     /// returns itself; a curve clamps to its endpoints outside its range (the
     /// standard hold) and interpolates the bracketing pair inside it.
-    pub fn sample(&self, t: f64) -> T {
+    pub fn sample(&self, t: f64) -> f64 {
         let keys = match self {
             Animated::Const(v) => return *v,
             Animated::Curve(k) => k,
@@ -172,7 +160,7 @@ impl<T: Lerp + Copy> Animated<T> {
         let (a, b) = (keys[j - 1], keys[j]);
         let span = b.t - a.t;
         let f = if span <= f64::EPSILON { 0.0 } else { (t - a.t) / span };
-        a.v.lerp(b.v, ease(b.interp, f))
+        a.v + (b.v - a.v) * ease(b.interp, f)
     }
 }
 

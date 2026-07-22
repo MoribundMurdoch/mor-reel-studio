@@ -198,10 +198,8 @@ pub fn compute_bevel(rgba: &[u8], width: u32, height: u32, params: &BevelParams)
     }
 
     let (gx, gy) = sobel(&height_map, w, h);
-    let mut depth_scale = params.depth as f32 / 50.0;
-    if params.cameo {
-        depth_scale = -depth_scale;
-    }
+    // Cameo inverts the relief so the shape reads as carved-in rather than raised.
+    let depth_scale = params.depth as f32 / 50.0 * if params.cameo { -1.0 } else { 1.0 };
 
     let az = params.angle.to_radians();
     let alt = params.altitude.to_radians();
