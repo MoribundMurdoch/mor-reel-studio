@@ -6,8 +6,8 @@
 //! Coordinate spaces, kept honest in one place so nothing downstream guesses:
 //!
 //! - **Model space** (input): normalized `0.0..=1.0`, origin **top-left**, `y` down
-//!   — the vision convention. Gemini-style `0..1000` integers go through
-//!   [`from_thousandths`] first.
+//!   — the vision convention. Divide Gemini-style `0..1000` integers by 1000 at
+//!   the boundary.
 //! - **Transform space** (output): fractional offset from the frame **centre**,
 //!   `+x` right, `+y` down, in units of one frame (`0.5` = half a frame). This is
 //!   exactly what `Transform.x`/`.y` mean, so a point at the top-left of the frame
@@ -23,13 +23,6 @@ use crate::keyframe::{Animated, Interp, Key};
 /// hair past the edge; clamping is friendlier than rejecting a whole detection.
 fn unit(v: f64) -> f64 {
     v.clamp(0.0, 1.0)
-}
-
-/// Convert a Gemini-style `0..1000` coordinate to the `0.0..=1.0` this module uses.
-/// Point/box constructors take `0..1` directly; call this at the boundary when a
-/// model reports thousandths.
-pub fn from_thousandths(v: f64) -> f64 {
-    v / 1000.0
 }
 
 /// A single location on the frame, model space (`0..1`, top-left origin).
@@ -148,12 +141,6 @@ mod tests {
         let tl = Point::new(0.0, 0.0); // top-left corner
         assert_eq!(tl.offset(), (-0.5, -0.5)); // place there → shift up-left
         assert_eq!(tl.centering_offset(), (0.5, 0.5)); // centre it → shift down-right
-    }
-
-    #[test]
-    fn thousandths_convert() {
-        let p = Point::new(from_thousandths(500.0), from_thousandths(1000.0));
-        assert_eq!(p.offset(), (0.0, 0.5));
     }
 
     #[test]

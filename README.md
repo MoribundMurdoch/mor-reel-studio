@@ -15,19 +15,31 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   waveform under its thumbnail, so a clip with no strip is a silent one.
   **Edit › Auto-cut silence…** drops quiet stretches by volume (threshold,
   padding, selection or whole reel) via ffmpeg silencedetect.
-- **Photos on the timeline** — drop a PNG/JPEG onto V1 or V2 and it loops for
-  as long as you hold it, so the Motion effects become camera moves over a
-  still. Same lanes, same effects, same export.
+- **Photos on the timeline** — drop a still (JPEG, PNG, HEIF/HEIC, TIFF, BMP,
+  WebP, AVIF) onto V1 or V2 and it loops for as long as you hold it, so the
+  Motion effects become camera moves over a photo. Same lanes, same effects,
+  same export. Animated GIF lands as video (it has duration); PDF, PSD and
+  camera RAW are out of scope — flatten or export to JPEG/PNG/HEIF first.
+- **Disable & Solo** — FCP-style: **Shift+D** disables the selection (dimmed on
+  the timeline, invisible and silent in preview/export, still keeps its span);
+  **Alt+S** solos it (other audio silent, non-soloed clips in B&W). Works on V1
+  clips, V2 cutaways, A-lane beds and titles (disable only).
+- **Clip appearance** — FCP-style timeline zoom and film/wave layout. **Ctrl+=/**
+  **Ctrl+-** zoom the timeline; the **⧉** button (status bar or View › Clip
+  appearance) opens modes for wave-only, film+wave mixes, film-only, or labels,
+  plus a clip height slider and “Show clip names”. **Ctrl+Alt+1…6** pick a mode;
+  **Ctrl+Alt+↑/↓** resize clip height.
 - **Drag and drop** — drag media in from a file manager and the lane you drop
   on decides what it becomes: a clip on V1, a cutaway on V2, music under on A1.
   The file has the final say, so audio aimed at a video lane still lands on A1
   and a video dropped on A1 contributes its soundtrack. The target lane lights
   up before you let go.
 - **Reads what ffmpeg reads** — MP4/MOV/MKV/WebM/AVI/GIF/MPEG-TS and the rest
-  for video, PNG/JPEG/WebP/HEIC/AVIF/TIFF for stills, MP3/M4A/WAV/FLAC/Ogg/
-  Opus for audio. The dialog filters are a convenience, not a gate: every one
-  also offers **All files**, and anything ffprobe can open will import — a
-  file with no duration but a video stream comes in as a still.
+  for video; JPEG/PNG/HEIF/TIFF/BMP/WebP/AVIF (and other single-frame formats
+  ffmpeg opens) for stills; MP3/M4A/WAV/FLAC/Ogg/Opus for audio. Dialog filters
+  are a convenience, not a gate: every one also offers **All files**, and
+  anything ffprobe can open will import — a file with no duration but a video
+  stream comes in as a still.
 - **Export options** — MP4 (H.264), WebM (VP9) or animated GIF; Draft /
   Balanced / High quality; 1080×1920, 720×1280 or 540×960. The edit is always
   composed at 1080×1920 and scaled once at the end of the graph, so a smaller
@@ -153,6 +165,29 @@ cargo run              # desktop app
 cargo test             # unit + end-to-end ffmpeg smoke tests
 MORREEL_MOBILE=1 cargo run   # preview the mobile layout on desktop
 ```
+
+## Terminal control (`morreel` CLI)
+
+The running editor listens on `127.0.0.1:8177` for live commands (set
+`MORREEL_LIVE_PORT` to move it). The `morreel` binary is a thin client for that
+port — same wire protocol the MCP server's live path uses — so power users can
+drive the open GUI from a shell and agents can skip an MCP client entirely.
+
+```bash
+cargo build --bin morreel        # or `cargo install --path . --bin morreel`
+morreel tools                    # what plugins/tools the editor exposes
+morreel items                    # V1 clips / V2 overlays and their indices
+morreel place_point lane=V1 index=0 x=0.5 y=0.4
+morreel place_box  lane=V2 index=1 x0=0.1 y0=0.1 x1=0.9 y1=0.9 cover=true
+morreel track_point lane=V1 index=0 \
+  --json '{"samples":[{"t":0,"x":0.2,"y":0.5},{"t":2,"x":0.8,"y":0.5}],"zoom":1.5}'
+```
+
+`lane`/`index` fold into the `target` the plugins expect; a value that parses as
+JSON is sent typed, otherwise as a string; `--json` passes a full params object
+for anything the flat args can't express (like `samples`). Every command lands on
+the same undo stack a GUI edit does. Offline `.morreel` editing (for agents that
+prefer files over a live app) is the separate `mcp` binary / MCP server.
 
 ## License
 

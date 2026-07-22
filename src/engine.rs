@@ -11,7 +11,7 @@ use tokio::process::Command;
 /// Portrait-only output. Every clip is center-cropped to fill this frame.
 pub const W: u32 = 1080;
 pub const H: u32 = 1920;
-const FPS: u32 = 30;
+pub const FPS: u32 = 30;
 
 /// Where the picture sits inside the frame, how big it is, and how it is
 /// turned — the Final Cut "Transform" set, which kdenlive calls Position,
@@ -97,6 +97,14 @@ pub struct Transform {
     /// and old projects load exactly as saved.
     #[serde(default)]
     pub cover: bool,
+    /// The pivot that rotation turns around, as a fraction offset from the picture
+    /// centre (same units as `x`/`y`). `(0,0)` = centre, so every existing project
+    /// is unchanged. Like Final Cut's Anchor, Position places the anchor, so moving
+    /// it shifts the picture; it is a set-once reference, not keyframed.
+    #[serde(default)]
+    pub anchor_x: f64,
+    #[serde(default)]
+    pub anchor_y: f64,
 }
 
 fn unit() -> f64 {
@@ -117,6 +125,8 @@ impl Default for Transform {
             opacity: 1.0,
             bg: Bg::Black,
             cover: false,
+            anchor_x: 0.0,
+            anchor_y: 0.0,
         }
     }
 }
@@ -158,6 +168,11 @@ pub struct AnimatedTransform {
     /// Cover-crop the box instead of stretching — not animated, a fit is a fit.
     #[serde(default)]
     pub cover: bool,
+    /// Rotation pivot offset from centre — not animated, a pivot is a reference.
+    #[serde(default)]
+    pub anchor_x: f64,
+    #[serde(default)]
+    pub anchor_y: f64,
 }
 
 fn anim_one() -> Animated<f64> {
@@ -188,6 +203,8 @@ impl From<Transform> for AnimatedTransform {
             opacity: Animated::Const(p.opacity),
             bg: p.bg,
             cover: p.cover,
+            anchor_x: p.anchor_x,
+            anchor_y: p.anchor_y,
         }
     }
 }
@@ -208,6 +225,8 @@ impl AnimatedTransform {
             opacity: self.opacity.sample(t),
             bg: self.bg,
             cover: self.cover,
+            anchor_x: self.anchor_x,
+            anchor_y: self.anchor_y,
         }
     }
 
@@ -259,9 +278,14 @@ impl AnimatedTransform {
             c += &format!("format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*clip({a},0,1)'");
             c
         };
+        // A keyframed rotation without a keyframed scale still takes the static
+        // geometry (no zoompan), with the spin threaded through as an angle
+        // expression — clip-local `t`, the same clock the fade above uses.
+        let rot_expr =
+            self.rotation.is_animated().then(|| format!("({})*PI/180", curve_expr(&self.rotation, "t")));
         if !self.scale.is_animated() {
             let p = if fade { Transform { opacity: 1.0, ..self.pose() } } else { self.pose() };
-            return with_fade(transform_chain(&p, w, h, alpha));
+            return with_fade(transform_chain_rot(&p, w, h, alpha, rot_expr.as_deref()));
         }
         let p = self.pose();
         let z = curve_expr(&self.scale, "it");
@@ -296,8 +320,15 @@ impl AnimatedTransform {
             pan(&self.x, "iw"),
             pan(&self.y, "ih")
         );
-        if p.rotation.abs() > 1e-6 {
-            c += &format!(",rotate={:.5}:c=black", p.rotation.to_radians());
+        // ponytail: the anchor pivot isn't applied in the zoompan branch — this
+        // rotate turns about the frame centre. Anchor + a keyframed *scale* at once
+        // is the rare case; it waits on the same zoompan-geometry migration as the
+        // rest. Anchor with keyframed *rotation* (the "swing in") takes the static
+        // branch above, where it is honoured.
+        match &rot_expr {
+            Some(e) => c += &format!(",rotate=a='{e}':c=black"),
+            None if p.rotation.abs() > 1e-6 => c += &format!(",rotate={:.5}:c=black", p.rotation.to_radians()),
+            None => {}
         }
         if alpha && !fade && p.opacity < 0.999 {
             c += &format!(",colorchannelmixer=aa={:.3}", p.opacity.clamp(0.0, 1.0));
@@ -350,6 +381,10 @@ impl Transform {
             && self.y.abs() < 1e-6
             && self.rotation.abs() < 1e-6
             && (self.opacity - 1.0).abs() < 1e-6
+            // A moved anchor shifts the picture (Position places the anchor), so
+            // it is not identity even with no rotation.
+            && self.anchor_x.abs() < 1e-6
+            && self.anchor_y.abs() < 1e-6
     }
 }
 
@@ -360,7 +395,18 @@ impl Transform {
 /// scaled-down V2 cutaway would black out the V1 clip it is supposed to sit on
 /// top of. That is what makes picture-in-picture work.
 pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
-    if t.is_identity() {
+    transform_chain_rot(t, w, h, alpha, None)
+}
+
+/// As [`transform_chain`], but `rot_expr` — an ffmpeg angle expression in radians
+/// using `t` (clip-local seconds) — overrides the constant rotation for a
+/// keyframed spin. The `rotate` filter stays in the same mid-chain position, so
+/// the geometry is byte-identical to the static path; only the angle varies with
+/// time. `None` reproduces `transform_chain` exactly.
+fn transform_chain_rot(t: &Transform, w: u32, h: u32, alpha: bool, rot_expr: Option<&str>) -> String {
+    // An animated rotation is never "identity" even from a 0° start pose, so only
+    // short-circuit when there's no spin to add.
+    if rot_expr.is_none() && t.is_identity() {
         return String::new();
     }
     // Every dimension is computed here rather than as an ffmpeg expression, so
@@ -371,10 +417,17 @@ pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
     let sh = even(h as f64 * t.scale * t.scale_y.max(0.01));
     let dx = (t.x * w as f64).round() as i64;
     let dy = (t.y * h as f64).round() as i64;
+    // Anchor: pad the scaled picture so the rotation pivot sits at the canvas
+    // centre; the `rotate` below then turns about it. `bw`/`bh` is that canvas.
+    // Position places the canvas centre (the anchor), so anchor (0,0) leaves
+    // bw,bh == sw,sh and the chain stays byte-identical to before.
+    let ax = (t.anchor_x * w as f64).round() as i64;
+    let ay = (t.anchor_y * h as f64).round() as i64;
+    let (bw, bh) = (sw + 2 * ax.unsigned_abs() as u32, sh + 2 * ay.unsigned_abs() as u32);
     // Pad out to whatever the offset crop needs, so the picture can be moved
     // clean off the edge of the frame instead of jamming against it.
-    let pw = even((sw as f64).max(w as f64 + 2.0 * dx.abs() as f64)).max(sw).max(w);
-    let ph = even((sh as f64).max(h as f64 + 2.0 * dy.abs() as f64)).max(sh).max(h);
+    let pw = even((bw as f64).max(w as f64 + 2.0 * dx.abs() as f64)).max(bw).max(w);
+    let ph = even((bh as f64).max(h as f64 + 2.0 * dy.abs() as f64)).max(bh).max(h);
     // A composited layer (V2) pads transparent; V1 pads with the chosen colour,
     // which is what shows behind a banded or shrunk clip.
     let fill = if alpha { "black@0" } else { t.bg.color() };
@@ -399,11 +452,20 @@ pub fn transform_chain(t: &Transform, w: u32, h: u32, alpha: bool) -> String {
     } else {
         c += &format!("scale={sw}:{sh}");
     }
-    if t.rotation.abs() > 1e-6 {
-        // rotate keeps the input size, so the corners it opens up take the fill.
-        c += &format!(",rotate={:.5}:c={fill}", t.rotation.to_radians());
+    // Anchor pad: extra room on the side away from the pivot, so the anchor lands
+    // at the bw×bh centre and `rotate` (next) turns about it. Skipped at (0,0).
+    if ax != 0 || ay != 0 {
+        let pad_l = ax.unsigned_abs() as i64 - ax; // |ax|-ax → 0 (ax≥0) or 2|ax| (ax<0)
+        let pad_t = ay.unsigned_abs() as i64 - ay;
+        c += &format!(",pad={bw}:{bh}:{pad_l}:{pad_t}:color={fill}");
     }
-    c += &format!(",pad={pw}:{ph}:{}:{}:color={fill}", (pw - sw) / 2, (ph - sh) / 2);
+    // rotate keeps the input size, so the corners it opens up take the fill.
+    match rot_expr {
+        Some(e) => c += &format!(",rotate=a='{e}':c={fill}"),
+        None if t.rotation.abs() > 1e-6 => c += &format!(",rotate={:.5}:c={fill}", t.rotation.to_radians()),
+        None => {}
+    }
+    c += &format!(",pad={pw}:{ph}:{}:{}:color={fill}", (pw - bw) / 2, (ph - bh) / 2);
     // Positive x moves the picture right, so the window it is seen through
     // moves left by the same amount.
     c += &format!(
@@ -562,10 +624,24 @@ pub const VIDEO_EXT: &[&str] = &[
     "flv", "wmv", "asf", "3gp", "3g2", "ogv", "vob", "mxf", "divx", "f4v", "rm", "rmvb", "y4m",
 ];
 
-/// Anything ffmpeg decodes to a single frame. These take the `-loop 1` path.
+/// Still formats that take the `-loop 1` path (one frame, held for the Out span).
+///
+/// **Primary** (reel-native — phone photos, design exports, web stills): JPEG,
+/// PNG, HEIF/HEIC, TIFF, BMP, WebP, AVIF. These are the formats worth naming
+/// in UI copy and dialogs.
+///
+/// **Long tail**: single-frame containers ffmpeg already decodes (TGA, netpbm,
+/// EXR, …). Kept because every dialog also offers **All files** and `probe`
+/// imports anything with a video stream and no duration.
+///
+/// **Not product targets:** PDF (multi-page document), PSD (flatten to PNG
+/// externally), camera RAW (export JPEG/HEIF first — demosaic is not our job).
+/// GIF is video, not a still — see `VIDEO_EXT`.
 pub const IMAGE_EXT: &[&str] = &[
-    "png", "jpg", "jpeg", "jfif", "webp", "bmp", "tif", "tiff", "avif", "heic", "heif", "tga",
-    "ppm", "pgm", "pbm", "pnm", "dds", "ico", "jp2", "j2k", "exr", "hdr", "qoi",
+    // Primary
+    "png", "jpg", "jpeg", "jfif", "heic", "heif", "tif", "tiff", "bmp", "webp", "avif",
+    // Long tail (free via ffmpeg; not marketed)
+    "tga", "ppm", "pgm", "pbm", "pnm", "dds", "ico", "jp2", "j2k", "exr", "hdr", "qoi",
 ];
 
 pub const AUDIO_EXT: &[&str] = &[
@@ -638,8 +714,10 @@ pub fn font_families() -> &'static [String] {
 /// timeline, a fade — and nothing a title does not.
 pub const TITLE_KINDS: &[&str] = &["Text", "Box", "Ellipse", "Line"];
 
-/// Numeric colour for geq, which cannot take the names drawtext accepts.
-fn rgb_of(color: &str) -> (u32, u32, u32) {
+/// An ffmpeg colour name or `#RRGGBB` as an `(r, g, b)` triple — for geq and ASS,
+/// which cannot take the names drawtext accepts. Only what the colour picker can
+/// produce is covered; anything else falls back to white rather than break a render.
+fn hex_rgb(color: &str) -> (u32, u32, u32) {
     match color {
         "black" => (0, 0, 0),
         hex if hex.len() == 7 && hex.starts_with('#') => {
@@ -656,7 +734,7 @@ fn rgb_of(color: &str) -> (u32, u32, u32) {
 /// transparent canvas a title card is rasterized onto, its box comes out fully
 /// coloured and completely invisible.
 fn shape_chain(s: &TitleStyle, w: u32, h: u32) -> String {
-    let (r, g, b) = rgb_of(&s.color);
+    let (r, g, b) = hex_rgb(&s.color);
     let (fw, fh) = (w as f64, h as f64);
     let cx = fw * (0.5 + s.shape_x);
     let cy = fh * s.y_frac.clamp(0.0, 1.0);
@@ -743,6 +821,10 @@ pub struct ClipSpec {
     pub transition: String,
     /// How long that transition runs. 0 means a straight cut.
     pub trans_dur: f64,
+    /// When false, the clip keeps its timeline span but contributes black
+    /// video and silence (FCP Clip › Disable). Still occupies duration so
+    /// neighbours do not ripple.
+    pub enabled: bool,
 }
 
 /// Hand-written so `..Default::default()` can never leave `speed` at 0.0 and
@@ -764,6 +846,7 @@ impl Default for ClipSpec {
             treat: "None".to_string(),
             transition: String::new(),
             trans_dur: 0.0,
+            enabled: true,
         }
     }
 }
@@ -963,6 +1046,10 @@ pub struct OverlaySpec {
     pub speed: f64,
     /// Play the trimmed span backwards.
     pub reverse: bool,
+    /// ffmpeg `blend` mode ("screen", "addition", …) to composite this layer with
+    /// instead of the default alpha-over. Empty = normal overlay. For light leaks
+    /// and particle plates on black, "screen"/"addition" brighten V1 through them.
+    pub blend: String,
 }
 
 /// Hand-written for the same reason ClipSpec's is: a defaulted 0.0 rate would
@@ -978,6 +1065,7 @@ impl Default for OverlaySpec {
             framing: String::new(),
             speed: 1.0,
             reverse: false,
+            blend: String::new(),
         }
     }
 }
@@ -1266,13 +1354,6 @@ impl Default for TitleSpec {
 }
 
 impl TitleSpec {
-    /// How long the card takes to arrive, and to leave again. Tied to the
-    /// alpha fade so the movement and the fade finish together rather than
-    /// fighting each other.
-    fn anim_len(&self) -> f64 {
-        title_fade(self.dur)
-    }
-
     /// `overlay` x/y options that carry the card on and off, trailing colon
     /// included so they splice in front of the next option. Empty when the card
     /// should just sit where it was rasterized.
@@ -1287,7 +1368,9 @@ impl TitleSpec {
             "Slide in right" => (W as f64 * 0.5, 0.0),
             _ => return String::new(),
         };
-        let (a, d, len) = (self.at, self.dur, self.anim_len().max(0.01));
+        // `len`: how long the card takes to arrive and leave, tied to the alpha
+        // fade so the movement and the fade finish together.
+        let (a, d, len) = (self.at, self.dur, title_fade(self.dur).max(0.01));
         // 1 while off-position, 0 once settled. The two ramps are "how much
         // arrival is left" and "how much departure has begun"; only one is
         // positive at a time, so it is their max — a min would clamp to 0 for
@@ -1556,15 +1639,7 @@ fn finish_title(png: &std::path::Path, s: &TitleStyle) -> Result<String, String>
 /// *transparency* — 00 is fully opaque. Only the handful of names the colour
 /// picker can produce, plus hex, need covering.
 fn ass_color(c: &str, alpha: u8) -> String {
-    let (r, g, b) = match c {
-        "white" => (255u32, 255u32, 255u32),
-        "black" => (0, 0, 0),
-        hex if hex.starts_with('#') && hex.len() == 7 => {
-            let p = |i: usize| u32::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0);
-            (p(1), p(3), p(5))
-        }
-        _ => (255, 255, 255),
-    };
+    let (r, g, b) = hex_rgb(c);
     format!("&H{alpha:02X}{b:02X}{g:02X}{r:02X}&")
 }
 
@@ -1877,6 +1952,50 @@ fn cache_dir(sub: &str) -> std::path::PathBuf {
     base.join("morreel").join(sub)
 }
 
+/// Grab one source frame at `t` seconds and write it to the freeze-frame cache
+/// as a PNG. Content-addressed by path + time so repeating the same freeze is
+/// free. Stills just return their own path — there is nothing to grab.
+pub async fn extract_still(path: &str, t: f64) -> Result<String, String> {
+    if is_still(path) {
+        return Ok(path.to_string());
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    // Quantise to the millisecond so near-identical seeks share a file.
+    ((t * 1000.0).round() as i64).hash(&mut h);
+    if let Ok(m) = std::fs::metadata(path) {
+        m.len().hash(&mut h);
+        if let Ok(mt) = m.modified() {
+            mt.hash(&mut h);
+        }
+    }
+    let dir = cache_dir("freezes");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dst = dir.join(format!("{:016x}.png", h.finish()));
+    if dst.exists() {
+        return Ok(dst.display().to_string());
+    }
+    // Write to a temp name then rename so a killed extract never leaves a
+    // half-written PNG that would poison the next cache hit.
+    let tmp = dir.join(format!("{:016x}.part.png", h.finish()));
+    let out = Command::new("ffmpeg")
+        .args(["-y", "-v", "error"])
+        .args(["-ss", &format!("{t:.3}"), "-i", path])
+        .args(["-frames:v", "1", "-update", "1"])
+        .arg(tmp.as_os_str())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+    if !out.status.success() || !tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    std::fs::rename(&tmp, &dst).map_err(|e| e.to_string())?;
+    Ok(dst.display().to_string())
+}
+
 /// Cache path for a source's scrub proxy, keyed by path + mtime + size so an
 /// edited/replaced source gets a fresh proxy.
 fn proxy_path(src: &str) -> std::path::PathBuf {
@@ -1977,9 +2096,9 @@ fn frame_chain_fill(framing: &str, w: u32, h: u32, tag: &str, fill: &str) -> Str
 /// Audio chain for V1 clip at input `i` — silent clips get anullsrc so the
 /// concat stays aligned with the video track.
 fn clip_audio(i: usize, c: &ClipSpec) -> String {
-    // A muted clip becomes silence of the right length rather than a volume=0
-    // stream, so a muted source that also fails to decode can't stall the mix.
-    if c.has_audio && c.volume > 0.0 {
+    // Disabled or muted clips become silence of the right length rather than a
+    // volume=0 stream, so a bad source can't stall the mix.
+    if c.enabled && c.has_audio && c.volume > 0.0 {
         let tempo = atempo_chain(c.speed);
         let tempo = if tempo.is_empty() { String::new() } else { format!(",{tempo}") };
         let rev = if c.reverse { "areverse," } else { "" };
@@ -2040,6 +2159,16 @@ pub fn build_filter(
 ) -> String {
     let mut f = String::new();
     for (i, c) in clips.iter().enumerate() {
+        // Disabled: black of the right length, silence — still owns its extent
+        // so the magnetic timeline does not collapse under neighbours.
+        if !c.enabled {
+            f += &format!(
+                "color=c=black:s={W}x{H}:d={:.3}:r={FPS},format=yuv420p,setsar=1[v{i}];",
+                c.trimmed()
+            );
+            f += &clip_audio(i, c);
+            continue;
+        }
         // Dividing PTS by the speed is what retimes the video; fps= after it
         // resamples so slow motion gets duplicated frames instead of a stutter.
         f += &format!(
@@ -2124,11 +2253,24 @@ pub fn build_filter(
             eff(&o.effect),
             o.at,
         );
-        f += &format!(
-            "[{vl}][ov{j}]overlay=eof_action=pass:enable='between(t,{:.3},{:.3})'[vx{j}];",
-            o.at,
-            o.at + o.trimmed()
-        );
+        let span = (o.at, o.at + o.trimmed());
+        if o.blend.is_empty() {
+            f += &format!(
+                "[{vl}][ov{j}]overlay=eof_action=pass:enable='between(t,{:.3},{:.3})'[vx{j}];",
+                span.0, span.1
+            );
+        } else {
+            // Blend modes (screen/add/…) aren't `overlay` options, so screen the
+            // layer over a copy of the base for the whole timeline, then let the
+            // outer `overlay` show that blended copy only inside the layer's window
+            // and the clean base outside it — reusing the same enable-gate as above.
+            f += &format!(
+                "[{vl}]split[bl{j}a][bl{j}b];\
+                 [bl{j}b][ov{j}]blend=all_mode={}:shortest=0[bl{j}c];\
+                 [bl{j}a][bl{j}c]overlay=enable='between(t,{:.3},{:.3})'[vx{j}];",
+                o.blend, span.0, span.1
+            );
+        }
         vl = format!("vx{j}");
     }
 
@@ -2272,6 +2414,95 @@ pub fn normalize_gain(measured_lufs: f64, target_lufs: f64) -> f64 {
     10f64.powf(db / 20.0).clamp(0.05, 4.0)
 }
 
+/// Path for a new voiceover take under the cache dir (unique per call).
+pub fn voiceover_out_path() -> std::path::PathBuf {
+    let dir = cache_dir("voiceovers");
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    dir.join(format!("vo-{stamp}.wav"))
+}
+
+/// Start capturing the default microphone into `path` (WAV, mono 48 kHz).
+/// Tries PulseAudio first, then ALSA. The child stays running until
+/// [`stop_mic_record`] writes `q` to its stdin (graceful so the WAV header is
+/// finalized). Returns the child so the UI task can hold it.
+pub async fn start_mic_record(path: &Path) -> Result<tokio::process::Child, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // (ffmpeg demuxer, device name) — default source on each backend.
+    let backends: [(&str, &str); 2] = [("pulse", "default"), ("alsa", "default")];
+    let mut last_err = String::from("no microphone backend responded");
+    for (fmt, dev) in backends {
+        let mut child = match Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-nostats", "-loglevel", "error"])
+            .args(["-f", fmt, "-i", dev])
+            // Mono is enough for VO and halves file size; 48 kHz matches the mix.
+            .args(["-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = format!("ffmpeg ({fmt}): {e}");
+                continue;
+            }
+        };
+        // If the device is missing, ffmpeg exits almost immediately.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        match child.try_wait() {
+            Ok(None) => return Ok(child), // still capturing
+            Ok(Some(status)) => {
+                let mut err = String::new();
+                if let Some(mut s) = child.stderr.take() {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = Vec::new();
+                    let _ = s.read_to_end(&mut buf).await;
+                    err = String::from_utf8_lossy(&buf).into_owned();
+                }
+                let _ = std::fs::remove_file(path);
+                last_err = format!(
+                    "{fmt}/{dev} exited ({status}): {}",
+                    err.trim().lines().last().unwrap_or("no device")
+                );
+            }
+            Err(e) => {
+                last_err = format!("ffmpeg ({fmt}): {e}");
+                let _ = child.start_kill();
+            }
+        }
+    }
+    Err(format!(
+        "Could not open a microphone ({last_err}). Check that a mic is connected and not exclusively used by another app."
+    ))
+}
+
+/// Stop a capture started by [`start_mic_record`]. Prefers a graceful `q` so
+/// the WAV container is closed cleanly; falls back to kill after a short wait.
+pub async fn stop_mic_record(mut child: tokio::process::Child) -> Result<(), String> {
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(b"q\n").await;
+        drop(stdin);
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("mic capture wait failed: {e}")),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Ok(())
+        }
+    }
+}
+
 /// Play `path` from `start` seconds, sound only, no window. Returns the child
 /// so pausing can kill it; the child is also killed if dropped.
 pub fn launch_audio(path: &Path, start: f64) -> Result<tokio::process::Child, String> {
@@ -2405,7 +2636,7 @@ pub fn keep_loud_ranges(
 /// Pull a BPM out of a filename like `house_128bpm_master.wav` or `track 90 BPM.mp3`
 /// — the digits immediately before "bpm". Reel music libraries name files this way,
 /// so it's a free, exact tempo when present.
-pub fn bpm_from_filename(name: &str) -> Option<f64> {
+fn bpm_from_filename(name: &str) -> Option<f64> {
     let low = name.to_ascii_lowercase();
     let idx = low.find("bpm")?;
     let head = low[..idx].trim_end();
@@ -2569,7 +2800,7 @@ pub async fn waveform_data_uri(path: &str) -> Result<String, String> {
 
 /// Parse SRT into (start_s, end_s, text). Tolerant: blocks without a valid
 /// timing line are skipped; both `,` and `.` millisecond separators accepted.
-pub fn parse_srt(srt: &str) -> Vec<(f64, f64, String)> {
+fn parse_srt(srt: &str) -> Vec<(f64, f64, String)> {
     fn ts(s: &str) -> Option<f64> {
         let s = s.trim();
         let (hms, ms) = s.split_once(',').or_else(|| s.split_once('.'))?;
@@ -2821,6 +3052,37 @@ mod tests {
     }
 
     #[test]
+    fn voiceover_out_path_is_under_cache_and_wav() {
+        let a = voiceover_out_path();
+        let b = voiceover_out_path();
+        assert!(a.to_string_lossy().contains("voiceovers"));
+        assert!(a.extension().and_then(|e| e.to_str()) == Some("wav"));
+        // Same-millisecond calls can collide; distinct paths are preferred but
+        // not required for correctness of a single take.
+        let _ = b;
+    }
+
+    /// Smoke: open the default mic briefly and land a valid WAV. Skips when
+    /// no input device is available (CI / headless).
+    #[tokio::test]
+    async fn mic_record_round_trip_when_device_exists() {
+        let path = voiceover_out_path();
+        let child = match start_mic_record(&path).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skip mic smoke (no device): {e}");
+                return;
+            }
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        stop_mic_record(child).await.expect("stop mic");
+        let (dur, has_audio) = probe(path.to_str().unwrap()).await.expect("probe vo");
+        assert!(has_audio, "voiceover wav should have audio");
+        assert!(dur >= 0.15, "expected a short take, got {dur}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn filter_graph_shape() {
         let clips = [
             ClipSpec { path: "a.mp4".into(), in_s: 0.5, out_s: 2.0, has_audio: true, effect: "hue=s=0".into(), ..Default::default() },
@@ -2862,6 +3124,20 @@ mod tests {
         // no overlays / titles / audio degenerates to plain concat
         let f = build_filter(&clips, &[], &[], &[], ExportOpts::default());
         assert!(f.ends_with("[vc]null[vout];[ac]anull[aout]"));
+    }
+
+    #[test]
+    fn blend_mode_overlay_screens_over_the_base_only_in_its_window() {
+        let clips = [ClipSpec { path: "a.mp4".into(), in_s: 0.0, out_s: 3.0, ..Default::default() }];
+        let overlays =
+            [OverlaySpec { path: "leak.mp4".into(), in_s: 0.0, out_s: 1.0, at: 0.5, blend: "screen".into(), ..Default::default() }];
+        let f = build_filter(&clips, &overlays, &[], &[], ExportOpts::default());
+        // Base split, screen-blended full length, gated to the layer's span by the
+        // outer overlay — not the plain alpha-over path.
+        assert!(f.contains("[vc]split[bl0a][bl0b];"), "{f}");
+        assert!(f.contains("[bl0b][ov0]blend=all_mode=screen:shortest=0[bl0c];"), "{f}");
+        assert!(f.contains("[bl0a][bl0c]overlay=enable='between(t,0.500,1.500)'[vx0];"), "{f}");
+        assert!(!f.contains("[ov0]overlay=eof_action=pass"), "blend path must skip alpha-over: {f}");
     }
 
     #[test]
@@ -3380,13 +3656,40 @@ noise
     }
 
     #[test]
+    fn disabled_clip_exports_black_and_silent() {
+        let clips = [ClipSpec {
+            path: "a.mp4".into(),
+            in_s: 0.0,
+            out_s: 2.0,
+            has_audio: true,
+            volume: 1.0,
+            enabled: false,
+            ..Default::default()
+        }];
+        let f = build_filter(&clips, &[], &[], &[], ExportOpts::default());
+        assert!(
+            f.contains("color=c=black") && f.contains("anullsrc"),
+            "disabled clip should be black + silence: {f}"
+        );
+        assert!(!f.contains("[0:v]"), "disabled clip must not sample the source video");
+    }
+
+    #[test]
     fn extension_tables_are_disjoint_and_cover_the_obvious() {
         for e in ["mp4", "mov", "mkv", "webm", "avi", "gif"] {
             assert!(VIDEO_EXT.contains(&e), "{e} missing from the video list");
         }
-        for e in ["png", "jpg", "jpeg", "webp", "heic", "avif"] {
+        // Primary reel stills (JPEG/PNG/HEIF/TIFF/BMP + modern web stills).
+        // GIF is video; PDF/PSD/RAW stay off these tables on purpose.
+        for e in ["png", "jpg", "jpeg", "jfif", "heic", "heif", "tif", "tiff", "bmp", "webp", "avif"] {
             assert!(IMAGE_EXT.contains(&e), "{e} missing from the image list");
+            assert!(is_still(&format!("x.{e}")), "{e} should take the still path");
         }
+        for e in ["pdf", "psd", "cr2", "nef", "arw", "dng", "raw"] {
+            assert!(!IMAGE_EXT.contains(&e), "{e} must stay out of stills (not a reel target)");
+            assert!(!is_still(&format!("x.{e}")), "{e} must not take the still fast path");
+        }
+        assert!(!is_still("x.gif"), "gif is video, not a still");
         for e in ["mp3", "m4a", "wav", "flac", "ogg", "opus"] {
             assert!(AUDIO_EXT.contains(&e), "{e} missing from the audio list");
         }
@@ -4189,6 +4492,66 @@ noise
         assert_eq!(s.chain(W, H, false), transform_chain(&s.pose(), W, H, false));
     }
 
+    #[test]
+    fn keyframed_rotation_animates_in_both_branches() {
+        let spin = Animated::curve(vec![
+            Key { t: 0.0, v: 0.0, interp: Interp::Smooth },
+            Key { t: 1.0, v: 90.0, interp: Interp::Smooth },
+        ]);
+
+        // Rotation-only: takes the static geometry branch, but the angle must be a
+        // time expression (rotate=a='…'), not a baked number.
+        let mut at = AnimatedTransform::default();
+        at.rotation = spin.clone();
+        let c = at.chain(W, H, false);
+        assert!(c.contains("rotate=a='"), "static branch must emit a time-varying angle: {c}");
+        assert!(c.contains("*PI/180"), "degrees curve must convert to radians: {c}");
+
+        // Rotation + a keyframed zoom: takes the zoompan branch, which must animate
+        // the spin too rather than freezing at the start pose.
+        at.scale = Animated::curve(vec![
+            Key { t: 0.0, v: 1.0, interp: Interp::Smooth },
+            Key { t: 1.0, v: 1.5, interp: Interp::Smooth },
+        ]);
+        let c2 = at.chain(W, H, false);
+        assert!(c2.contains("zoompan") && c2.contains("rotate=a='"), "zoompan branch must animate rotation: {c2}");
+
+        // A constant rotation stays a plain number — no regression, no expression.
+        let stat = AnimatedTransform::from(Transform { rotation: 45.0, ..Default::default() });
+        let cs = stat.chain(W, H, false);
+        assert!(cs.contains("rotate=") && !cs.contains("rotate=a='"), "constant rotation must stay static: {cs}");
+    }
+
+    #[test]
+    fn anchor_relocates_the_pivot_without_touching_the_default() {
+        // Anchor (0,0) is byte-identical to no anchor at all.
+        let plain = Transform { rotation: 30.0, ..Default::default() };
+        let anchored0 = Transform { rotation: 30.0, anchor_x: 0.0, anchor_y: 0.0, ..Default::default() };
+        assert_eq!(transform_chain(&plain, W, H, false), transform_chain(&anchored0, W, H, false));
+
+        // anchor_x 0.3 on a full-frame picture (sw = 1080) pads to a 1080+2*324 =
+        // 1728-wide canvas before the rotate, so the pivot moves off-centre.
+        let anchored = Transform { rotation: 30.0, anchor_x: 0.3, ..Default::default() };
+        let ca = transform_chain(&anchored, W, H, false);
+        assert_ne!(transform_chain(&plain, W, H, false), ca);
+        assert!(ca.contains("pad=1728:"), "anchor must pad to relocate the pivot: {ca}");
+
+        // Anchor alone (no rotation) still shifts the picture, so it isn't identity.
+        let anchor_only = Transform { anchor_x: 0.25, ..Default::default() };
+        assert!(!anchor_only.is_identity());
+        assert!(!transform_chain(&anchor_only, W, H, false).is_empty());
+
+        // A keyframed swing about an off-centre anchor: static branch, so it must
+        // BOTH pad for the pivot AND animate the angle.
+        let mut swing = AnimatedTransform::from(Transform { anchor_x: 0.3, ..Default::default() });
+        swing.rotation = Animated::curve(vec![
+            Key { t: 0.0, v: 0.0, interp: Interp::Smooth },
+            Key { t: 1.0, v: 90.0, interp: Interp::Smooth },
+        ]);
+        let cw = swing.chain(W, H, false);
+        assert!(cw.contains("pad=1728:") && cw.contains("rotate=a='"), "anchored swing must pad and animate: {cw}");
+    }
+
     #[tokio::test]
     async fn a_keyframed_zoom_animates_in_the_shared_preview_export_chain() {
         let dir = std::env::temp_dir().join("morreel-kb-test");
@@ -4282,11 +4645,11 @@ noise
 
     #[test]
     fn shape_colours_come_out_as_numbers_geq_understands() {
-        assert_eq!(rgb_of("black"), (0, 0, 0));
-        assert_eq!(rgb_of("white"), (255, 255, 255));
-        assert_eq!(rgb_of("#E8C060"), (232, 192, 96));
-        assert_eq!(rgb_of("#3DD6D0"), (61, 214, 208));
-        assert_eq!(rgb_of("nonsense"), (255, 255, 255), "fall back rather than break the render");
+        assert_eq!(hex_rgb("black"), (0, 0, 0));
+        assert_eq!(hex_rgb("white"), (255, 255, 255));
+        assert_eq!(hex_rgb("#E8C060"), (232, 192, 96));
+        assert_eq!(hex_rgb("#3DD6D0"), (61, 214, 208));
+        assert_eq!(hex_rgb("nonsense"), (255, 255, 255), "fall back rather than break the render");
     }
 
     #[test]

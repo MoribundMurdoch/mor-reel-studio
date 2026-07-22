@@ -1,13 +1,12 @@
-//! In-app plugin spine. A [`Plugin`] contributes named **tools** that mutate a
-//! timeline [`Snapshot`](crate::Snapshot); the [`Registry`] holds them and
-//! dispatches a `(plugin, tool, json-params)` call to the right one. The boundary
-//! is JSON on purpose — it is the same shape the MCP server speaks over the wire,
-//! so a live coordinate command from a model and an in-process call are one code
-//! path, and a second plugin is a `impl Plugin` + one `push`, not an enum edit.
+//! In-app plugin spine. [`dispatch`] routes a `(plugin, tool, json-params)` call
+//! against a timeline [`Snapshot`](crate::Snapshot) to the right handler. The
+//! boundary is JSON on purpose — it is the same shape the MCP server speaks over
+//! the wire, so a live coordinate command from a model and an in-process call are
+//! one code path, and a second plugin is one more match arm.
 //!
-//! The first (and, today, only) plugin is [`CoordsPlugin`]: the vision-model
-//! "visual primitives" — a point and a bounding box — turned into transforms and
-//! pan curves via [`crate::coords`].
+//! The first (and, today, only) plugin is `coords`: the vision-model "visual
+//! primitives" — a point and a bounding box — turned into transforms and pan
+//! curves via [`crate::coords`].
 
 use crate::coords::{track_curves, BBox, Point, TrackSample};
 use crate::engine::AnimatedTransform;
@@ -142,105 +141,240 @@ fn track_point(snap: &mut Snapshot, p: TrackPointParams) -> Result<String, Strin
     Ok(format!("tracked {:?}[{}] over {} points, zoom {z:.2}", p.target.lane, p.target.index, samples.len()))
 }
 
-// --- plugin trait + registry ---------------------------------------------------
+// --- edit plugin: plain timeline verbs -----------------------------------------
+// Not geometry — the everyday edits (retime, trim, effect, mute, delete) a model
+// or a CLI wants to drive without touching the GUI. Every one mutates the same
+// Snapshot dispatch owns, so it lands on the undo stack and refreshes preview like
+// any UI edit, and shows up over MCP, the live port and the `morreel` CLI at once.
 
-/// One tool a plugin exposes — its name and a one-line description, enough to fill
-/// an MCP `tools/list` or a UI menu.
-pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+fn miss(r: ItemRef) -> String {
+    format!("no item at {:?}[{}]", r.lane, r.index)
 }
 
-/// A unit of timeline capability. Implement this and register it to add tools a
-/// model (or the UI) can call by name.
-pub trait Plugin {
-    fn name(&self) -> &'static str;
-    fn tools(&self) -> Vec<ToolSpec>;
-    /// Run `tool` with JSON `params` against the timeline, returning a short
-    /// human-readable summary of what changed (or an error message).
-    fn call(&self, snap: &mut Snapshot, tool: &str, params: &Value) -> Result<String, String>;
+/// Edit a field that lives on *both* lane structs. The body is expanded once per
+/// lane, so it type-checks against `Clip` in the V1 arm and `OverlayItem` in the
+/// V2 arm — every field it names exists on both. ponytail: a macro, not a trait —
+/// the two structs share field *names*, not an interface, and one trait with two
+/// impls would be more code than this. `volume`/`transition` are V1-only and so
+/// don't go through here.
+macro_rules! on_item {
+    ($snap:expr, $r:expr, |$it:ident| $body:expr) => {
+        match $r.lane {
+            Lane::V1 => {
+                let $it = $snap.clips.get_mut($r.index).ok_or_else(|| miss($r))?;
+                $body
+            }
+            Lane::V2 => {
+                let $it = $snap.overlays.get_mut($r.index).ok_or_else(|| miss($r))?;
+                $body
+            }
+        }
+    };
 }
+
+#[derive(Deserialize)]
+struct SetEffectParams {
+    target: ItemRef,
+    effect: String,
+    amount: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct SetSpeedParams {
+    target: ItemRef,
+    speed: Option<f64>,
+    reverse: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct TrimParams {
+    target: ItemRef,
+    #[serde(rename = "in")]
+    in_s: Option<f64>,
+    out: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct EnableParams {
+    target: ItemRef,
+    on: bool,
+}
+
+#[derive(Deserialize)]
+struct SetVolumeParams {
+    target: ItemRef,
+    volume: Option<f64>,
+    mute: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RemoveParams {
+    target: ItemRef,
+}
+
+/// Set the effect/look preset, validated against the live effect list (built-ins
+/// plus any hub bundle) so a typo is a clear error the model can retry, not a
+/// silent no-op at render time.
+fn set_effect(snap: &mut Snapshot, p: SetEffectParams) -> Result<String, String> {
+    if !crate::all_effects().iter().any(|(_, n, _)| *n == p.effect) {
+        let names: Vec<String> = crate::all_effects().into_iter().map(|(_, n, _)| n).collect();
+        return Err(format!("unknown effect '{}'. valid: {}", p.effect, names.join(", ")));
+    }
+    let amt = p.amount.unwrap_or(1.0).clamp(0.0, 1.0);
+    let r = p.target;
+    on_item!(snap, r, |it| {
+        it.effect = p.effect.clone();
+        it.effect_amount = amt;
+    });
+    Ok(format!("{:?}[{}] effect → {} ({amt:.2})", r.lane, r.index, p.effect))
+}
+
+/// Retime: `speed` (0.1..10, 1.0 = normal) and/or `reverse`. Clamp matches the
+/// GUI's own scale limits so a driven edit can't leave a state the UI can't.
+fn set_speed(snap: &mut Snapshot, p: SetSpeedParams) -> Result<String, String> {
+    if p.speed.is_none() && p.reverse.is_none() {
+        return Err("set_speed needs 'speed' and/or 'reverse'".into());
+    }
+    let r = p.target;
+    let (sp, rev) = on_item!(snap, r, |it| {
+        if let Some(s) = p.speed {
+            it.speed = s.clamp(0.1, 10.0);
+        }
+        if let Some(v) = p.reverse {
+            it.reverse = v;
+        }
+        (it.speed, it.reverse)
+    });
+    Ok(format!("{:?}[{}] speed {sp:.2}× reverse={rev}", r.lane, r.index))
+}
+
+/// Set the source trim in/out (seconds into the source file). Either bound is
+/// optional; the pair is clamped into `0..duration` and kept in order with a small
+/// minimum span, so no combination collapses the clip.
+fn trim(snap: &mut Snapshot, p: TrimParams) -> Result<String, String> {
+    if p.in_s.is_none() && p.out.is_none() {
+        return Err("trim needs 'in' and/or 'out' (seconds)".into());
+    }
+    let r = p.target;
+    let msg = on_item!(snap, r, |it| {
+        const MIN_SRC: f64 = 0.05;
+        let dur = it.duration.max(MIN_SRC);
+        let nin = p.in_s.unwrap_or(it.in_s).clamp(0.0, dur - MIN_SRC);
+        let nout = p.out.unwrap_or(it.out_s).clamp(nin + MIN_SRC, dur);
+        it.in_s = nin;
+        it.out_s = nout;
+        format!("{:?}[{}] trim {nin:.2}..{nout:.2}s", r.lane, r.index)
+    });
+    Ok(msg)
+}
+
+/// Enable/disable an item — the driven form of Clip › Disable (invisible + silent,
+/// still on the timeline).
+fn enable(snap: &mut Snapshot, p: EnableParams) -> Result<String, String> {
+    let r = p.target;
+    on_item!(snap, r, |it| {
+        it.enabled = p.on;
+    });
+    Ok(format!("{:?}[{}] {}", r.lane, r.index, if p.on { "enabled" } else { "disabled" }))
+}
+
+/// Set a V1 clip's audio gain (0 = silent, 1 = unity, 2 = +6dB). `mute:true` is a
+/// shortcut for volume 0; an explicit `volume` wins if both are given. V2 overlays
+/// carry no audio, so this rejects them rather than silently doing nothing.
+fn set_volume(snap: &mut Snapshot, p: SetVolumeParams) -> Result<String, String> {
+    let r = p.target;
+    if r.lane != Lane::V1 {
+        return Err("set_volume applies to V1 clips (V2 overlays have no audio)".into());
+    }
+    if p.volume.is_none() && p.mute.is_none() {
+        return Err("set_volume needs 'volume' and/or 'mute'".into());
+    }
+    let c = snap.clips.get_mut(r.index).ok_or_else(|| miss(r))?;
+    if p.mute == Some(true) {
+        c.volume = 0.0;
+    }
+    if let Some(v) = p.volume {
+        c.volume = v.clamp(0.0, 2.0);
+    }
+    Ok(format!("V1[{}] volume {:.2}", r.index, c.volume))
+}
+
+/// Delete an item from its lane. Indices after it shift down by one, same as a
+/// GUI delete — a follow-up call should re-`list_items` rather than assume old
+/// indices.
+fn remove(snap: &mut Snapshot, p: RemoveParams) -> Result<String, String> {
+    let r = p.target;
+    let name = match r.lane {
+        Lane::V1 => {
+            if r.index >= snap.clips.len() {
+                return Err(miss(r));
+            }
+            snap.clips.remove(r.index).name
+        }
+        Lane::V2 => {
+            if r.index >= snap.overlays.len() {
+                return Err(miss(r));
+            }
+            snap.overlays.remove(r.index).name
+        }
+    };
+    Ok(format!("removed {:?}[{}] {name}", r.lane, r.index))
+}
+
+// --- tool dispatch -------------------------------------------------------------
 
 fn parse<T: DeserializeOwned>(params: &Value) -> Result<T, String> {
     serde_json::from_value(params.clone()).map_err(|e| format!("bad params: {e}"))
 }
 
-/// Visual primitives → geometry. See [`crate::coords`].
-pub struct CoordsPlugin;
-
-impl Plugin for CoordsPlugin {
-    fn name(&self) -> &'static str {
-        "coords"
-    }
-
-    fn tools(&self) -> Vec<ToolSpec> {
-        vec![
-            ToolSpec {
-                name: "place_box",
-                description: "Box a V1/V2 layer into a bounding box (x0,y0,x1,y1 in 0..1, top-left origin).",
-            },
-            ToolSpec {
-                name: "place_point",
-                description: "Put a V1/V2 layer's centre at a point (x,y in 0..1, top-left origin).",
-            },
-            ToolSpec {
-                name: "track_point",
-                description: "Pan a layer to follow a moving point: samples=[{t,x,y}], optional zoom, center.",
-            },
-        ]
-    }
-
-    fn call(&self, snap: &mut Snapshot, tool: &str, params: &Value) -> Result<String, String> {
-        match tool {
+/// Run `plugin.tool(params)` against the timeline, returning a short summary of
+/// what changed (or an error message). One plugin today — `coords` (visual
+/// primitives → geometry, see [`crate::coords`]); a second is another arm.
+pub fn dispatch(snap: &mut Snapshot, plugin: &str, tool: &str, params: &Value) -> Result<String, String> {
+    match plugin {
+        "coords" => match tool {
             "place_box" => place_box(snap, parse(params)?),
             "place_point" => place_point(snap, parse(params)?),
             "track_point" => track_point(snap, parse(params)?),
             other => Err(format!("coords: unknown tool '{other}'")),
-        }
+        },
+        "edit" => match tool {
+            "set_effect" => set_effect(snap, parse(params)?),
+            "set_speed" => set_speed(snap, parse(params)?),
+            "trim" => trim(snap, parse(params)?),
+            "enable" => enable(snap, parse(params)?),
+            "set_volume" => set_volume(snap, parse(params)?),
+            "remove" => remove(snap, parse(params)?),
+            other => Err(format!("edit: unknown tool '{other}'")),
+        },
+        other => Err(format!("no plugin '{other}'")),
     }
 }
 
-/// Holds the registered plugins and routes calls to them.
-pub struct Registry {
-    plugins: Vec<Box<dyn Plugin>>,
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self { plugins: vec![Box::new(CoordsPlugin)] }
-    }
-}
-
-impl Registry {
-    /// Run `plugin.tool(params)` against the timeline.
-    pub fn dispatch(
-        &self,
-        snap: &mut Snapshot,
-        plugin: &str,
-        tool: &str,
-        params: &Value,
-    ) -> Result<String, String> {
-        let p = self.plugins.iter().find(|p| p.name() == plugin).ok_or_else(|| format!("no plugin '{plugin}'"))?;
-        p.call(snap, tool, params)
-    }
-
-    /// Every registered plugin and its tools — the shape an MCP `tools/list`
-    /// answer or a UI menu is built from.
-    pub fn manifest(&self) -> Value {
-        Value::Array(
-            self.plugins
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "plugin": p.name(),
-                        "tools": p.tools().iter().map(|t| serde_json::json!({
-                            "name": t.name, "description": t.description
-                        })).collect::<Vec<_>>(),
-                    })
-                })
-                .collect(),
-        )
-    }
+/// Every plugin and its tools — the shape an MCP `tools/list` answer or a UI
+/// menu is built from.
+pub fn manifest() -> Value {
+    serde_json::json!([
+        {
+            "plugin": "coords",
+            "tools": [
+                {"name": "place_box", "description": "Box a V1/V2 layer into a bounding box (x0,y0,x1,y1 in 0..1, top-left origin)."},
+                {"name": "place_point", "description": "Put a V1/V2 layer's centre at a point (x,y in 0..1, top-left origin)."},
+                {"name": "track_point", "description": "Pan a layer to follow a moving point: samples=[{t,x,y}], optional zoom, center."},
+            ],
+        },
+        {
+            "plugin": "edit",
+            "tools": [
+                {"name": "set_effect", "description": "Set a V1/V2 item's effect/look preset: effect=<name>, optional amount 0..1."},
+                {"name": "set_speed", "description": "Retime a V1/V2 item: speed (0.1..10) and/or reverse (bool)."},
+                {"name": "trim", "description": "Set a V1/V2 item's source trim: in and/or out, in seconds."},
+                {"name": "enable", "description": "Enable/disable a V1/V2 item (invisible+silent, still on the timeline): on=<bool>."},
+                {"name": "set_volume", "description": "Set a V1 clip's audio gain: volume (0..2) and/or mute (bool). V1 only."},
+                {"name": "remove", "description": "Delete a V1/V2 item from its lane (later indices shift down)."},
+            ],
+        },
+    ])
 }
 
 #[cfg(test)]
@@ -272,6 +406,8 @@ mod tests {
             wave: String::new(),
             proxy: String::new(),
             group: 0,
+            enabled: true,
+            solo: false,
         }
     }
 
@@ -288,13 +424,13 @@ mod tests {
 
     #[test]
     fn place_box_sets_the_static_pose() {
-        let reg = Registry::default();
+        
         let mut snap = one_clip_snapshot();
         let params = serde_json::json!({
             "target": {"lane": "V1", "index": 0},
             "x0": 0.0, "y0": 0.0, "x1": 0.5, "y1": 0.5
         });
-        reg.dispatch(&mut snap, "coords", "place_box", &params).unwrap();
+        dispatch(&mut snap, "coords", "place_box", &params).unwrap();
         let pose = snap.clips[0].transform.pose();
         assert!((pose.scale_x - 0.5).abs() < 1e-9);
         assert!((pose.x - -0.25).abs() < 1e-9);
@@ -304,14 +440,14 @@ mod tests {
 
     #[test]
     fn track_point_writes_pan_curves_and_zoom() {
-        let reg = Registry::default();
+        
         let mut snap = one_clip_snapshot();
         let params = serde_json::json!({
             "target": {"lane": "V1", "index": 0},
             "samples": [{"t": 0.0, "x": 0.2, "y": 0.5}, {"t": 2.0, "x": 0.8, "y": 0.5}],
             "zoom": 1.5
         });
-        reg.dispatch(&mut snap, "coords", "track_point", &params).unwrap();
+        dispatch(&mut snap, "coords", "track_point", &params).unwrap();
         let xf = &snap.clips[0].transform;
         assert!(xf.x.is_animated()); // pan curve laid down
         assert!(xf.scale.is_animated()); // zoom headroom engages the animated branch
@@ -322,16 +458,66 @@ mod tests {
 
     #[test]
     fn a_missing_target_is_an_error_not_a_panic() {
-        let reg = Registry::default();
         let mut snap = one_clip_snapshot();
         let params = serde_json::json!({"target": {"lane": "V2", "index": 0}, "x": 0.5, "y": 0.5});
-        assert!(reg.dispatch(&mut snap, "coords", "place_point", &params).is_err());
+        assert!(dispatch(&mut snap, "coords", "place_point", &params).is_err());
     }
 
     #[test]
     fn manifest_lists_the_coords_tools() {
-        let m = Registry::default().manifest();
+        let m = manifest();
         let s = m.to_string();
         assert!(s.contains("place_box") && s.contains("place_point") && s.contains("track_point"));
+        // and the edit plugin's verbs
+        assert!(s.contains("set_speed") && s.contains("trim") && s.contains("remove"));
+    }
+
+    #[test]
+    fn set_speed_clamps_and_can_reverse() {
+        let mut snap = one_clip_snapshot();
+        let p = serde_json::json!({"target": {"lane": "V1", "index": 0}, "speed": 99.0, "reverse": true});
+        dispatch(&mut snap, "edit", "set_speed", &p).unwrap();
+        assert_eq!(snap.clips[0].speed, 10.0); // clamped to the GUI's ceiling
+        assert!(snap.clips[0].reverse);
+    }
+
+    #[test]
+    fn trim_keeps_in_before_out() {
+        let mut snap = one_clip_snapshot(); // clip duration 5.0
+        // Ask for out before in — must not collapse or invert.
+        let p = serde_json::json!({"target": {"lane": "V1", "index": 0}, "in": 3.0, "out": 1.0});
+        dispatch(&mut snap, "edit", "trim", &p).unwrap();
+        let c = &snap.clips[0];
+        assert!(c.in_s < c.out_s && c.in_s >= 0.0 && c.out_s <= 5.0);
+    }
+
+    #[test]
+    fn set_effect_rejects_an_unknown_name() {
+        let mut snap = one_clip_snapshot();
+        let bad = serde_json::json!({"target": {"lane": "V1", "index": 0}, "effect": "Nope"});
+        assert!(dispatch(&mut snap, "edit", "set_effect", &bad).is_err());
+        let ok = serde_json::json!({"target": {"lane": "V1", "index": 0}, "effect": "None", "amount": 2.0});
+        dispatch(&mut snap, "edit", "set_effect", &ok).unwrap();
+        assert_eq!(snap.clips[0].effect, "None");
+        assert_eq!(snap.clips[0].effect_amount, 1.0); // amount clamped into 0..1
+    }
+
+    #[test]
+    fn set_volume_is_v1_only_and_mutes() {
+        let mut snap = one_clip_snapshot();
+        dispatch(&mut snap, "edit", "set_volume", &serde_json::json!({"target": {"lane": "V1", "index": 0}, "mute": true})).unwrap();
+        assert_eq!(snap.clips[0].volume, 0.0);
+        // V2 has no audio → error, not a silent no-op.
+        let v2 = serde_json::json!({"target": {"lane": "V2", "index": 0}, "volume": 1.0});
+        assert!(dispatch(&mut snap, "edit", "set_volume", &v2).is_err());
+    }
+
+    #[test]
+    fn remove_shrinks_the_lane() {
+        let mut snap = one_clip_snapshot();
+        dispatch(&mut snap, "edit", "remove", &serde_json::json!({"target": {"lane": "V1", "index": 0}})).unwrap();
+        assert!(snap.clips.is_empty());
+        // removing again is an error, not a panic
+        assert!(dispatch(&mut snap, "edit", "remove", &serde_json::json!({"target": {"lane": "V1", "index": 0}})).is_err());
     }
 }
