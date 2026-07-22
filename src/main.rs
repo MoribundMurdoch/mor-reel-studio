@@ -6,6 +6,7 @@
 mod bevel;
 mod coords;
 mod engine;
+mod giphy;
 mod hub;
 mod keyframe;
 mod plugin;
@@ -2622,6 +2623,11 @@ editor_state! {
     saved_json: Option<String> = || None,
     hub_gen: u64 = || 0u64,
     show_hub: bool = || false,
+    show_giphy: bool = || false,
+    giphy_query: String = String::new,
+    giphy_stickers: bool = || false,
+    giphy_results: Vec<giphy::Gif> = Vec::<giphy::Gif>::new,
+    giphy_busy: bool = || false,
     show_autocut: bool = || false,
     autocut_busy: bool = || false,
     autocut_noise: f64 = || 32.0_f64,
@@ -3324,6 +3330,40 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     // bumps to re-render when the Plugin Hub panel installs/toggles something.
     let mut hub_gen = state.hub_gen;
     let mut show_hub = state.show_hub;
+    let mut show_giphy = state.show_giphy;
+    let mut giphy_query = state.giphy_query;
+    let mut giphy_stickers = state.giphy_stickers;
+    let mut giphy_results = state.giphy_results;
+    let mut giphy_busy = state.giphy_busy;
+    // Search GIPHY (or clear on empty). One coroutine-free spawn, guarded by busy.
+    let run_giphy_search = move |_: ()| {
+        if giphy_busy() {
+            return;
+        }
+        spawn(async move {
+            let q = giphy_query().trim().to_string();
+            if q.is_empty() {
+                return;
+            }
+            let key = match giphy::api_key() {
+                Ok(k) => k,
+                Err(e) => {
+                    status.set(e);
+                    return;
+                }
+            };
+            giphy_busy.set(true);
+            status.set(format!("Searching GIPHY for “{q}”…"));
+            match giphy::search(&q, giphy_stickers(), &key).await {
+                Ok(hits) => {
+                    status.set(format!("{} result(s) — click one to drop it on V2.", hits.len()));
+                    giphy_results.set(hits);
+                }
+                Err(e) => status.set(format!("GIPHY: {e}")),
+            }
+            giphy_busy.set(false);
+        });
+    };
     use_hook(|| {
         if let Some(dir) = hub::hub_dir() {
             let manifests = hub::load_manifests(&dir);
@@ -6497,6 +6537,11 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         label: "Add overlay (V2)…".to_string(),
                         disabled: no_clips || exporting,
                         on_action: move |_| add_overlay(()),
+                    }
+                    MenuItem {
+                        label: "Add from Giphy…".to_string(),
+                        disabled: no_clips || exporting,
+                        on_action: move |_| show_giphy.set(true),
                     }
                     MenuItem {
                         label: "Add audio (A1)…".to_string(),
@@ -10862,6 +10907,62 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             }
         }
         Modal {
+            open: show_giphy,
+            title: "Add from Giphy".to_string(),
+            div { class: "mr-hub",
+                p { class: "mor-statusbar-muted mr-export-blurb",
+                    "Search GIPHY, then click a result to drop it on V2 at the playhead. "
+                    "Stickers come in with transparency; GIFs fill the frame. Needs a free "
+                    "GIPHY_API_KEY (developers.giphy.com)."
+                }
+                div { class: "mr-toolbar",
+                    input {
+                        class: "mor-input",
+                        r#type: "text",
+                        placeholder: "Search GIFs…",
+                        value: "{giphy_query}",
+                        oninput: move |e| giphy_query.set(e.value()),
+                        onkeydown: move |e| if e.key() == Key::Enter { run_giphy_search(()); },
+                    }
+                    button {
+                        class: if giphy_stickers() { "mor-btn primary" } else { "mor-btn" },
+                        onclick: move |_| giphy_stickers.set(!giphy_stickers()),
+                        "Stickers"
+                    }
+                    button {
+                        class: "mor-btn primary",
+                        disabled: giphy_busy(),
+                        onclick: move |_| run_giphy_search(()),
+                        if giphy_busy() { "Searching…" } else { "Search" }
+                    }
+                }
+                div { class: "mr-giphy-grid",
+                    for g in giphy_results() {
+                        img {
+                            key: "{g.id}",
+                            class: "mr-giphy-thumb",
+                            src: "{g.preview}",
+                            title: "{g.title}",
+                            onclick: move |_| {
+                                let g = g.clone();
+                                let at = playhead();
+                                spawn(async move {
+                                    status.set(format!("Fetching “{}”…", g.title));
+                                    match giphy::download(&g).await {
+                                        Ok(path) => add_overlay_path(path.display().to_string(), at),
+                                        Err(e) => status.set(format!("GIPHY download: {e}")),
+                                    }
+                                });
+                            },
+                        }
+                    }
+                }
+                div { class: "mr-toolbar",
+                    button { class: "mor-btn", onclick: move |_| show_giphy.set(false), "Done" }
+                }
+            }
+        }
+        Modal {
             open: show_shortcuts,
             title: "Keyboard shortcuts".to_string(),
             table { class: "mr-shortcut-table",
@@ -12433,6 +12534,9 @@ const APP_CSS: &str = r#"
 .mr-keys-dialog .mr-toolbar { justify-content: flex-end; margin-top: 6px; }
 
 .mr-hub { display: flex; flex-direction: column; gap: 10px; min-width: 460px; max-width: 560px; }
+.mr-giphy-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-height: 420px; overflow-y: auto; padding: 2px; }
+.mr-giphy-thumb { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; cursor: pointer; background: var(--mor-surface-2, #2a2a33); border: 1px solid var(--mor-border, #333); }
+.mr-giphy-thumb:hover { border-color: var(--mor-accent, #b98cff); }
 .mr-hub-row { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--mor-border, #333); border-radius: 8px; }
 .mr-hub-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .mr-hub-name { font-weight: 600; }
