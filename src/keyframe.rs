@@ -80,6 +80,55 @@ impl<T: Copy> Animated<T> {
     }
 }
 
+/// Two keys closer than this in time are "the same" keyframe — one frame at
+/// 60fps. The diamond toggles the key at the playhead, and a click lands on
+/// whatever key is within a frame of it rather than stacking a second one.
+pub const KEY_EPS: f64 = 0.008;
+
+impl<T: Copy> Animated<T> {
+    /// Current keys as an owned vec; a `Const` yields one implicit key at t=0.
+    /// The authoring path below edits this and rebuilds, so a static parameter
+    /// grows its first key from wherever it already sits.
+    fn keyframes(&self) -> Vec<Key<T>> {
+        match self {
+            Animated::Const(v) => vec![Key { t: 0.0, v: *v, interp: Interp::Smooth }],
+            Animated::Curve(k) => k.clone(),
+        }
+    }
+
+    /// Set (or replace) the key at time `t`. The first key on a `Const` arms the
+    /// parameter — it becomes a `Curve`, and a second key at another time makes
+    /// it actually move. Smooth easing, the Ken Burns default.
+    pub fn set_key(&mut self, t: f64, v: T, interp: Interp) {
+        let mut keys = self.keyframes();
+        match keys.iter_mut().find(|k| (k.t - t).abs() < KEY_EPS) {
+            Some(k) => {
+                k.v = v;
+                k.interp = interp;
+            }
+            None => keys.push(Key { t, v, interp }),
+        }
+        keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+        *self = Animated::Curve(keys);
+    }
+
+    /// Remove the key within a frame of `t`. Collapsing to one key drops back to
+    /// a `Const` — un-keying the last diamond makes the parameter static again.
+    /// A `Const` (or a `t` that hits no key) is left untouched.
+    pub fn remove_key(&mut self, t: f64) {
+        let Animated::Curve(keys) = self else { return };
+        keys.retain(|k| (k.t - t).abs() >= KEY_EPS);
+        if keys.len() == 1 {
+            *self = Animated::Const(keys[0].v);
+        }
+    }
+
+    /// Is there a key within a frame of `t`? Fills the diamond at that playhead.
+    pub fn has_key(&self, t: f64) -> bool {
+        matches!(self, Animated::Curve(k) if k.iter().any(|k| (k.t - t).abs() < KEY_EPS))
+    }
+}
+
 impl<T> Default for Animated<T>
 where
     T: Default,
@@ -179,6 +228,38 @@ mod tests {
         assert_eq!(p.sample(5.0), 8.0); // after last key
         let back: Animated<f64> = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn diamonds_arm_move_and_disarm_a_parameter() {
+        // A static value: no key at the playhead, nothing animates.
+        let mut p = Animated::Const(100.0_f64);
+        assert!(!p.has_key(0.0));
+        assert!(!p.is_animated());
+
+        // First diamond at the clip start arms it (still visually static).
+        p.set_key(0.0, 100.0, Interp::Smooth);
+        assert!(p.has_key(0.0));
+        assert!(p.is_animated());
+        assert_eq!(p.sample(5.0), 100.0);
+
+        // A second diamond at t=2 with a new value makes it move.
+        p.set_key(2.0, 140.0, Interp::Linear);
+        assert!(p.has_key(2.0));
+        assert_eq!(p.sample(1.0), 120.0); // halfway up the linear ramp
+
+        // Clicking the same playhead re-keys in place, never stacks a duplicate.
+        p.set_key(2.004, 160.0, Interp::Linear); // within KEY_EPS of t=2
+        assert_eq!(p.sample(2.0), 160.0);
+        let Animated::Curve(k) = &p else { panic!("still a curve") };
+        assert_eq!(k.len(), 2);
+
+        // Un-keying down to one key collapses straight back to a constant,
+        // holding whichever value survived.
+        p.remove_key(2.0);
+        assert_eq!(p, Animated::Const(100.0));
+        p.remove_key(0.0); // a Const has no keys to pull; left as-is
+        assert_eq!(p, Animated::Const(100.0));
     }
 
     #[test]

@@ -12,7 +12,10 @@ mor_rust_dioxus_ui_kit = { path = "../mor_rust_dioxus_ui_kit" }
 rfd = "0.15"
 # ponytail: dioxus-desktop already pulls image 0.25 — declaring it direct is free.
 image = { version = "0.25", default-features = false, features = ["png"] }
-tokio = { version = "1", features = ["process", "io-util", "time"] }
+tokio = { version = "1", features = ["process", "io-util", "time", "net", "sync"] }
+# ponytail: futures-util is already in the tree via dioxus — declaring it direct is
+# free, and use_coroutine's `rx.next().await` needs its StreamExt.
+futures-util = "0.3"
 # ponytail: dioxus already pulls both — declaring them direct is free, and a
 # project file is the one thing worth not hand-rolling a parser for.
 serde = { version = "1", features = ["derive"] }

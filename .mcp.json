@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "morreel-coords": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "--bin", "mcp"],
+      "description": "OFFLINE: ground vision-model coordinates into a .morreel file (pass 'project'). Tools: place_box, place_point, track_point, list_items."
+    },
+    "morreel-coords-live": {
+      "command": "cargo",
+      "args": ["run", "--quiet", "--bin", "mcp"],
+      "env": { "MORREEL_LIVE": "1" },
+      "description": "LIVE: drive the RUNNING editor over 127.0.0.1:8177 (no 'project' needed). Same tools; each edit is undoable and refreshes the monitor."
+    }
+  }
+}

@@ -240,8 +240,28 @@ impl AnimatedTransform {
     /// geometry onto zoompan and trading away that safety proof — deferred until a
     /// reel actually needs it; presets + this cover the Ken Burns case today.
     pub fn chain(&self, w: u32, h: u32, alpha: bool) -> String {
+        // Opacity keyframes on a composited layer (alpha) animate independently of
+        // geometry: colorchannelmixer can't take a time expression, so the tail
+        // below multiplies the alpha plane by the opacity curve via geq. The
+        // export now composes this look on a clip-local clock (see build_filter's
+        // overlay reorder), so frame time `T` here is 0-based clip time — the same
+        // clock the preview shifts to, keeping preview == export. Force the pose's
+        // opacity to 1 in the geometry so it isn't also baked in as a constant.
+        let fade = alpha && self.opacity.is_animated();
+        let with_fade = |mut c: String| {
+            if !fade {
+                return c;
+            }
+            let a = curve_expr(&self.opacity, "T");
+            if !c.is_empty() {
+                c += ",";
+            }
+            c += &format!("format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*clip({a},0,1)'");
+            c
+        };
         if !self.scale.is_animated() {
-            return transform_chain(&self.pose(), w, h, alpha);
+            let p = if fade { Transform { opacity: 1.0, ..self.pose() } } else { self.pose() };
+            return with_fade(transform_chain(&p, w, h, alpha));
         }
         let p = self.pose();
         let z = curve_expr(&self.scale, "it");
@@ -255,17 +275,34 @@ impl AnimatedTransform {
         if p.flip_v {
             c += "vflip,";
         }
-        // z clamped ≥1: zoompan can't zoom out past the source frame.
+        // z clamped ≥1: zoompan can't zoom out past the source frame. The crop
+        // window (iw/zoom × ih/zoom) is centred by default; an animated or offset
+        // x/y pans it, following the same convention as the static path — a
+        // positive `x` moves the picture right, so the window slides left. One
+        // output pixel is (iw/zoom)/w source pixels, so a frame-fraction offset is
+        // that fraction of the window, `off*(iw/zoom)`. zoompan clamps the window
+        // inside the source, so an over-pan stops at the edge rather than reading
+        // past it — the crop-inside-the-picture safety, kept.
+        let pan = |axis: &Animated<f64>, dim: &str| -> String {
+            let centre = format!("{dim}/2-({dim}/zoom/2)");
+            if axis.is_animated() || axis.sample(0.0).abs() > 1e-6 {
+                format!("{centre}-({})*({dim}/zoom)", curve_expr(axis, "it"))
+            } else {
+                centre
+            }
+        };
         c += &format!(
-            "zoompan=z='max({z},1)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps=30"
+            "zoompan=z='max({z},1)':d=1:x='{}':y='{}':s={w}x{h}:fps=30",
+            pan(&self.x, "iw"),
+            pan(&self.y, "ih")
         );
         if p.rotation.abs() > 1e-6 {
             c += &format!(",rotate={:.5}:c=black", p.rotation.to_radians());
         }
-        if alpha && p.opacity < 0.999 {
+        if alpha && !fade && p.opacity < 0.999 {
             c += &format!(",colorchannelmixer=aa={:.3}", p.opacity.clamp(0.0, 1.0));
         }
-        c + ",setsar=1"
+        with_fade(c + ",setsar=1")
     }
 }
 
@@ -692,8 +729,15 @@ pub struct ClipSpec {
     pub bg: Bg,
     /// Playback rate: 0.5 is half speed (slow motion), 2.0 is double.
     pub speed: f64,
+    /// Play the trimmed span backwards (video and its audio).
+    pub reverse: bool,
     /// Gain on this clip's own audio; 0.0 mutes it.
     pub volume: f64,
+    /// Spectral denoise strength 0..=1 (`afftdn`), 0 = off. iMovie's "Reduce
+    /// background noise" for the clip's own audio.
+    pub denoise: f64,
+    /// EQ / voice treatment label from [`AUDIO_TREATS`]; "None" = flat.
+    pub treat: String,
     /// Transition *into* this clip, by menu label. Ignored on the first clip —
     /// there is nothing before it to blend from.
     pub transition: String,
@@ -714,7 +758,10 @@ impl Default for ClipSpec {
             framing: String::new(),
             bg: Bg::Black,
             speed: 1.0,
+            reverse: false,
             volume: 1.0,
+            denoise: 0.0,
+            treat: "None".to_string(),
             transition: String::new(),
             trans_dur: 0.0,
         }
@@ -914,6 +961,8 @@ pub struct OverlaySpec {
     pub framing: String,
     /// Playback rate, same as a V1 clip: 0.5 is slow motion.
     pub speed: f64,
+    /// Play the trimmed span backwards.
+    pub reverse: bool,
 }
 
 /// Hand-written for the same reason ClipSpec's is: a defaulted 0.0 rate would
@@ -928,6 +977,7 @@ impl Default for OverlaySpec {
             effect: String::new(),
             framing: String::new(),
             speed: 1.0,
+            reverse: false,
         }
     }
 }
@@ -1284,6 +1334,8 @@ pub struct TitleStyle {
     pub outline_color: String,
     /// Semi-opaque backdrop box behind the text.
     pub boxed: bool,
+    /// Backdrop-box opacity, 0..1 — the caption plate's punch.
+    pub box_opacity: f64,
     /// One of TITLE_KINDS. "Text" draws words; the rest draw a shape and
     /// ignore everything about type.
     pub kind: String,
@@ -1315,6 +1367,7 @@ impl Default for TitleStyle {
             outline: 0.0,
             outline_color: "black".into(),
             boxed: false,
+            box_opacity: 0.45,
             kind: "Text".into(),
             shape_w: 0.6,
             shape_h: 0.12,
@@ -1352,6 +1405,7 @@ impl std::hash::Hash for TitleStyle {
         self.bevel.hash(h);
         for f in [
             self.y_frac,
+            self.box_opacity,
             self.outline,
             self.bevel_size,
             self.soften,
@@ -1416,7 +1470,11 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
     // the bevel's own relief — makes the drop shadow redundant.
     let plain = s.bevel == "Off" && !s.boxed && s.outline <= 0.0;
     let shadow = if plain { ":shadowcolor=black@0.5:shadowx=3:shadowy=3" } else { "" };
-    let boxp = if s.boxed { ":box=1:boxcolor=black@0.45:boxborderw=18" } else { "" };
+    let boxp = if s.boxed {
+        format!(":box=1:boxcolor=black@{:.3}:boxborderw=18", s.box_opacity.clamp(0.0, 1.0))
+    } else {
+        String::new()
+    };
     let border = if s.outline > 0.0 {
         format!(":borderw={:.0}:bordercolor={}", s.outline, s.outline_color)
     } else {
@@ -1489,6 +1547,137 @@ fn finish_title(png: &std::path::Path, s: &TitleStyle) -> Result<String, String>
             }
         }
         rgba.save(png).map_err(|e| e.to_string())?;
+    }
+    Ok(png.display().to_string())
+}
+
+/// An ffmpeg colour ("white", "black", "#RRGGBB") as an ASS `&HAABBGGRR&`
+/// literal. ASS packs the bytes reversed (BGR) and reads the leading byte as
+/// *transparency* — 00 is fully opaque. Only the handful of names the colour
+/// picker can produce, plus hex, need covering.
+fn ass_color(c: &str, alpha: u8) -> String {
+    let (r, g, b) = match c {
+        "white" => (255u32, 255u32, 255u32),
+        "black" => (0, 0, 0),
+        hex if hex.starts_with('#') && hex.len() == 7 => {
+            let p = |i: usize| u32::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0);
+            (p(1), p(3), p(5))
+        }
+        _ => (255, 255, 255),
+    };
+    format!("&H{alpha:02X}{b:02X}{g:02X}{r:02X}&")
+}
+
+/// Rasterize one karaoke frame: the whole caption line with word `active`
+/// recoloured to `hi_color`, drawn through libass — which lays the type out and
+/// wraps it on its own. One PNG per word-state, cached and content-addressed
+/// exactly like [`render_title`], so a karaoke card rides the same per-card
+/// overlay path a word-by-word reveal already uses. The custom bevel is not
+/// available here — libass owns the glyph rendering.
+// ponytail: vertical placement approximates drawtext's — an ASS top-anchor at
+// (H-text_h)*y_frac with text_h estimated from font size and line count, since
+// the exact laid-out height isn't known until libass runs. Off by well under a
+// line; upgrade to a two-pass measure only if a caption ever visibly clips.
+pub async fn render_karaoke(s: &TitleStyle, active: usize, hi_color: &str) -> Result<String, String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    active.hash(&mut hasher);
+    hi_color.hash(&mut hasher);
+    "kara-v1".hash(&mut hasher);
+    let dir = cache_dir("titles");
+    let png = dir.join(format!("kara-{:016x}.png", hasher.finish()));
+    if png.exists() {
+        return Ok(png.display().to_string());
+    }
+
+    // Colour every word: each opens with an explicit colour override, so the
+    // active one is highlighted and the rest carry the base colour regardless of
+    // order. Whitespace runs collapse to a single space; newlines force a break.
+    let base = ass_color(&s.color, 0);
+    let hi = ass_color(hi_color, 0);
+    let mut body = String::new();
+    let mut idx = 0usize;
+    let mut prev_ws = true;
+    let mut pending_break = false;
+    for ch in s.text.chars() {
+        if ch.is_whitespace() {
+            if !prev_ws {
+                idx += 1;
+            }
+            if ch == '\n' {
+                pending_break = true;
+            }
+            prev_ws = true;
+            continue;
+        }
+        if prev_ws {
+            if !body.is_empty() {
+                body.push_str(if pending_break { "\\N" } else { " " });
+            }
+            pending_break = false;
+            body.push_str(if idx == active { &hi } else { &base });
+        }
+        prev_ws = false;
+        // Braces open an override block and would swallow the text; drop them.
+        // Caption text otherwise carries no ASS metacharacters.
+        if ch != '{' && ch != '}' {
+            body.push(ch);
+        }
+    }
+
+    let lines = body.matches("\\N").count() + 1;
+    let text_h = s.font_size as f64 * 1.35 * lines as f64;
+    let top = ((H as f64 - text_h) * s.y_frac).max(0.0);
+    // Top-anchored so only the block's top position is needed (no laid-out
+    // height). Horizontal component also sets multi-line justification.
+    let (an, x) = match s.align.as_str() {
+        "Left" => (7, 60.0),
+        "Right" => (9, 1020.0),
+        _ => (8, W as f64 / 2.0),
+    };
+
+    // Box wins over outline: an opaque plate (BorderStyle=3) is the caption look,
+    // and a plain outline (BorderStyle=1) is the transparent-friendly one.
+    let (border_style, outline, outline_col, back_col) = if s.boxed {
+        let a = ((1.0 - s.box_opacity.clamp(0.0, 1.0)) * 255.0) as u8;
+        (3, 12.0, ass_color("black", 0), ass_color("black", a))
+    } else if s.outline > 0.0 {
+        (1, s.outline, ass_color(&s.outline_color, 0), ass_color("black", 0))
+    } else {
+        (1, 0.0, ass_color("black", 0), ass_color("black", 0))
+    };
+
+    let ass = format!(
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: {W}\nPlayResY: {H}\nWrapStyle: 0\n\n\
+         [V4+ Styles]\n\
+         Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, \
+         Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, \
+         Alignment, MarginL, MarginR, MarginV, Encoding\n\
+         Style: D,{font},{size},{base},&H000000FF&,{outline_col},{back_col},1,0,0,0,100,100,0,0,\
+         {border_style},{outline},0,{an},40,40,40,1\n\n\
+         [Events]\n\
+         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+         Dialogue: 0,0:00:00.00,0:00:10.00,D,,0,0,0,,{{\\an{an}\\pos({x:.0},{top:.0})}}{body}\n",
+        font = if s.font.is_empty() { "Sans" } else { &s.font },
+        size = s.font_size,
+    );
+    let assp = png.with_extension("ass");
+    std::fs::write(&assp, ass).map_err(|e| e.to_string())?;
+    let out = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
+        .arg(format!("color=c=black@0.0:s={W}x{H},format=rgba"))
+        .arg("-vf")
+        .arg(format!("ass=filename={}:original_size={W}x{H}:alpha=1", assp.display()))
+        .args(["-frames:v", "1", "-pix_fmt", "rgba"])
+        .arg(&png)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+    let _ = std::fs::remove_file(&assp);
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(png.display().to_string())
 }
@@ -1793,9 +1982,21 @@ fn clip_audio(i: usize, c: &ClipSpec) -> String {
     if c.has_audio && c.volume > 0.0 {
         let tempo = atempo_chain(c.speed);
         let tempo = if tempo.is_empty() { String::new() } else { format!(",{tempo}") };
+        let rev = if c.reverse { "areverse," } else { "" };
+        // Reduce background noise + EQ preset, same building blocks as the A1 lane.
+        let mut proc: Vec<String> = Vec::new();
+        let dn = c.denoise.clamp(0.0, 1.0);
+        if dn > 0.001 {
+            proc.push(format!("afftdn=nr={:.1}:nf=-25", 4.0 + 20.0 * dn));
+        }
+        let treat = audio_treat_chain(&c.treat);
+        if !treat.is_empty() {
+            proc.push(treat.to_string());
+        }
+        let proc = if proc.is_empty() { String::new() } else { format!(",{}", proc.join(",")) };
         format!(
-            "[{i}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,\
-             aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo{tempo},\
+            "[{i}:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,{rev}\
+             aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo{proc}{tempo},\
              volume={:.2}[a{i}];",
             c.in_s, c.out_s, c.volume
         )
@@ -1842,10 +2043,11 @@ pub fn build_filter(
         // Dividing PTS by the speed is what retimes the video; fps= after it
         // resamples so slow motion gets duplicated frames instead of a stutter.
         f += &format!(
-            "[{i}:v]trim=start={:.3}:end={:.3},setpts=(PTS-STARTPTS)/{:.4},fps={FPS},\
+            "[{i}:v]trim=start={:.3}:end={:.3},{}setpts=(PTS-STARTPTS)/{:.4},fps={FPS},\
              {},setsar=1{}[v{i}];",
             c.in_s,
             c.out_s,
+            if c.reverse { "reverse," } else { "" },
             c.speed.max(0.01),
             frame_chain_fill(&c.framing, W, H, &format!("c{i}"), c.bg.color()),
             eff(&c.effect)
@@ -1904,15 +2106,23 @@ pub fn build_filter(
     let mut vl = vhead;
     for (j, o) in overlays.iter().enumerate() {
         let idx = clips.len() + j;
+        // Compose the layer's own look on a clip-local clock, THEN shift it into
+        // its timeline slot. Order matters: a time-based filter inside look() (a
+        // keyframed opacity's alpha curve, a motion preset) must see 0-based clip
+        // time — the preview composes the look clip-locally too, so anything else
+        // would animate at a different moment there than in the export. The final
+        // PTS is identical to the old combined shift, so a static overlay (whose
+        // look holds no clock) exports byte-for-byte as before.
         f += &format!(
-            "[{idx}:v]trim=start={:.3}:end={:.3},setpts=(PTS-STARTPTS)/{:.4}+{:.3}/TB,fps={FPS},\
-             {},setsar=1{}[ov{j}];",
+            "[{idx}:v]trim=start={:.3}:end={:.3},{}setpts=(PTS-STARTPTS)/{:.4},fps={FPS},\
+             {},setsar=1{},setpts=PTS+{:.3}/TB[ov{j}];",
             o.in_s,
             o.out_s,
+            if o.reverse { "reverse," } else { "" },
             o.speed.max(0.01),
-            o.at,
             frame_chain(&o.framing, W, H, &format!("o{j}")),
-            eff(&o.effect)
+            eff(&o.effect),
+            o.at,
         );
         f += &format!(
             "[{vl}][ov{j}]overlay=eof_action=pass:enable='between(t,{:.3},{:.3})'[vx{j}];",
@@ -2633,7 +2843,9 @@ mod tests {
         assert!(!f.contains("[1:a]") && f.contains("anullsrc"));
         assert!(f.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vc][ac]"));
         // input order: clips 0-1, overlay 2, title 3, audio 4
-        assert!(f.contains("[2:v]trim=start=0.000:end=1.000,setpts=(PTS-STARTPTS)/1.0000+0.500/TB"));
+        // Look composed on a clip-local clock, then shifted to the timeline slot.
+        assert!(f.contains("[2:v]trim=start=0.000:end=1.000,setpts=(PTS-STARTPTS)/1.0000,fps="));
+        assert!(f.contains("setsar=1,setpts=PTS+0.500/TB[ov0]"));
         assert!(f.contains("[vc][ov0]overlay=eof_action=pass:enable='between(t,0.500,1.500)'[vx0]"));
         // title: looped still trimmed to its duration, alpha-faded both ends,
         // shifted to its timeline spot
@@ -3450,7 +3662,8 @@ noise
             &[],
             ExportOpts::default(),
         );
-        assert!(f.contains("setpts=(PTS-STARTPTS)/2.0000+1.000/TB"), "not retimed: {f}");
+        assert!(f.contains("setpts=(PTS-STARTPTS)/2.0000,"), "not retimed: {f}");
+        assert!(f.contains("setpts=PTS+1.000/TB[ov0]"), "not shifted to its slot: {f}");
         assert!(f.contains("enable='between(t,1.000,3.000)'"), "window not retimed: {f}");
     }
 
@@ -4003,6 +4216,68 @@ noise
         let early = frame_data_uri(&png, 0.0, 108, 192, "Crop", &chain, Over::default()).await.unwrap();
         let later = frame_data_uri(&png, 2.5, 108, 192, "Crop", &chain, Over::default()).await.unwrap();
         assert_ne!(early, later, "keyframed zoom froze at its opening pose");
+    }
+
+    #[test]
+    fn a_transform_the_mcp_server_writes_loads_and_samples() {
+        // Exactly the shape src/bin/mcp.rs emits: static fields as bare numbers,
+        // a tracked axis as a key array. If the editor can't load this, the MCP
+        // round-trip is broken — so pin it here against the real type.
+        let json = serde_json::json!({
+            "scale": 1.0, "scale_x": 0.5, "scale_y": 0.5, "cover": true, "y": -0.15,
+            "x": [
+                {"t": 0.0, "v": 0.3, "interp": "Smooth"},
+                {"t": 2.0, "v": -0.3, "interp": "Smooth"}
+            ]
+        });
+        let xf: AnimatedTransform = serde_json::from_value(json).unwrap();
+        assert!(xf.x.is_animated());
+        assert!((xf.x.sample(0.0) - 0.3).abs() < 1e-9);
+        assert!((xf.pose().scale_x - 0.5).abs() < 1e-9);
+        assert!(xf.cover);
+        // And it compiles to a panning zoompan (scale const>? no — scale is const
+        // 1.0 here, so the static branch runs and honours x via the crop offset).
+        assert!(!xf.chain(W, H, false).is_empty());
+    }
+
+    #[test]
+    fn an_animated_pan_offsets_the_zoompan_crop() {
+        // Zoom headroom (engages the animated branch) plus an x pan curve.
+        let mut xf = AnimatedTransform::default();
+        xf.scale = Animated::curve(vec![
+            Key { t: 0.0, v: 1.5, interp: Interp::Smooth },
+            Key { t: 2.0, v: 1.5, interp: Interp::Smooth },
+        ]);
+        xf.x = Animated::curve(vec![
+            Key { t: 0.0, v: 0.3, interp: Interp::Smooth },
+            Key { t: 2.0, v: -0.3, interp: Interp::Smooth },
+        ]);
+        let chain = xf.chain(W, H, false);
+        assert!(chain.contains("x='iw/2-(iw/zoom/2)-("), "pan term not applied: {chain}");
+        assert!(chain.contains("(iw/zoom)"), "pan scale factor missing: {chain}");
+
+        // A pure centred zoom (no pan) keeps the bare centre expression, unchanged.
+        let mut z = AnimatedTransform::default();
+        z.scale = xf.scale.clone();
+        assert!(z.chain(W, H, false).contains("x='iw/2-(iw/zoom/2)':"), "{}", z.chain(W, H, false));
+    }
+
+    #[test]
+    fn keyframed_opacity_animates_the_alpha_plane_only_on_a_composited_layer() {
+        let mut xf = AnimatedTransform::default(); // geometry is the identity
+        xf.opacity = Animated::curve(vec![
+            Key { t: 0.0, v: 0.0, interp: Interp::Linear },
+            Key { t: 1.0, v: 1.0, interp: Interp::Linear },
+        ]);
+        // On a composited layer the curve drives the alpha plane at clip-local
+        // frame time T, never a constant colorchannelmixer.
+        let over = xf.chain(W, H, true);
+        assert!(over.contains("geq=") && over.contains("a='alpha(X,Y)*clip("), "no animated alpha: {over}");
+        assert!(!over.contains("colorchannelmixer"), "opacity must not bake a constant: {over}");
+        // V1 (no alpha) ignores opacity entirely — it fills black, so no alpha
+        // filter is ever emitted there, animated or not.
+        let v1 = xf.chain(W, H, false);
+        assert!(!v1.contains("geq=") && !v1.contains("colorchannelmixer"), "no alpha work on V1: {v1}");
     }
 
     #[test]
