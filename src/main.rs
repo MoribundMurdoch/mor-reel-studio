@@ -194,6 +194,11 @@ fn HubRow(
 enum EditorView {
     Full,
     Inspector,
+    /// Popped-out program monitor: the same `Editor` over shared state, rendering
+    /// only the monitor stage + its transform/text handles. Editing in it (move,
+    /// scale, rotate, stretch, text seat) writes the shared model, so the main
+    /// window updates live — one project, two windows.
+    Monitor,
 }
 
 /// Every signal the editor owns, in one Copy bundle. It exists so a second
@@ -369,30 +374,19 @@ fn SafeArea() -> Element {
     }
 }
 
-/// Program monitor window: just the phone, fed by the editor's preview signal.
-/// Runs in its own VirtualDom, so it gets its own style provider.
+/// Program monitor window: the same `Editor` in `Monitor` view over the *shared*
+/// state, so it's a live, editable monitor — move/scale/rotate/stretch the
+/// selected layer and drag text right on the popped-out phone, and the main
+/// window updates with it. Same trick as [`PoppedInspector`]. Runs in its own
+/// VirtualDom, so it gets its own style provider; closing it docks the monitor
+/// back (use_drop).
 #[component]
-fn Monitor(preview: Signal<String>, out: Signal<bool>, safe: Signal<bool>) -> Element {
-    // Closing the window drops this VirtualDom — that drop is what docks the
-    // monitor back into the editor.
+fn PoppedMonitor(state: EditorState, out: Signal<bool>) -> Element {
     use_drop(move || out.set(false));
     rsx! {
         MorStyleProvider { theme_toml: Some(MORREEL_TOML.to_string()) }
         style { {APP_CSS} }
-        div { class: "mr-monitor",
-            // The webview's default menu (Reload/Inspect) is noise in a monitor.
-            oncontextmenu: move |evt| evt.prevent_default(),
-            div { class: "mr-phone",
-                if preview().is_empty() {
-                    span { "Add clips to preview your reel" }
-                } else {
-                    img { src: "{preview}" }
-                }
-                if safe() {
-                    SafeArea {}
-                }
-            }
-        }
+        MorShortcutRoot { Editor { state, view: EditorView::Monitor } }
     }
 }
 
@@ -519,6 +513,9 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     // keyboard shortcuts, preview pump). A popped-out inspector shares the same
     // signals but must not run a second copy of any of them — it only renders.
     let is_main = view == EditorView::Full;
+    // The popped-out monitor window: show the monitor stage + handles, hide the
+    // rail/inspector and timeline. Shares is_main's "no chrome" via the layout.
+    let is_monitor = view == EditorView::Monitor;
     let mut clips = state.clips;
     let mut overlays = state.overlays;
     let mut audios = state.audios;
@@ -4027,8 +4024,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         }
         use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
         let dom = VirtualDom::new_with_props(
-            Monitor,
-            MonitorProps { preview, out: monitor_out, safe: safe_area },
+            PoppedMonitor,
+            PoppedMonitorProps { state, out: monitor_out },
         );
         let cfg = Config::new()
             .with_menu(None::<dioxus::desktop::muda::Menu>)
@@ -5001,7 +4998,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 }
             },
 
-            div { class: "mr-root",
+            div { class: if is_monitor { "mr-root mr-root-mon" } else { "mr-root" },
                 // Releasing the mouse ends an interaction, so the next drag of
                 // the same slider or item starts a fresh undo step instead of
                 // collapsing into the previous one's snapshot.
@@ -5018,9 +5015,9 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     float_size.set(Some((w, h)));
                 },
                 div { class: "mr-work",
-                    if is_main {
+                    if is_main || is_monitor {
                     div { class: "mr-preview-col",
-                        if !monitor_out() {
+                        if is_monitor || !monitor_out() {
                             div { class: "mr-stage",
                             div {
                                 class: if matches!(drop_hover(), Some(Lane::V(_))) { "mr-phone mr-drop" } else { "mr-phone" },
@@ -5372,6 +5369,100 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     }
                     } // if is_main (monitor column)
 
+                    // Right rail: the phase spine sits atop the inspector, so the
+                    // full-width bottom bar is gone and the monitor/timeline get
+                    // that height back. The inspector still floats/closes below it.
+                    // Hidden in the popped-out monitor window (stage only).
+                    if !is_monitor {
+                    div { class: "mr-rail",
+                    if is_main {
+                    div { class: "mr-workflow",
+                        button {
+                            class: if active_phase() == Phase::Add { "mr-wf active" } else { "mr-wf" },
+                            title: "Add clips, b-roll or music",
+                            onclick: move |_| active_phase.set(Phase::Add),
+                            span { class: "mr-wf-icon", "＋" }
+                            span { class: "mr-wf-label", "Add" }
+                            if !clips.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
+                        }
+                        button {
+                            class: if active_phase() == Phase::Cut { "mr-wf active" } else { "mr-wf" },
+                            title: "Trim, split and arrange the current clip",
+                            onclick: move |_| {
+                                if selected().is_none() {
+                                    if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
+                                }
+                                active_phase.set(Phase::Cut);
+                            },
+                            span { class: "mr-wf-icon", "✂" }
+                            span { class: "mr-wf-label", "Cut" }
+                        }
+                        button {
+                            class: if active_phase() == Phase::Style { "mr-wf active" } else { "mr-wf" },
+                            title: "Effects, transform and Ken Burns for the current clip",
+                            onclick: move |_| {
+                                if selected().is_none() {
+                                    if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
+                                }
+                                active_phase.set(Phase::Style);
+                            },
+                            span { class: "mr-wf-icon", "✦" }
+                            span { class: "mr-wf-label", "Style" }
+                            if clips.read().iter().any(|c| c.effect != "None" || c.transform.scale.is_animated()) {
+                                span { class: "mr-wf-tick", "✓" }
+                            }
+                        }
+                        button {
+                            class: if active_phase() == Phase::Effects { "mr-wf active" } else { "mr-wf" },
+                            title: "Chroma key and image/particle effects for the current clip or overlay",
+                            onclick: move |_| {
+                                if selected().is_none() {
+                                    if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
+                                }
+                                active_phase.set(Phase::Effects);
+                            },
+                            span { class: "mr-wf-icon", "◧" }
+                            span { class: "mr-wf-label", "FX" }
+                            if clips.read().iter().any(|c| is_keyer(&c.effect))
+                                || overlays.read().iter().any(|o| is_keyer(&o.effect) || !o.blend.is_empty()) {
+                                span { class: "mr-wf-tick", "✓" }
+                            }
+                        }
+                        button {
+                            class: if active_phase() == Phase::Background { "mr-wf active" } else { "mr-wf" },
+                            title: "Frame background behind banded or shrunk clips",
+                            onclick: move |_| active_phase.set(Phase::Background),
+                            span { class: "mr-wf-icon", "▧" }
+                            span { class: "mr-wf-label", "Bg" }
+                            if clips.read().iter().any(|c| c.transform.bg != engine::Bg::Black) {
+                                span { class: "mr-wf-tick", "✓" }
+                            }
+                        }
+                        button {
+                            class: if active_phase() == Phase::Text { "mr-wf active" } else { "mr-wf" },
+                            title: "Text and captions",
+                            onclick: move |_| active_phase.set(Phase::Text),
+                            span { class: "mr-wf-icon", "T" }
+                            span { class: "mr-wf-label", "Text" }
+                            if !titles.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
+                        }
+                        button {
+                            class: if active_phase() == Phase::Audio { "mr-wf active" } else { "mr-wf" },
+                            title: "Music and voiceover under the picture",
+                            onclick: move |_| active_phase.set(Phase::Audio),
+                            span { class: "mr-wf-icon", "♪" }
+                            span { class: "mr-wf-label", "Audio" }
+                            if !audios.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
+                        }
+                        button {
+                            class: if active_phase() == Phase::Export { "mr-wf active mr-wf-export" } else { "mr-wf mr-wf-export" },
+                            title: "Export your reel",
+                            onclick: move |_| active_phase.set(Phase::Export),
+                            span { class: "mr-wf-icon", "⇪" }
+                            span { class: "mr-wf-label", "Export" }
+                        }
+                    }
+                    }
                     if is_main && !insp_open() {
                         button {
                             class: "mr-insp-reopen",
@@ -7084,6 +7175,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         }
                     }
                     }
+                    } // mr-rail
+                    } // if !is_monitor
                 }
 
                 if is_main {
@@ -8085,98 +8178,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     }
                 }
                 } // if is_main (timeline)
-                // Workflow spine: the reel-building phases left→right, the phase
-                // you're in lit up, a ✓ on phases that already have content. Each
-                // button is the primary action for its phase, not a menu clone.
-                // Main window only — a popped inspector is chrome-free.
-                if is_main {
-                div { class: "mr-workflow",
-                    button {
-                        class: if active_phase() == Phase::Add { "mr-wf active" } else { "mr-wf" },
-                        title: "Add clips, b-roll or music",
-                        onclick: move |_| active_phase.set(Phase::Add),
-                        span { class: "mr-wf-icon", "＋" }
-                        span { class: "mr-wf-label", "Add" }
-                        if !clips.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
-                    }
-                    button {
-                        class: if active_phase() == Phase::Cut { "mr-wf active" } else { "mr-wf" },
-                        title: "Trim, split and arrange the current clip",
-                        onclick: move |_| {
-                            if selected().is_none() {
-                                if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
-                            }
-                            active_phase.set(Phase::Cut);
-                        },
-                        span { class: "mr-wf-icon", "✂" }
-                        span { class: "mr-wf-label", "Cut" }
-                    }
-                    button {
-                        class: if active_phase() == Phase::Style { "mr-wf active" } else { "mr-wf" },
-                        title: "Effects, transform and Ken Burns for the current clip",
-                        onclick: move |_| {
-                            if selected().is_none() {
-                                if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
-                            }
-                            active_phase.set(Phase::Style);
-                        },
-                        span { class: "mr-wf-icon", "✦" }
-                        span { class: "mr-wf-label", "Style" }
-                        if clips.read().iter().any(|c| c.effect != "None" || c.transform.scale.is_animated()) {
-                            span { class: "mr-wf-tick", "✓" }
-                        }
-                    }
-                    button {
-                        class: if active_phase() == Phase::Effects { "mr-wf active" } else { "mr-wf" },
-                        title: "Chroma key and image/particle effects for the current clip or overlay",
-                        onclick: move |_| {
-                            if selected().is_none() {
-                                if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
-                            }
-                            active_phase.set(Phase::Effects);
-                        },
-                        span { class: "mr-wf-icon", "◧" }
-                        span { class: "mr-wf-label", "FX" }
-                        if clips.read().iter().any(|c| is_keyer(&c.effect))
-                            || overlays.read().iter().any(|o| is_keyer(&o.effect) || !o.blend.is_empty()) {
-                            span { class: "mr-wf-tick", "✓" }
-                        }
-                    }
-                    button {
-                        class: if active_phase() == Phase::Background { "mr-wf active" } else { "mr-wf" },
-                        title: "Frame background behind banded or shrunk clips",
-                        onclick: move |_| active_phase.set(Phase::Background),
-                        span { class: "mr-wf-icon", "▧" }
-                        span { class: "mr-wf-label", "Bg" }
-                        if clips.read().iter().any(|c| c.transform.bg != engine::Bg::Black) {
-                            span { class: "mr-wf-tick", "✓" }
-                        }
-                    }
-                    button {
-                        class: if active_phase() == Phase::Text { "mr-wf active" } else { "mr-wf" },
-                        title: "Text and captions",
-                        onclick: move |_| active_phase.set(Phase::Text),
-                        span { class: "mr-wf-icon", "T" }
-                        span { class: "mr-wf-label", "Text" }
-                        if !titles.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
-                    }
-                    button {
-                        class: if active_phase() == Phase::Audio { "mr-wf active" } else { "mr-wf" },
-                        title: "Music and voiceover under the picture",
-                        onclick: move |_| active_phase.set(Phase::Audio),
-                        span { class: "mr-wf-icon", "♪" }
-                        span { class: "mr-wf-label", "Audio" }
-                        if !audios.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
-                    }
-                    button {
-                        class: if active_phase() == Phase::Export { "mr-wf active mr-wf-export" } else { "mr-wf mr-wf-export" },
-                        title: "Export your reel",
-                        onclick: move |_| active_phase.set(Phase::Export),
-                        span { class: "mr-wf-icon", "⇪" }
-                        span { class: "mr-wf-label", "Export" }
-                    }
-                }
-                } // if is_main (phase bar)
+                // Workflow spine moved into the right rail, above the inspector
+                // (see mr-rail) — the full-width bottom bar is gone.
             }
         }
 

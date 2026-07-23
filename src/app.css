@@ -202,7 +202,7 @@
 
 /* Inspector: framed panel like a classic side window. */
 .mr-inspector {
-  flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 12px;
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px;
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 92%, white), var(--mor-panel));
   border: 1px solid color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border));
@@ -596,9 +596,21 @@
 }
 
 /* Workflow spine: the reel-building phases as a bottom bar. */
+/* Right rail: phase spine stacked above the inspector (which floats/closes
+   below it). Owns the right column's width; the inspector fills what's left. */
+.mr-rail {
+  flex: 1; min-width: 280px; min-height: 0;
+  display: flex; flex-direction: column; gap: 12px;
+}
+/* Popped-out monitor window: no rail, so the preview column takes the whole
+   window and the phone centers in it. */
+.mr-root-mon .mr-work { justify-content: center; }
+.mr-root-mon .mr-preview-col { flex: 1; width: 100%; max-width: none; }
+/* The phase spine, now a compact 4×2 grid so all eight fit the narrow column
+   instead of a full-width row. flex:none keeps it from eating inspector height. */
 .mr-workflow {
-  display: flex; justify-content: center; gap: 4px; flex: none;
-  padding: 5px 8px; margin-top: 6px;
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px;
+  flex: none; padding: 6px;
   background: rgba(127, 127, 127, 0.05);
   border: 1px solid var(--mor-border);
   border-radius: var(--mor-radius);
@@ -607,7 +619,7 @@
 .mr-wf {
   position: relative;
   display: flex; flex-direction: column; align-items: center; gap: 3px;
-  min-width: 76px; padding: 5px 12px;
+  min-width: 0; padding: 6px 4px;
   background: transparent; border: 1px solid transparent; border-radius: 7px;
   color: var(--mor-text-muted); cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
