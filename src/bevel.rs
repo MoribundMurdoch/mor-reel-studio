@@ -145,7 +145,7 @@ fn convolve_1d(src: &[f32], dst: &mut [f32], w: usize, h: usize, kernel: &[f32],
     }
 }
 
-fn gaussian_blur(src: &mut [f32], w: usize, h: usize, sigma: f32) {
+pub fn gaussian_blur(src: &mut [f32], w: usize, h: usize, sigma: f32) {
     if sigma <= 0.0 {
         return;
     }
@@ -219,10 +219,14 @@ pub fn compute_bevel(rgba: &[u8], width: u32, height: u32, params: &BevelParams)
         let ny = ggy / denom;
         let nz = 1.0 / denom;
 
-        let lighting = (nx * lx + ny * ly + nz * lz).clamp(0.0, 1.0) * alpha;
-
-        let hi_a = ((lighting - 0.5) * 2.0).clamp(0.0, 1.0) * params.hi_opacity * alpha;
-        let sh_a = ((0.5 - lighting) * 2.0).clamp(0.0, 1.0) * params.sh_opacity * alpha;
+        // Raw Lambertian term, then a tighter specular rim layered on top for a
+        // metallic (chrome) sheen rather than matte relief. Alpha gates both at
+        // the end. `spec` ramps in only where the surface faces the light most.
+        let l = (nx * lx + ny * ly + nz * lz).clamp(0.0, 1.0);
+        let spec = (((l - 0.6) / 0.4).clamp(0.0, 1.0)).powi(2);
+        let hi_a =
+            (((l - 0.5) * 2.0).clamp(0.0, 1.0) + 0.6 * spec).min(1.0) * params.hi_opacity * alpha;
+        let sh_a = ((0.5 - l) * 2.0).clamp(0.0, 1.0) * params.sh_opacity * alpha;
 
         hi_rgba[i * 4] = 255;
         hi_rgba[i * 4 + 1] = 255;
