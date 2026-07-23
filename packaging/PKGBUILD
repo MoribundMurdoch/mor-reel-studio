@@ -1,0 +1,36 @@
+# Maintainer: MoribundMurdoch <moribundenglish@gmail.com>
+# Local/dev PKGBUILD: builds from the working tree ($startdir), so it expects
+# the sibling crate ../mor_rust_dioxus_ui_kit to be present (as in the repo layout).
+pkgname=morreel-studio
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Portrait-only (9:16) video editor for phone reels — Dioxus UI over an ffmpeg engine"
+arch=('x86_64')
+url="https://github.com/MoribundMurdoch/mor-reel-studio"
+license=('GPL-3.0-or-later')
+depends=('ffmpeg' 'webkit2gtk-4.1' 'gcc-libs' 'glibc')
+makedepends=('cargo')
+provides=('morreel-studio' 'morreel' 'morreel-mcp')
+# !debug: debuginfo=2 + opt3 segfaults rustc on the large main.rs. !lto: leave
+# the profile as-is. $startdir is the PKGBUILD's dir (packaging/), so the repo
+# root — where Cargo.toml and the sibling crate live — is one level up.
+options=('!debug' '!lto')
+
+build() {
+    cd "$startdir/.."
+    RUST_MIN_STACK=33554432 cargo build --release --locked
+}
+
+package() {
+    cd "$startdir/.."
+    install -Dm755 target/release/morreel-studio "$pkgdir/usr/bin/morreel-studio"
+    install -Dm755 target/release/morreel        "$pkgdir/usr/bin/morreel"
+    install -Dm755 target/release/mcp            "$pkgdir/usr/bin/morreel-mcp"
+    install -Dm644 packaging/morreel-studio.desktop \
+        "$pkgdir/usr/share/applications/morreel-studio.desktop"
+    for s in 48 128 256 512; do
+        install -Dm644 "assets/icons/morreel-studio-$s.png" \
+            "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/morreel-studio.png"
+    done
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

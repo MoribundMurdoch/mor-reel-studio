@@ -1,0 +1,45 @@
+name: release
+
+# Push a tag like v0.1.0 to build the Windows .exe on a real Windows runner
+# and attach it to the GitHub release for that tag. Linux packages (deb/rpm/
+# arch) are built locally and uploaded separately.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      # The crate has a path dep on ../mor_rust_dioxus_ui_kit, so check out both
+      # repos as siblings to match the local layout.
+      - uses: actions/checkout@v4
+        with:
+          path: morreel-studio
+      - uses: actions/checkout@v4
+        with:
+          repository: MoribundInstitute/mor_rust_dioxus_ui_kit
+          path: mor_rust_dioxus_ui_kit
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: morreel-studio
+      - name: Build (release)
+        working-directory: morreel-studio
+        run: cargo build --release --locked
+      - name: Package zip
+        working-directory: morreel-studio
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/morreel-studio.exe dist/
+          Copy-Item target/release/morreel.exe dist/
+          Copy-Item target/release/mcp.exe dist/morreel-mcp.exe
+          Compress-Archive -Path dist/* -DestinationPath "morreel-studio-${{ github.ref_name }}-windows-x86_64.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: morreel-studio/morreel-studio-*-windows-x86_64.zip

@@ -1829,8 +1829,20 @@ pub struct Over {
     /// (0 = not yet visible, 1 = fully replaced the base).
     /// (path, source time, framing, effect chain, alpha)
     pub blend: Option<(String, f64, String, String, f64)>,
+    /// Extra picture layers stacked after the base (and transition blend),
+    /// bottom → top — V2, V3, … cutaways so multi-track preview matches export.
+    /// Each is (path, source time, framing, effect/look chain).
+    pub layers: Vec<(String, f64, String, String)>,
     /// A rendered title card and its opacity at this instant.
+    /// Prefer [`Self::titles`] when more than one card is active.
     pub title: Option<(String, f64)>,
+    /// Multiple title cards stacked bottom → top (T1 under T2 under …).
+    /// When non-empty, takes precedence over [`Self::title`].
+    pub titles: Vec<(String, f64)>,
+    /// A full-frame adjustment-layer look active at this instant (grade + effect
+    /// chain), applied to the composited picture below any title. Empty/None
+    /// when no adjustment covers the playhead — same look the export bakes in.
+    pub adjust: Option<String>,
 }
 
 pub async fn frame_data_uri(
@@ -1905,17 +1917,49 @@ pub async fn frame_data_uri_fill(
         );
         top = format!("x{idx}");
     }
-    if let Some((png, alpha)) = &over.title {
+    // Multi-track cutaways (V2, V3, …) over the base — same stack as export.
+    for (li, (lpath, lt, lframing, leffect)) in over.layers.iter().enumerate() {
+        idx += 1;
+        if is_still(lpath) {
+            cmd.args(["-loop", "1"]);
+        }
+        cmd.args(["-ss", &format!("{lt:.3}"), "-i", lpath]);
+        let mut lchain = frame_chain_fill(lframing, w, h, &format!("l{li}"), fill);
+        if !leffect.is_empty() {
+            lchain = format!("{lchain},setpts=PTS+{lt:.3}/TB,{leffect},setpts=PTS-{lt:.3}/TB");
+        }
+        graph += &format!(
+            "[{idx}:v]{lchain},format=rgba[ly{idx}];\
+             [{top}][ly{idx}]overlay[x{idx}];"
+        );
+        top = format!("x{idx}");
+    }
+    // Adjustment layer: a full-frame look over the composited picture, below any
+    // title (captions stay clean, matching the export's placement). Shift the
+    // clock to the seek point so a time-based look poses at the playhead.
+    if let Some(look) = over.adjust.as_deref().filter(|s| !s.is_empty()) {
+        graph += &format!("[{top}]setpts=PTS+{t:.3}/TB,{look},setpts=PTS-{t:.3}/TB[adj];");
+        top = "adj".to_string();
+    }
+    // Title stack: multi-track cards when present, else the single-title field.
+    let title_stack: Vec<(String, f64)> = if !over.titles.is_empty() {
+        over.titles.clone()
+    } else if let Some((png, alpha)) = &over.title {
+        vec![(png.clone(), *alpha)]
+    } else {
+        Vec::new()
+    };
+    for (png, alpha) in &title_stack {
         idx += 1;
         cmd.args(["-i", png]);
         graph += &format!(
-            "[{idx}:v]scale={w}:{h},format=rgba,colorchannelmixer=aa={:.3}[ttl];\
-             [{top}][ttl]overlay[x{idx}];",
+            "[{idx}:v]scale={w}:{h},format=rgba,colorchannelmixer=aa={:.3}[ttl{idx}];\
+             [{top}][ttl{idx}]overlay[x{idx}];",
             alpha.clamp(0.0, 1.0)
         );
         top = format!("x{idx}");
     }
-    if idx == 0 {
+    if top == "base" {
         cmd.args(["-vf", &chain]);
     } else {
         graph += &format!("[{top}]null[out]");
@@ -2147,12 +2191,25 @@ fn a1_audio(idx: usize, k: usize, a: &AudioSpec) -> String {
     )
 }
 
+/// A full-frame adjustment layer: a grade/effect `look` applied to everything
+/// composited beneath it, only inside `[at, at+dur]`. Carries no media, so it
+/// adds no ffmpeg input — it's a pure filter on the running composite.
+#[derive(Clone, Default)]
+pub struct AdjustSpec {
+    pub at: f64,
+    pub dur: f64,
+    pub look: String,
+    pub enabled: bool,
+}
+
 /// The whole edit as one filter graph: V1 clips trim + portrait crop + effect,
-/// concat; V2 overlays composited on top; T titles above those; A1 audio mixed
-/// under. Ends [vout][aout]. Input order: clips, overlays, titles, audio.
+/// concat; V2 overlays composited on top; FX adjustment looks over that; T
+/// titles above those; A1 audio mixed under. Ends [vout][aout]. Input order:
+/// clips, overlays, titles, audio (adjustments add no inputs).
 pub fn build_filter(
     clips: &[ClipSpec],
     overlays: &[OverlaySpec],
+    adjustments: &[AdjustSpec],
     titles: &[TitleSpec],
     audio: &[AudioSpec],
     opts: ExportOpts,
@@ -2272,6 +2329,26 @@ pub fn build_filter(
             );
         }
         vl = format!("vx{j}");
+    }
+
+    // Adjustment layers grade/stylise the composited picture over a window,
+    // above V1+V2 but below the titles. Split the running composite, run the
+    // look on one copy, then let the outer overlay show that processed copy only
+    // inside the window and the clean base outside it — the same enable-gate the
+    // blend path uses. A disabled or empty adjustment is a no-op.
+    for (j, a) in adjustments.iter().enumerate() {
+        if !a.enabled || a.look.is_empty() {
+            continue;
+        }
+        f += &format!(
+            "[{vl}]split[aj{j}a][aj{j}b];\
+             [aj{j}b]{}[aj{j}c];\
+             [aj{j}a][aj{j}c]overlay=enable='between(t,{:.3},{:.3})'[ax{j}];",
+            a.look,
+            a.at,
+            a.at + a.dur,
+        );
+        vl = format!("ax{j}");
     }
 
     for (j, t) in titles.iter().enumerate() {
@@ -2905,6 +2982,7 @@ pub async fn transcribe(
 pub async fn export(
     clips: &[ClipSpec],
     overlays: &[OverlaySpec],
+    adjustments: &[AdjustSpec],
     titles: &[TitleSpec],
     audio: &[AudioSpec],
     out: &Path,
@@ -2935,7 +3013,7 @@ pub async fn export(
     }
     let (speed, crf) = opts.quality.encode(opts.format);
     let crf = crf.to_string();
-    cmd.args(["-filter_complex", &build_filter(clips, overlays, titles, audio, opts)]);
+    cmd.args(["-filter_complex", &build_filter(clips, overlays, adjustments, titles, audio, opts)]);
     // GIF's palette pass renames the video output; everything else maps [vout].
     cmd.args(["-map", if opts.format == Format::Gif { "[gout]" } else { "[vout]" }]);
     if opts.format.has_audio() {
@@ -3098,7 +3176,7 @@ mod tests {
             volume: 0.5,
             ..Default::default()
         }];
-        let f = build_filter(&clips, &overlays, &titles, &audio, ExportOpts::default());
+        let f = build_filter(&clips, &overlays, &[], &titles, &audio, ExportOpts::default());
         assert!(f.contains("[0:v]trim=start=0.500:end=2.000"));
         assert!(f.contains("setsar=1,hue=s=0[v0]"));
         assert!(f.contains("crop=1080:1920"));
@@ -3122,7 +3200,7 @@ mod tests {
         assert!(f.ends_with("[vt0]null[vout];[am]anull[aout]"));
 
         // no overlays / titles / audio degenerates to plain concat
-        let f = build_filter(&clips, &[], &[], &[], ExportOpts::default());
+        let f = build_filter(&clips, &[], &[], &[], &[], ExportOpts::default());
         assert!(f.ends_with("[vc]null[vout];[ac]anull[aout]"));
     }
 
@@ -3131,13 +3209,29 @@ mod tests {
         let clips = [ClipSpec { path: "a.mp4".into(), in_s: 0.0, out_s: 3.0, ..Default::default() }];
         let overlays =
             [OverlaySpec { path: "leak.mp4".into(), in_s: 0.0, out_s: 1.0, at: 0.5, blend: "screen".into(), ..Default::default() }];
-        let f = build_filter(&clips, &overlays, &[], &[], ExportOpts::default());
+        let f = build_filter(&clips, &overlays, &[], &[], &[], ExportOpts::default());
         // Base split, screen-blended full length, gated to the layer's span by the
         // outer overlay — not the plain alpha-over path.
         assert!(f.contains("[vc]split[bl0a][bl0b];"), "{f}");
         assert!(f.contains("[bl0b][ov0]blend=all_mode=screen:shortest=0[bl0c];"), "{f}");
         assert!(f.contains("[bl0a][bl0c]overlay=enable='between(t,0.500,1.500)'[vx0];"), "{f}");
         assert!(!f.contains("[ov0]overlay=eof_action=pass"), "blend path must skip alpha-over: {f}");
+    }
+
+    #[test]
+    fn adjustment_layer_grades_the_composite_only_in_its_window() {
+        let clips = [ClipSpec { path: "a.mp4".into(), in_s: 0.0, out_s: 3.0, ..Default::default() }];
+        let adj = [AdjustSpec { at: 0.5, dur: 1.0, look: "hue=s=0".into(), enabled: true }];
+        let f = build_filter(&clips, &[], &adj, &[], &[], ExportOpts::default());
+        // Split the composite, run the look on one copy, show it only in-window.
+        assert!(f.contains("[vc]split[aj0a][aj0b];"), "{f}");
+        assert!(f.contains("[aj0b]hue=s=0[aj0c];"), "{f}");
+        assert!(f.contains("[aj0a][aj0c]overlay=enable='between(t,0.500,1.500)'[ax0];"), "{f}");
+        // Disabled or empty adjustments emit nothing.
+        let off = [AdjustSpec { at: 0.5, dur: 1.0, look: "hue=s=0".into(), enabled: false }];
+        assert!(!build_filter(&clips, &[], &off, &[], &[], ExportOpts::default()).contains("aj0"));
+        let empty = [AdjustSpec { at: 0.5, dur: 1.0, look: String::new(), enabled: true }];
+        assert!(!build_filter(&clips, &[], &empty, &[], &[], ExportOpts::default()).contains("aj0"));
     }
 
     #[test]
@@ -3359,7 +3453,7 @@ noise
         assert!(clip_audio(0, &ClipSpec { volume: 0.4, ..base.clone() }).contains("volume=0.40"));
 
         // The video side retimes through setpts and the span shrinks to match.
-        let f = build_filter(&[ClipSpec { speed: 2.0, ..base }], &[], &[], &[], ExportOpts::default());
+        let f = build_filter(&[ClipSpec { speed: 2.0, ..base }], &[], &[], &[], &[], ExportOpts::default());
         assert!(f.contains("setpts=(PTS-STARTPTS)/2.0000"), "video not retimed: {f}");
     }
 
@@ -3385,7 +3479,7 @@ noise
             speed: 2.0,
             ..Default::default()
         }];
-        export(&clips, &[], &[], &[], &out, ExportOpts::preview(), |_| {}).await.unwrap();
+        export(&clips, &[], &[], &[], &[], &out, ExportOpts::preview(), |_| {}).await.unwrap();
         let d = capture("ffprobe", &[
             "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
             &out.display().to_string(),
@@ -3523,7 +3617,7 @@ noise
             let out = dir.join(format!("out.{}", format.ext()));
             let opts = ExportOpts { format, quality: Quality::Draft, ..Default::default() }
                 .with_size(540);
-            export(&clips, &[], &[], &[], &out, opts, |_| {})
+            export(&clips, &[], &[], &[], &[], &out, opts, |_| {})
                 .await
                 .unwrap_or_else(|e| panic!("{} export failed: {e}", format.label()));
             assert!(
@@ -3587,17 +3681,18 @@ noise
     #[test]
     fn filter_scales_only_when_the_size_differs() {
         let clips = [ClipSpec { out_s: 1.0, ..Default::default() }];
-        let full = build_filter(&clips, &[], &[], &[], ExportOpts::default());
+        let full = build_filter(&clips, &[], &[], &[], &[], ExportOpts::default());
         assert!(full.contains("[vc]null[vout]"), "full size should not rescale: {full}");
         assert!(full.ends_with("[ac]anull[aout]"));
 
-        let small = build_filter(&clips, &[], &[], &[], ExportOpts::default().with_size(720));
+        let small = build_filter(&clips, &[], &[], &[], &[], ExportOpts::default().with_size(720));
         assert!(small.contains("scale=720:1280"), "{small}");
 
         // GIF drains the mix into a sink and renames the video output, because
         // an unmapped [aout] is a hard filtergraph error.
         let gif = build_filter(
             &clips,
+            &[],
             &[],
             &[],
             &[],
@@ -3666,7 +3761,7 @@ noise
             enabled: false,
             ..Default::default()
         }];
-        let f = build_filter(&clips, &[], &[], &[], ExportOpts::default());
+        let f = build_filter(&clips, &[], &[], &[], &[], ExportOpts::default());
         assert!(
             f.contains("color=c=black") && f.contains("anullsrc"),
             "disabled clip should be black + silence: {f}"
@@ -3868,7 +3963,7 @@ noise
             }];
             let out = dir.join("out.mp4");
             let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
-            export(&clips, &[], &[], &[], &out, opts, |_| {})
+            export(&clips, &[], &[], &[], &[], &out, opts, |_| {})
                 .await
                 .unwrap_or_else(|e| panic!("{xf:?} failed to render: {e}"));
             let dims = capture("ffprobe", &[
@@ -3925,7 +4020,7 @@ noise
         }];
         let out = dir.join("pip.mp4");
         let opts = ExportOpts { quality: Quality::Draft, ..Default::default() };
-        export(&clips, &overlays, &[], &[], &out, opts, |_| {}).await.unwrap();
+        export(&clips, &overlays, &[], &[], &[], &out, opts, |_| {}).await.unwrap();
 
         // Pull the middle frame and check both colours are on screen: the
         // cutaway is inset, so the main track must still be visible around it.
@@ -3961,6 +4056,7 @@ noise
         let f = build_filter(
             &clips,
             &[OverlaySpec { speed: 2.0, ..base }],
+            &[],
             &[],
             &[],
             ExportOpts::default(),
@@ -4004,7 +4100,7 @@ noise
     fn the_filter_graph_only_changes_shape_when_a_transition_exists() {
         let c = |d: f64| ClipSpec { path: "a.mp4".into(), out_s: d, has_audio: true, ..Default::default() };
         // No transitions: the single concat that shipped before, untouched.
-        let plain = build_filter(&[c(2.0), c(3.0)], &[], &[], &[], ExportOpts::default());
+        let plain = build_filter(&[c(2.0), c(3.0)], &[], &[], &[], &[], ExportOpts::default());
         assert!(plain.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vc][ac]"), "{plain}");
         assert!(!plain.contains("xfade"));
 
@@ -4012,6 +4108,7 @@ noise
         // offset is where the incoming clip starts on the finished timeline.
         let faded = build_filter(
             &[c(2.0), ClipSpec { transition: "Cross dissolve".into(), trans_dur: 0.5, ..c(3.0) }],
+            &[],
             &[],
             &[],
             &[],
@@ -4025,6 +4122,7 @@ noise
         // the frame clock or xfade rejects the mismatched timebase.
         let mixed = build_filter(
             &[c(2.0), c(2.0), ClipSpec { transition: "Wipe".into(), trans_dur: 0.5, ..c(2.0) }],
+            &[],
             &[],
             &[],
             &[],
@@ -4064,7 +4162,7 @@ noise
         ];
         let out = dir.join("xf.mp4");
         let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
-        export(&clips, &[], &[], &[], &out, opts, |_| {}).await.unwrap();
+        export(&clips, &[], &[], &[], &[], &out, opts, |_| {}).await.unwrap();
 
         let d: f64 = capture("ffprobe", &[
             "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
@@ -4182,19 +4280,19 @@ noise
         };
 
         // Off: the mix is what it always was, with no sidechain anywhere.
-        let plain = build_filter(&clips, &[], &[], &[bed(0.0)], ExportOpts::default());
+        let plain = build_filter(&clips, &[], &[], &[], &[bed(0.0)], ExportOpts::default());
         assert!(!plain.contains("sidechaincompress") && !plain.contains("asplit"), "{plain}");
         assert!(plain.contains("[ac][au0]amix=inputs=2"), "{plain}");
 
         // On: the main track is split so the compressor has something to key
         // from, and the mix takes the ducked copy rather than the raw bed.
-        let ducked = build_filter(&clips, &[], &[], &[bed(0.8)], ExportOpts::default());
+        let ducked = build_filter(&clips, &[], &[], &[], &[bed(0.8)], ExportOpts::default());
         assert!(ducked.contains("[ac]asplit=2[amain][akey0]"), "{ducked}");
         assert!(ducked.contains("[au0][akey0]sidechaincompress="), "{ducked}");
         assert!(ducked.contains("[amain][au0d]amix=inputs=2"), "{ducked}");
 
         // Two beds, one ducked: the split only serves the one that asked.
-        let mixed = build_filter(&clips, &[], &[], &[bed(0.0), bed(0.5)], ExportOpts::default());
+        let mixed = build_filter(&clips, &[], &[], &[], &[bed(0.0), bed(0.5)], ExportOpts::default());
         assert!(mixed.contains("asplit=2[amain][akey1]"), "{mixed}");
         assert!(mixed.contains("[amain][au0][au1d]amix=inputs=3"), "{mixed}");
 
@@ -4233,7 +4331,7 @@ noise
             duck: 0.0,
             lane: 1,
         };
-        let f = build_filter(&clips, &[], &[], &[bed], ExportOpts::default());
+        let f = build_filter(&clips, &[], &[], &[], &[bed], ExportOpts::default());
         assert!(f.contains("afftdn=nr="), "denoise missing: {f}");
         assert!(f.contains("nf=-25"), "noise floor missing: {f}");
         assert!(!f.contains(":tn=1"), "track_noise off should omit tn: {f}");
@@ -4244,13 +4342,13 @@ noise
             track_noise: true,
             ..AudioSpec::default()
         };
-        let f2 = build_filter(&[], &[], &[], &[bed2], ExportOpts::default());
+        let f2 = build_filter(&[], &[], &[], &[], &[bed2], ExportOpts::default());
         assert!(f2.contains("nf=-55") && f2.contains(":tn=1"), "adaptive floor missing: {f2}");
         // Gate + de-click appear only when their knobs are up, and de-click sits
         // ahead of the denoiser so clicks are repaired before it smears them.
         assert!(!f.contains("agate=") && !f.contains("adeclick="), "fx present at zero: {f}");
         let bed3 = AudioSpec { gate: 0.5, declick: 1.0, denoise: 0.5, ..AudioSpec::default() };
-        let f3 = build_filter(&[], &[], &[], &[bed3], ExportOpts::default());
+        let f3 = build_filter(&[], &[], &[], &[], &[bed3], ExportOpts::default());
         assert!(f3.contains("agate=threshold="), "gate missing: {f3}");
         assert!(f3.contains("adeclick=threshold=1.50"), "declick missing/miscalibrated: {f3}");
         assert!(
@@ -4331,7 +4429,7 @@ noise
         }];
         let out = dir.join("out.mp4");
         let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
-        export(&clips, &[], &[], &audio, &out, opts, |_| {}).await.unwrap();
+        export(&clips, &[], &[], &[], &audio, &out, opts, |_| {}).await.unwrap();
 
         let streams = capture("ffprobe", &[
             "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0",
@@ -4387,7 +4485,7 @@ noise
             let titles = [TitleSpec { png: png.clone(), at: 0.0, dur: 3.0, anim: anim.into(), ..Default::default() }];
             let out = dir.join(format!("{}.mp4", anim.replace(' ', "_")));
             let opts = ExportOpts { quality: Quality::Draft, ..Default::default() }.with_size(540);
-            export(&clips, &[], &titles, &[], &out, opts, |_| {}).await.unwrap();
+            export(&clips, &[], &[], &titles, &[], &out, opts, |_| {}).await.unwrap();
             // Early in the card, where the slide has not yet settled.
             let f = dir.join(format!("{}.png", anim.replace(' ', "_")));
             capture("ffmpeg", &[
@@ -4707,7 +4805,7 @@ noise
         // Draft quality but full size: this test is about the still becoming a
         // real span of portrait video, not about the preview's half-size path.
         let opts = ExportOpts { quality: Quality::Draft, ..Default::default() };
-        export(&clips, &[], &[], &[], &out, opts, |p| last = p).await.unwrap();
+        export(&clips, &[], &[], &[], &[], &out, opts, |p| last = p).await.unwrap();
         assert_eq!(last, 1.0);
 
         let info = capture("ffprobe", &[
@@ -5005,12 +5103,12 @@ noise
         assert!(std::fs::metadata(&boxed).unwrap().len() > 0);
         let titles = [TitleSpec { png, at: 0.0, dur: 1.0, ..Default::default() }];
         let mut last = 0.0;
-        export(&clips, &overlays, &titles, &audio, &out, ExportOpts::default(), |p| last = p).await.unwrap();
+        export(&clips, &overlays, &[], &titles, &audio, &out, ExportOpts::default(), |p| last = p).await.unwrap();
         assert_eq!(last, 1.0);
 
         // fast preview render (playback path) produces a playable file too
         let fast_out = dir.join("preview.mp4");
-        export(&clips, &overlays, &titles, &audio, &fast_out, ExportOpts::preview(), |_| {}).await.unwrap();
+        export(&clips, &overlays, &[], &titles, &audio, &fast_out, ExportOpts::preview(), |_| {}).await.unwrap();
         assert!(std::fs::metadata(&fast_out).unwrap().len() > 0);
 
         // in-app playback audio mix renders with the V1 timeline's duration
