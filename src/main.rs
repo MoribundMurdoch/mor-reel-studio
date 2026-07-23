@@ -4933,6 +4933,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         onclick: move |_| insp_open.set(true),
                         "inspector hidden"
                     }
+                } else if inspector_out() {
+                    span { class: "mor-statusbar-chip", "inspector in its own window" }
                 } else if insp_float() {
                     span { class: "mor-statusbar-chip", "inspector floating" }
                 }
@@ -5472,7 +5474,11 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         }
                     }
 
-                    if insp_open() {
+                    // Hide the docked inspector while it's popped into its own
+                    // window — otherwise the same panel shows in both places.
+                    // (The popped window is a separate Editor with its own
+                    // inspector_out = false, so its solo panel still renders.)
+                    if insp_open() && !(is_main && inspector_out()) {
                     div {
                         class: if !is_main { "mr-inspector mr-inspector-solo" } else if insp_float() { "mr-inspector mr-float-panel" } else { "mr-inspector" },
                         style: {
