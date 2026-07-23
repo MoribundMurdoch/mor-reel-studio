@@ -168,29 +168,47 @@
 }
 .mr-monitor .mr-phone { width: auto; height: 100%; max-width: 100%; min-width: 0; }
 
-.mr-scrub { width: 100%; flex: none; }
-/* Deck: HUD readout — brass inset frame, amber at rest, record-red rolling. */
-.mr-deck {
-  display: flex; justify-content: center; align-items: baseline; gap: 7px;
-  margin-bottom: 4px; padding: 5px 14px 6px;
-  background: linear-gradient(180deg, #12121a, #08080c);
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 35%, var(--mor-border));
-  border-radius: 8px;
+/* Transport console: one chassis under the phone — the VFD timecode window
+   and the transport keys read as a single instrument, not floating parts. */
+.mr-scrub {
+  width: 100%; flex: none; box-sizing: border-box;
+  padding: 8px 10px 10px;
+  background: linear-gradient(180deg,
+    color-mix(in srgb, var(--mor-panel) 90%, white),
+    color-mix(in srgb, var(--mor-panel) 92%, black));
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
+  border-radius: 12px;
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 18%, transparent),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.45),
-    0 0 16px color-mix(in srgb, var(--mor-accent) 12%, transparent);
+    var(--mor-highlight),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.4),
+    0 6px 18px rgba(0, 0, 0, 0.3);
+}
+/* Deck: the console's readout window — a recessed VFD pane with faint
+   scanlines. Violet at rest, record-red while the transport rolls. */
+.mr-deck {
+  position: relative;
+  display: flex; justify-content: center; align-items: baseline; gap: 8px;
+  margin-bottom: 8px; padding: 4px 14px 6px;
+  background: linear-gradient(180deg, #0b0b12, #050508);
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 30%, var(--mor-border));
+  border-radius: 7px;
+  box-shadow:
+    inset 0 2px 6px rgba(0, 0, 0, 0.6),
+    inset 0 -1px 0 color-mix(in srgb, white 4%, transparent);
   font-size: 21px; color: var(--mor-accent); letter-spacing: 0.06em;
+  transition: color 0.25s ease, text-shadow 0.25s ease, border-color 0.25s ease;
   text-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 45%, transparent);
-  transition: color 0.25s ease, text-shadow 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+}
+.mr-deck::after {
+  content: ""; position: absolute; inset: 0; border-radius: 6px;
+  background: repeating-linear-gradient(180deg,
+    transparent 0 2px, rgba(0, 0, 0, 0.16) 2px 3px);
+  pointer-events: none;
 }
 .mr-deck.playing {
   color: var(--mor-destructive);
   border-color: color-mix(in srgb, var(--mor-destructive) 45%, var(--mor-border));
   text-shadow: 0 0 14px color-mix(in srgb, var(--mor-destructive) 50%, transparent);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--mor-destructive) 20%, transparent),
-    0 0 18px color-mix(in srgb, var(--mor-destructive) 18%, transparent);
   animation: mr-deck-pulse 1.4s ease-in-out infinite;
 }
 @keyframes mr-deck-pulse {
@@ -198,7 +216,14 @@
   50% { text-shadow: 0 0 18px color-mix(in srgb, var(--mor-destructive) 65%, transparent); }
 }
 .mr-deck-total { font-size: 12px; color: var(--mor-text-muted); text-shadow: none; letter-spacing: 0.03em; }
-.mr-play-row { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
+/* Transport keys: uniform console keys; Play is the hero and holds its width
+   so the label swap to Pause doesn't shuffle its neighbours. */
+.mr-play-row { display: flex; gap: 8px; justify-content: center; }
+.mr-play-row .mor-btn { padding: 7px 13px; border-radius: 8px; letter-spacing: 0.02em; }
+.mr-play-row .mor-btn.primary { min-width: 118px; }
+.mr-play-row .mor-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--mor-accent) 45%, var(--mor-border));
+}
 
 /* Inspector: framed panel like a classic side window. */
 .mr-inspector {
@@ -509,7 +534,29 @@
     inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 10%, transparent),
     0 6px 22px rgba(0, 0, 0, 0.4);
 }
-.mr-timeline-hint { align-self: center; margin: auto; }
+/* Empty timeline reads as an inviting drop slot, not a bare sentence. */
+.mr-timeline-hint {
+  align-self: center; margin: auto;
+  padding: 16px 26px;
+  border: 1px dashed color-mix(in srgb, var(--mor-accent) 38%, var(--mor-border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--mor-accent) 5%, transparent);
+}
+
+/* Quiet machined scrollbars: both bars are always shown, so they must read as
+   part of the bench, not GTK chrome. */
+.mr-timeline::-webkit-scrollbar { width: 10px; height: 10px; }
+.mr-timeline::-webkit-scrollbar-track { background: transparent; }
+.mr-timeline::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--mor-accent) 30%, var(--mor-border));
+  border-radius: 5px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+.mr-timeline::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--mor-accent) 55%, var(--mor-border));
+  border: 2px solid transparent; background-clip: padding-box;
+}
+.mr-timeline::-webkit-scrollbar-corner { background: transparent; }
 
 /* Phase emphasis on the timeline: dim the lanes the active phase doesn't touch,
    spotlighting the ones it does. V1 is .mr-clips, V2 .mr-lane-v, T .mr-lane-t,
@@ -628,6 +675,21 @@
    window and the phone centers in it. */
 .mr-root-mon .mr-work { justify-content: center; }
 .mr-root-mon .mr-preview-col { flex: 1; width: 100%; max-width: none; }
+/* The monitor window is naturally narrow (9:16), so the max-width:700px media
+   query below would cap its phone at 45vh like a squeezed main window — keep
+   it filling the stage instead. Higher specificity wins over the media rule. */
+.mr-root-mon .mr-phone { height: 100%; }
+/* Main window while the monitor is popped out: the whole preview column
+   (stage + transport) lives in the monitor window, so the work row stops
+   soaking spare height (grow 0, but still shrinkable — a tall docked
+   inspector must scroll, not push the timeline off screen) and the timeline
+   below takes whatever is left. */
+.mr-work.mr-mon-out { flex: 0 1 auto; }
+.mr-work.mr-mon-out ~ .mr-timeline { flex: 1; max-height: none; }
+/* Main window while the inspector is popped out: the rail isn't rendered at
+   all — center the stage in the reclaimed width (the phone is height-bound,
+   so it can't grow; centering is the honest adaptation). */
+.mr-work.mr-insp-out { justify-content: center; }
 /* The phase spine, split into two vertical flanks hugging the phone in the
    stage — reclaims the dead space beside the 9:16 picture and frees the rail
    height the old grid ate. flex:none so it never squeezes the phone. */
@@ -639,6 +701,12 @@
   border-radius: var(--mor-radius);
   box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.2);
 }
+/* Popped-out monitor: the same phase buttons as one row under the transport. */
+.mr-wf-bar {
+  flex-direction: row; flex-wrap: wrap; gap: 4px;
+  width: auto; align-self: stretch; justify-content: center;
+}
+.mr-wf-bar .mr-wf { flex: 1; padding: 5px 2px; }
 .mr-wf {
   position: relative;
   display: flex; flex-direction: column; align-items: center; gap: 3px;
@@ -673,9 +741,16 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Sticky ruler: pinned while the lane stack scrolls vertically, so the time
+   reference (and the playhead badge riding above it) never leaves view. */
 .mr-ruler {
-  position: relative; height: 22px; margin-bottom: 6px;
+  position: sticky; top: 0; z-index: 5;
+  height: 22px; margin-bottom: 6px;
+  background: linear-gradient(180deg,
+    color-mix(in srgb, var(--mor-header) 92%, var(--mor-accent)),
+    color-mix(in srgb, var(--mor-header) 90%, black));
   border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 25%, var(--mor-border-light));
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.22);
   cursor: ew-resize;
 }
 .mr-tick {
@@ -704,6 +779,14 @@
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
 }
 .mr-lane-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
+/* Lane badges stick to the left edge while scrolled right, so a long timeline
+   never loses its track labels. Only for .mr-lane children — the V1 tag lives
+   inside the filmstrip's flex flow and must stay absolute (out of flow) or it
+   would shift every clip off the ruler grid. */
+.mr-lane > .mr-lane-tag {
+  position: sticky; left: 6px; top: auto;
+  display: inline-block; margin: 4px 0 0 4px; z-index: 3;
+}
 /* An eye-toggle tag opts back into clicks (the base tag is inert) and dims when
    its lane is hidden from the monitor. */
 .mr-lane-toggle { pointer-events: auto; cursor: pointer; transition: opacity 0.15s ease, filter 0.15s ease; }
@@ -1034,7 +1117,8 @@
 .mr-marker {
   position: absolute; top: 18px; bottom: 0; width: 1px;
   background: color-mix(in srgb, var(--mor-warning) 70%, transparent);
-  pointer-events: none; z-index: 1;
+  /* Above the sticky ruler — beat markers stay anchored in it while scrolled. */
+  pointer-events: none; z-index: 6;
 }
 .mr-marker::before {
   content: ""; position: absolute; top: -6px; left: -3px;
@@ -1046,7 +1130,7 @@
   position: absolute; top: 0; bottom: 0; width: 2px;
   background: var(--mor-destructive);
   box-shadow: 0 0 8px color-mix(in srgb, var(--mor-destructive) 65%, transparent);
-  pointer-events: none;
+  pointer-events: none; z-index: 7; /* above the sticky ruler */
 }
 /* Diamond cap — a tiny retro-UI gem on the playhead. */
 .mr-playhead::before {
@@ -1240,38 +1324,53 @@
   text-align: center; color: var(--mor-text-muted);
 }
 
-/* Format bar under the phone — the knobs you hit while looking at the words. */
+/* Format bar under the phone — the knobs you hit while looking at the words.
+   Frosted strip in the same console language as the transport chassis. */
 .mr-format-bar {
   display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
-  margin: 6px 0 4px; padding: 6px 8px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 92%, white), var(--mor-panel));
-  border: 1px solid var(--mor-border);
-  border-radius: 8px;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
+  margin: 0; padding: 6px 10px;
+  background: var(--mor-glass);
+  backdrop-filter: blur(var(--mor-glass-blur));
+  -webkit-backdrop-filter: blur(var(--mor-glass-blur));
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 20%, var(--mor-border));
+  border-radius: 10px;
+  box-shadow: var(--mor-highlight), 0 4px 14px rgba(0, 0, 0, 0.25);
 }
 .mr-format-select {
   max-width: 110px; min-width: 72px;
   background: var(--mor-btn); color: var(--mor-text);
-  border: 1px solid var(--mor-border); border-radius: 5px;
+  border: 1px solid var(--mor-border); border-radius: 6px;
   padding: 3px 6px; font-size: 11px;
+  transition: border-color 0.15s ease;
+}
+.mr-format-select:hover, .mr-format-select:focus {
+  border-color: color-mix(in srgb, var(--mor-accent) 50%, var(--mor-border));
+  outline: none;
 }
 .mr-format-step { min-width: 28px; padding: 2px 6px !important; font-size: 12px !important; }
 .mr-format-size {
   min-width: 28px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', monospace;
   color: var(--mor-text-muted);
 }
 .mr-format-sep {
-  width: 1px; align-self: stretch; margin: 2px 3px;
-  background: color-mix(in srgb, var(--mor-border) 80%, transparent);
+  width: 1px; align-self: stretch; margin: 2px 4px;
+  background: linear-gradient(180deg,
+    transparent,
+    color-mix(in srgb, var(--mor-accent) 30%, var(--mor-border)),
+    transparent);
 }
 .mr-format-swatch {
   width: 18px; height: 18px; border-radius: 50%; border: 2px solid transparent;
   padding: 0; cursor: pointer;
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
+.mr-format-swatch:hover { transform: scale(1.2); }
 .mr-format-swatch.active {
   border-color: var(--mor-accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mor-accent) 50%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mor-accent) 50%, transparent),
+    0 0 8px color-mix(in srgb, var(--mor-accent) 40%, transparent);
 }
 .mr-format-pos { font-size: 10px !important; padding: 2px 6px !important; }
 .mr-format-reset { margin-left: auto; font-size: 11px !important; }
@@ -1416,5 +1515,7 @@
   .mr-text-row { transition: none !important; }
   .mr-root .mor-btn:hover:not(:disabled),
   .mr-fx-tile:hover, .mr-add-card:hover:not(:disabled),
+  .mr-format-swatch:hover,
   .mr-text-row:hover { transform: none; }
+  .mr-format-swatch { transition: none !important; }
 }

@@ -4380,6 +4380,99 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         _ => Vec::new(),
     };
 
+    // The workspace phase buttons, one definition rendered in two homes: the
+    // two flanks hugging the phone in the main window, and a horizontal bar
+    // under the popped-out monitor's transport — so switching phases doesn't
+    // require a trip back to the main window.
+    let wf_phases_a = move || rsx! {
+        button {
+            class: if active_phase() == Phase::Add { "mr-wf active" } else { "mr-wf" },
+            title: "Add clips, b-roll or music",
+            onclick: move |_| active_phase.set(Phase::Add),
+            span { class: "mr-wf-icon", "＋" }
+            span { class: "mr-wf-label", "Add" }
+            if !clips.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
+        }
+        button {
+            class: if active_phase() == Phase::Cut { "mr-wf active" } else { "mr-wf" },
+            title: "Trim, split and arrange the current clip",
+            onclick: move |_| {
+                if selected().is_none() {
+                    if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
+                }
+                active_phase.set(Phase::Cut);
+            },
+            span { class: "mr-wf-icon", "✂" }
+            span { class: "mr-wf-label", "Cut" }
+        }
+        button {
+            class: if active_phase() == Phase::Style { "mr-wf active" } else { "mr-wf" },
+            title: "Effects, transform and Ken Burns for the current clip",
+            onclick: move |_| {
+                if selected().is_none() {
+                    if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
+                }
+                active_phase.set(Phase::Style);
+            },
+            span { class: "mr-wf-icon", "✦" }
+            span { class: "mr-wf-label", "Style" }
+            if clips.read().iter().any(|c| c.effect != "None" || c.transform.scale.is_animated()) {
+                span { class: "mr-wf-tick", "✓" }
+            }
+        }
+        button {
+            class: if active_phase() == Phase::Effects { "mr-wf active" } else { "mr-wf" },
+            title: "Chroma key and image/particle effects for the current clip or overlay",
+            onclick: move |_| {
+                if selected().is_none() {
+                    if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
+                }
+                active_phase.set(Phase::Effects);
+            },
+            span { class: "mr-wf-icon", "◧" }
+            span { class: "mr-wf-label", "FX" }
+            if clips.read().iter().any(|c| is_keyer(&c.effect))
+                || overlays.read().iter().any(|o| is_keyer(&o.effect) || !o.blend.is_empty()) {
+                span { class: "mr-wf-tick", "✓" }
+            }
+        }
+    };
+    let wf_phases_b = move || rsx! {
+        button {
+            class: if active_phase() == Phase::Background { "mr-wf active" } else { "mr-wf" },
+            title: "Frame background behind banded or shrunk clips",
+            onclick: move |_| active_phase.set(Phase::Background),
+            span { class: "mr-wf-icon", "▧" }
+            span { class: "mr-wf-label", "Bg" }
+            if clips.read().iter().any(|c| c.transform.bg != engine::Bg::Black) {
+                span { class: "mr-wf-tick", "✓" }
+            }
+        }
+        button {
+            class: if active_phase() == Phase::Text { "mr-wf active" } else { "mr-wf" },
+            title: "Text and captions",
+            onclick: move |_| active_phase.set(Phase::Text),
+            span { class: "mr-wf-icon", "T" }
+            span { class: "mr-wf-label", "Text" }
+            if !titles.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
+        }
+        button {
+            class: if active_phase() == Phase::Audio { "mr-wf active" } else { "mr-wf" },
+            title: "Music and voiceover under the picture",
+            onclick: move |_| active_phase.set(Phase::Audio),
+            span { class: "mr-wf-icon", "♪" }
+            span { class: "mr-wf-label", "Audio" }
+            if !audios.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
+        }
+        button {
+            class: if active_phase() == Phase::Export { "mr-wf active mr-wf-export" } else { "mr-wf mr-wf-export" },
+            title: "Export your reel",
+            onclick: move |_| active_phase.set(Phase::Export),
+            span { class: "mr-wf-icon", "⇪" }
+            span { class: "mr-wf-label", "Export" }
+        }
+    };
+
     rsx! {
         MorAppFrame {
             title: "MorReel Studio".to_string(),
@@ -4453,6 +4546,196 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                 dioxus::desktop::window().close();
                             }
                         },
+                    }
+                }
+                // "Edit" — history, clipboard, delete, grouping: verbs that act
+                // on whatever is selected. Right after File, as everywhere.
+                MorMenuDropdown { label: "Edit".to_string(),
+                    MenuItem {
+                        label: "Undo".to_string(),
+                        shortcut: Some("Ctrl+Z".to_string()),
+                        disabled: undo_stack.read().is_empty(),
+                        on_action: move |_| undo(()),
+                    }
+                    MenuItem {
+                        label: "Redo".to_string(),
+                        shortcut: Some("Ctrl+Shift+Z".to_string()),
+                        disabled: redo_stack.read().is_empty(),
+                        on_action: move |_| redo(()),
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        label: "Copy".to_string(),
+                        shortcut: Some("Ctrl+C".to_string()),
+                        disabled: selected().is_none(),
+                        on_action: move |_| copy_sel(()),
+                    }
+                    MenuItem {
+                        label: "Paste at playhead".to_string(),
+                        shortcut: Some("Ctrl+V".to_string()),
+                        disabled: clipboard().is_none() || exporting,
+                        on_action: move |_| paste_sel(()),
+                    }
+                    MenuItem {
+                        label: "Paste look (transform + grade + effect)".to_string(),
+                        shortcut: Some("Ctrl+Shift+V".to_string()),
+                        disabled: clipboard().is_none()
+                            || !matches!(selected(), Some(Sel::Main(_)) | Some(Sel::Over(_))),
+                        on_action: move |_| paste_attrs(()),
+                    }
+                    MenuItem {
+                        label: "Reset look".to_string(),
+                        shortcut: Some("Ctrl+Shift+X".to_string()),
+                        disabled: !matches!(
+                            selected(),
+                            Some(Sel::Main(_)) | Some(Sel::Over(_)) | Some(Sel::Adjust(_))
+                        ),
+                        on_action: move |_| reset_attrs(()),
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        label: "Ripple delete".to_string(),
+                        shortcut: Some("Delete".to_string()),
+                        disabled: selected().is_none(),
+                        on_action: move |_| delete_sel(()),
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        label: "Group marked items".to_string(),
+                        shortcut: Some("Ctrl+G".to_string()),
+                        disabled: marked().len() < 2,
+                        on_action: move |_| group_marked(()),
+                    }
+                    MenuItem {
+                        label: "Ungroup".to_string(),
+                        shortcut: Some("Ctrl+Shift+G".to_string()),
+                        disabled: selected().map(group_of).unwrap_or(0) == 0,
+                        on_action: move |_| ungroup_sel(()),
+                    }
+                }
+                // "Clip" — per-clip surgery, split out of Edit (FCP/Premiere's
+                // Clip/Modify menu): trim, transitions, audio state, position.
+                MorMenuDropdown { label: "Clip".to_string(),
+                    MenuItem {
+                        label: "Set in point at playhead".to_string(),
+                        shortcut: Some("I".to_string()),
+                        disabled: no_clips,
+                        on_action: move |_| set_in_here(()),
+                    }
+                    MenuItem {
+                        label: "Set out point at playhead".to_string(),
+                        shortcut: Some("O".to_string()),
+                        disabled: no_clips,
+                        on_action: move |_| set_out_here(()),
+                    }
+                    MenuItem {
+                        label: "Split at playhead".to_string(),
+                        shortcut: Some(key_scheme().split().to_string()),
+                        disabled: no_clips,
+                        on_action: move |_| split_at_playhead(()),
+                    }
+                    MenuItem {
+                        label: "Join clips".to_string(),
+                        shortcut: Some("Ctrl+J".to_string()),
+                        disabled: !matches!(selected(), Some(Sel::Main(_))) || exporting,
+                        on_action: move |_| join_clips(()),
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        label: "Add freeze frame".to_string(),
+                        shortcut: Some("F".to_string()),
+                        disabled: no_clips || exporting,
+                        on_action: move |_| add_freeze_frame(()),
+                    }
+                    MenuItem {
+                        label: "Instant replay".to_string(),
+                        shortcut: Some("Ctrl+R".to_string()),
+                        disabled: no_clips || exporting,
+                        on_action: move |_| instant_replay(()),
+                    }
+                    MenuItem {
+                        label: "Add cross dissolve".to_string(),
+                        shortcut: Some("Ctrl+D".to_string()),
+                        disabled: no_clips || exporting,
+                        on_action: move |_| add_cross_dissolve(()),
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        label: "Mute audio".to_string(),
+                        shortcut: Some("Ctrl+Shift+M".to_string()),
+                        disabled: !matches!(
+                            selected(),
+                            Some(Sel::Main(i)) if clips.read().get(i).is_some_and(|c| c.has_audio)
+                        ) && !matches!(selected(), Some(Sel::Aud(_))),
+                        on_action: move |_| mute_sel(()),
+                    }
+                    MenuItem {
+                        label: {
+                            let en = match selected() {
+                                Some(Sel::Main(i)) => clips.read().get(i).map(|c| c.enabled),
+                                Some(Sel::Over(j)) => overlays.read().get(j).map(|o| o.enabled),
+                                Some(Sel::Aud(k)) => audios.read().get(k).map(|a| a.enabled),
+                                Some(Sel::Title(k)) => titles.read().get(k).map(|t| t.enabled),
+                                Some(Sel::Adjust(k)) => adjustments.read().get(k).map(|a| a.enabled),
+                                None => None,
+                            };
+                            if en == Some(false) {
+                                "Enable".to_string()
+                            } else {
+                                "Disable".to_string()
+                            }
+                        },
+                        shortcut: Some("Shift+D".to_string()),
+                        disabled: selected().is_none(),
+                        on_action: move |_| toggle_disable_sel(()),
+                    }
+                    MenuItem {
+                        label: {
+                            let sol = match selected() {
+                                Some(Sel::Main(i)) => clips.read().get(i).map(|c| c.solo),
+                                Some(Sel::Over(j)) => overlays.read().get(j).map(|o| o.solo),
+                                Some(Sel::Aud(k)) => audios.read().get(k).map(|a| a.solo),
+                                _ => None,
+                            };
+                            if sol == Some(true) {
+                                "Unsolo".to_string()
+                            } else {
+                                "Solo".to_string()
+                            }
+                        },
+                        shortcut: Some("Alt+S".to_string()),
+                        disabled: !matches!(
+                            selected(),
+                            Some(Sel::Main(_)) | Some(Sel::Over(_)) | Some(Sel::Aud(_))
+                        ),
+                        on_action: move |_| toggle_solo_sel(()),
+                    }
+                    MenuItem {
+                        label: "Clear all solos".to_string(),
+                        disabled: !(clips.read().iter().any(|c| c.solo)
+                            || overlays.read().iter().any(|o| o.solo)
+                            || audios.read().iter().any(|a| a.solo)),
+                        on_action: move |_| clear_all_solos(()),
+                    }
+                    MenuItem {
+                        label: "Detach audio to A1".to_string(),
+                        shortcut: Some("Ctrl+U".to_string()),
+                        disabled: !matches!(
+                            selected(),
+                            Some(Sel::Main(i)) if clips.read().get(i).is_some_and(|c| c.has_audio)
+                        ),
+                        on_action: move |_| detach_audio(()),
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        label: "Move clip left".to_string(),
+                        disabled: !matches!(selected(), Some(Sel::Main(_))),
+                        on_action: move |_| move_sel(-1),
+                    }
+                    MenuItem {
+                        label: "Move clip right".to_string(),
+                        disabled: !matches!(selected(), Some(Sel::Main(_))),
+                        on_action: move |_| move_sel(1),
                     }
                 }
                 // "Insert" — everything you place on the timeline by hand. Lifted
@@ -4576,189 +4859,6 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         on_action: move |_| show_hub.set(true),
                     }
                 }
-                MorMenuDropdown { label: "Edit".to_string(),
-                    MenuItem {
-                        label: "Undo".to_string(),
-                        shortcut: Some("Ctrl+Z".to_string()),
-                        disabled: undo_stack.read().is_empty(),
-                        on_action: move |_| undo(()),
-                    }
-                    MenuItem {
-                        label: "Redo".to_string(),
-                        shortcut: Some("Ctrl+Shift+Z".to_string()),
-                        disabled: redo_stack.read().is_empty(),
-                        on_action: move |_| redo(()),
-                    }
-                    MenuSeparator {}
-                    MenuItem {
-                        label: "Set in point at playhead".to_string(),
-                        shortcut: Some("I".to_string()),
-                        disabled: no_clips,
-                        on_action: move |_| set_in_here(()),
-                    }
-                    MenuItem {
-                        label: "Set out point at playhead".to_string(),
-                        shortcut: Some("O".to_string()),
-                        disabled: no_clips,
-                        on_action: move |_| set_out_here(()),
-                    }
-                    MenuItem {
-                        label: "Split at playhead".to_string(),
-                        shortcut: Some(key_scheme().split().to_string()),
-                        disabled: no_clips,
-                        on_action: move |_| split_at_playhead(()),
-                    }
-                    MenuItem {
-                        label: "Add freeze frame".to_string(),
-                        shortcut: Some("F".to_string()),
-                        disabled: no_clips || exporting,
-                        on_action: move |_| add_freeze_frame(()),
-                    }
-                    MenuItem {
-                        label: "Instant replay".to_string(),
-                        shortcut: Some("Ctrl+R".to_string()),
-                        disabled: no_clips || exporting,
-                        on_action: move |_| instant_replay(()),
-                    }
-                    MenuItem {
-                        label: "Add cross dissolve".to_string(),
-                        shortcut: Some("Ctrl+D".to_string()),
-                        disabled: no_clips || exporting,
-                        on_action: move |_| add_cross_dissolve(()),
-                    }
-                    MenuItem {
-                        label: "Join clips".to_string(),
-                        shortcut: Some("Ctrl+J".to_string()),
-                        disabled: !matches!(selected(), Some(Sel::Main(_))) || exporting,
-                        on_action: move |_| join_clips(()),
-                    }
-                    MenuItem {
-                        label: "Ripple delete".to_string(),
-                        shortcut: Some("Delete".to_string()),
-                        disabled: selected().is_none(),
-                        on_action: move |_| delete_sel(()),
-                    }
-                    MenuSeparator {}
-                    MenuItem {
-                        label: "Copy".to_string(),
-                        shortcut: Some("Ctrl+C".to_string()),
-                        disabled: selected().is_none(),
-                        on_action: move |_| copy_sel(()),
-                    }
-                    MenuItem {
-                        label: "Paste at playhead".to_string(),
-                        shortcut: Some("Ctrl+V".to_string()),
-                        disabled: clipboard().is_none() || exporting,
-                        on_action: move |_| paste_sel(()),
-                    }
-                    MenuItem {
-                        label: "Paste look (transform + grade + effect)".to_string(),
-                        shortcut: Some("Ctrl+Shift+V".to_string()),
-                        disabled: clipboard().is_none()
-                            || !matches!(selected(), Some(Sel::Main(_)) | Some(Sel::Over(_))),
-                        on_action: move |_| paste_attrs(()),
-                    }
-                    MenuItem {
-                        label: "Reset look".to_string(),
-                        shortcut: Some("Ctrl+Shift+X".to_string()),
-                        disabled: !matches!(
-                            selected(),
-                            Some(Sel::Main(_)) | Some(Sel::Over(_)) | Some(Sel::Adjust(_))
-                        ),
-                        on_action: move |_| reset_attrs(()),
-                    }
-                    MenuSeparator {}
-                    MenuItem {
-                        label: "Mute audio".to_string(),
-                        shortcut: Some("Ctrl+Shift+M".to_string()),
-                        disabled: !matches!(
-                            selected(),
-                            Some(Sel::Main(i)) if clips.read().get(i).is_some_and(|c| c.has_audio)
-                        ) && !matches!(selected(), Some(Sel::Aud(_))),
-                        on_action: move |_| mute_sel(()),
-                    }
-                    MenuItem {
-                        label: {
-                            let en = match selected() {
-                                Some(Sel::Main(i)) => clips.read().get(i).map(|c| c.enabled),
-                                Some(Sel::Over(j)) => overlays.read().get(j).map(|o| o.enabled),
-                                Some(Sel::Aud(k)) => audios.read().get(k).map(|a| a.enabled),
-                                Some(Sel::Title(k)) => titles.read().get(k).map(|t| t.enabled),
-                                Some(Sel::Adjust(k)) => adjustments.read().get(k).map(|a| a.enabled),
-                                None => None,
-                            };
-                            if en == Some(false) {
-                                "Enable".to_string()
-                            } else {
-                                "Disable".to_string()
-                            }
-                        },
-                        shortcut: Some("Shift+D".to_string()),
-                        disabled: selected().is_none(),
-                        on_action: move |_| toggle_disable_sel(()),
-                    }
-                    MenuItem {
-                        label: {
-                            let sol = match selected() {
-                                Some(Sel::Main(i)) => clips.read().get(i).map(|c| c.solo),
-                                Some(Sel::Over(j)) => overlays.read().get(j).map(|o| o.solo),
-                                Some(Sel::Aud(k)) => audios.read().get(k).map(|a| a.solo),
-                                _ => None,
-                            };
-                            if sol == Some(true) {
-                                "Unsolo".to_string()
-                            } else {
-                                "Solo".to_string()
-                            }
-                        },
-                        shortcut: Some("Alt+S".to_string()),
-                        disabled: !matches!(
-                            selected(),
-                            Some(Sel::Main(_)) | Some(Sel::Over(_)) | Some(Sel::Aud(_))
-                        ),
-                        on_action: move |_| toggle_solo_sel(()),
-                    }
-                    MenuItem {
-                        label: "Clear all solos".to_string(),
-                        disabled: !(clips.read().iter().any(|c| c.solo)
-                            || overlays.read().iter().any(|o| o.solo)
-                            || audios.read().iter().any(|a| a.solo)),
-                        on_action: move |_| clear_all_solos(()),
-                    }
-                    MenuItem {
-                        label: "Detach audio to A1".to_string(),
-                        shortcut: Some("Ctrl+U".to_string()),
-                        disabled: !matches!(
-                            selected(),
-                            Some(Sel::Main(i)) if clips.read().get(i).is_some_and(|c| c.has_audio)
-                        ),
-                        on_action: move |_| detach_audio(()),
-                    }
-                    MenuSeparator {}
-                    MenuItem {
-                        label: "Move clip left".to_string(),
-                        disabled: !matches!(selected(), Some(Sel::Main(_))),
-                        on_action: move |_| move_sel(-1),
-                    }
-                    MenuItem {
-                        label: "Move clip right".to_string(),
-                        disabled: !matches!(selected(), Some(Sel::Main(_))),
-                        on_action: move |_| move_sel(1),
-                    }
-                    MenuSeparator {}
-                    MenuItem {
-                        label: "Group marked items".to_string(),
-                        shortcut: Some("Ctrl+G".to_string()),
-                        disabled: marked().len() < 2,
-                        on_action: move |_| group_marked(()),
-                    }
-                    MenuItem {
-                        label: "Ungroup".to_string(),
-                        shortcut: Some("Ctrl+Shift+G".to_string()),
-                        disabled: selected().map(group_of).unwrap_or(0) == 0,
-                        on_action: move |_| ungroup_sel(()),
-                    }
-                }
                 MorMenuDropdown { label: "Playback".to_string(),
                     MenuItem {
                         label: if playing() { "Pause".to_string() } else { "Play".to_string() },
@@ -4777,17 +4877,6 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         shortcut: Some("Ctrl+L".to_string()),
                         disabled: no_clips,
                         on_action: move |_| toggle_loop(()),
-                    }
-                    MenuSeparator {}
-                    MenuItem {
-                        label: if vo_session().is_some() {
-                            "● Stop voiceover".to_string()
-                        } else {
-                            "Record voiceover…".to_string()
-                        },
-                        shortcut: Some("V".to_string()),
-                        disabled: exporting,
-                        on_action: move |_| toggle_voiceover(()),
                     }
                     MenuSeparator {}
                     MenuItem {
@@ -5016,68 +5105,27 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     float_xy.set(Some((x, y)));
                     float_size.set(Some((w, h)));
                 },
-                div { class: "mr-work",
-                    if is_main || is_monitor {
+                div {
+                    class: "mr-work",
+                    // Reflect pop-out state so CSS can reclaim the vacated space:
+                    // monitor out → the preview column shrinks to the transport;
+                    // inspector out → the rail is gone and the stage centers.
+                    class: if is_main && monitor_out() { "mr-mon-out" },
+                    class: if is_main && inspector_out() { "mr-insp-out" },
+                    // The whole preview column — stage, format bar AND transport —
+                    // travels with the monitor: while it's popped into its own
+                    // window (which renders all of this itself), the main window
+                    // shows none of it, not a leftover transport console.
+                    if is_monitor || (is_main && !monitor_out()) {
                     div { class: "mr-preview-col",
-                        if is_monitor || !monitor_out() {
-                            div { class: "mr-stage",
+                        div { class: "mr-stage",
                             // Phase spine, split into two flanks that hug the phone —
                             // reclaims the dead space beside the 9:16 picture and
                             // frees the rail height the old 4×2 grid ate. Main view
                             // only; the popped-out monitor is stage-only.
                             if is_main {
                             div { class: "mr-wf-flank",
-                                button {
-                                    class: if active_phase() == Phase::Add { "mr-wf active" } else { "mr-wf" },
-                                    title: "Add clips, b-roll or music",
-                                    onclick: move |_| active_phase.set(Phase::Add),
-                                    span { class: "mr-wf-icon", "＋" }
-                                    span { class: "mr-wf-label", "Add" }
-                                    if !clips.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
-                                }
-                                button {
-                                    class: if active_phase() == Phase::Cut { "mr-wf active" } else { "mr-wf" },
-                                    title: "Trim, split and arrange the current clip",
-                                    onclick: move |_| {
-                                        if selected().is_none() {
-                                            if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
-                                        }
-                                        active_phase.set(Phase::Cut);
-                                    },
-                                    span { class: "mr-wf-icon", "✂" }
-                                    span { class: "mr-wf-label", "Cut" }
-                                }
-                                button {
-                                    class: if active_phase() == Phase::Style { "mr-wf active" } else { "mr-wf" },
-                                    title: "Effects, transform and Ken Burns for the current clip",
-                                    onclick: move |_| {
-                                        if selected().is_none() {
-                                            if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
-                                        }
-                                        active_phase.set(Phase::Style);
-                                    },
-                                    span { class: "mr-wf-icon", "✦" }
-                                    span { class: "mr-wf-label", "Style" }
-                                    if clips.read().iter().any(|c| c.effect != "None" || c.transform.scale.is_animated()) {
-                                        span { class: "mr-wf-tick", "✓" }
-                                    }
-                                }
-                                button {
-                                    class: if active_phase() == Phase::Effects { "mr-wf active" } else { "mr-wf" },
-                                    title: "Chroma key and image/particle effects for the current clip or overlay",
-                                    onclick: move |_| {
-                                        if selected().is_none() {
-                                            if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
-                                        }
-                                        active_phase.set(Phase::Effects);
-                                    },
-                                    span { class: "mr-wf-icon", "◧" }
-                                    span { class: "mr-wf-label", "FX" }
-                                    if clips.read().iter().any(|c| is_keyer(&c.effect))
-                                        || overlays.read().iter().any(|o| is_keyer(&o.effect) || !o.blend.is_empty()) {
-                                        span { class: "mr-wf-tick", "✓" }
-                                    }
-                                }
+                                {wf_phases_a()}
                             }
                             }
                             div {
@@ -5254,43 +5302,10 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                             }
                             if is_main {
                             div { class: "mr-wf-flank",
-                                button {
-                                    class: if active_phase() == Phase::Background { "mr-wf active" } else { "mr-wf" },
-                                    title: "Frame background behind banded or shrunk clips",
-                                    onclick: move |_| active_phase.set(Phase::Background),
-                                    span { class: "mr-wf-icon", "▧" }
-                                    span { class: "mr-wf-label", "Bg" }
-                                    if clips.read().iter().any(|c| c.transform.bg != engine::Bg::Black) {
-                                        span { class: "mr-wf-tick", "✓" }
-                                    }
-                                }
-                                button {
-                                    class: if active_phase() == Phase::Text { "mr-wf active" } else { "mr-wf" },
-                                    title: "Text and captions",
-                                    onclick: move |_| active_phase.set(Phase::Text),
-                                    span { class: "mr-wf-icon", "T" }
-                                    span { class: "mr-wf-label", "Text" }
-                                    if !titles.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
-                                }
-                                button {
-                                    class: if active_phase() == Phase::Audio { "mr-wf active" } else { "mr-wf" },
-                                    title: "Music and voiceover under the picture",
-                                    onclick: move |_| active_phase.set(Phase::Audio),
-                                    span { class: "mr-wf-icon", "♪" }
-                                    span { class: "mr-wf-label", "Audio" }
-                                    if !audios.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
-                                }
-                                button {
-                                    class: if active_phase() == Phase::Export { "mr-wf active mr-wf-export" } else { "mr-wf mr-wf-export" },
-                                    title: "Export your reel",
-                                    onclick: move |_| active_phase.set(Phase::Export),
-                                    span { class: "mr-wf-icon", "⇪" }
-                                    span { class: "mr-wf-label", "Export" }
-                                }
+                                {wf_phases_b()}
                             }
                             }
                             }
-                        }
                         if !clips.read().is_empty() {
                             // iMovie-style format bar: the knobs you reach for while
                             // looking at the words on the picture, not buried under
@@ -5463,6 +5478,15 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     }
                                 }
                             }
+                            // The popped-out monitor keeps the workspace phase
+                            // buttons as a bar under the transport — same buttons
+                            // as the main window's flanks, laid out in a row.
+                            if is_monitor {
+                                div { class: "mr-wf-flank mr-wf-bar",
+                                    {wf_phases_a()}
+                                    {wf_phases_b()}
+                                }
+                            }
                         }
                     }
                     } // if is_main (monitor column)
@@ -5470,8 +5494,12 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     // Right rail: the phase spine sits atop the inspector, so the
                     // full-width bottom bar is gone and the monitor/timeline get
                     // that height back. The inspector still floats/closes below it.
-                    // Hidden in the popped-out monitor window (stage only).
-                    if !is_monitor {
+                    // Hidden in the popped-out monitor window (stage only), and in
+                    // the main window while the inspector lives in its own window —
+                    // an empty rail would just hold a dead flex:1 column.
+                    // (The popped window is a separate Editor with its own
+                    // inspector_out = false, so its solo panel still renders.)
+                    if !is_monitor && !(is_main && inspector_out()) {
                     div { class: "mr-rail",
                     if is_main && !insp_open() {
                         button {
@@ -5482,11 +5510,9 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         }
                     }
 
-                    // Hide the docked inspector while it's popped into its own
-                    // window — otherwise the same panel shows in both places.
-                    // (The popped window is a separate Editor with its own
-                    // inspector_out = false, so its solo panel still renders.)
-                    if insp_open() && !(is_main && inspector_out()) {
+                    // The popped-out case never gets here — the whole rail is
+                    // hidden above while the inspector has its own window.
+                    if insp_open() {
                     div {
                         class: if !is_main { "mr-inspector mr-inspector-solo" } else if insp_float() { "mr-inspector mr-float-panel" } else { "mr-inspector" },
                         style: {
