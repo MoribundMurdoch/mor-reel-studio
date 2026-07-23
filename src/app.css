@@ -27,11 +27,11 @@
     var(--mor-bg);
 }
 .mr-work { display: flex; gap: 16px; flex: 1; min-height: 0; }
-.mr-preview-col { display: flex; flex-direction: column; gap: 10px; align-items: center; min-height: 0; padding-top: 4px; flex: 0 0 auto; width: clamp(180px, 34vw, 560px); }
+.mr-preview-col { display: flex; flex-direction: column; gap: 10px; align-items: center; min-height: 0; padding-top: 4px; flex: 0 0 auto; width: clamp(280px, 40vw, 700px); }
 /* The phone fills whatever height is left after the scrub controls; a definite
    column width keeps the height-driven phone from overflowing (the old WebKit
    intrinsic-width bug). 9:16 is tall, so height is the binding constraint. */
-.mr-stage { flex: 1; min-height: 0; width: 100%; display: flex; align-items: center; justify-content: center; }
+.mr-stage { flex: 1; min-height: 0; width: 100%; display: flex; align-items: center; justify-content: center; gap: 10px; }
 
 /* Buttons inside the editor: longer ease, slight lift, brass-rim primary. */
 .mr-root .mor-btn {
@@ -606,11 +606,12 @@
    window and the phone centers in it. */
 .mr-root-mon .mr-work { justify-content: center; }
 .mr-root-mon .mr-preview-col { flex: 1; width: 100%; max-width: none; }
-/* The phase spine, now a compact 4×2 grid so all eight fit the narrow column
-   instead of a full-width row. flex:none keeps it from eating inspector height. */
-.mr-workflow {
-  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px;
-  flex: none; padding: 6px;
+/* The phase spine, split into two vertical flanks hugging the phone in the
+   stage — reclaims the dead space beside the 9:16 picture and frees the rail
+   height the old grid ate. flex:none so it never squeezes the phone. */
+.mr-wf-flank {
+  display: flex; flex-direction: column; gap: 6px;
+  flex: none; align-self: center; width: 60px; padding: 6px;
   background: rgba(127, 127, 127, 0.05);
   border: 1px solid var(--mor-border);
   border-radius: var(--mor-radius);

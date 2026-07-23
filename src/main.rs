@@ -5021,6 +5021,65 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     div { class: "mr-preview-col",
                         if is_monitor || !monitor_out() {
                             div { class: "mr-stage",
+                            // Phase spine, split into two flanks that hug the phone —
+                            // reclaims the dead space beside the 9:16 picture and
+                            // frees the rail height the old 4×2 grid ate. Main view
+                            // only; the popped-out monitor is stage-only.
+                            if is_main {
+                            div { class: "mr-wf-flank",
+                                button {
+                                    class: if active_phase() == Phase::Add { "mr-wf active" } else { "mr-wf" },
+                                    title: "Add clips, b-roll or music",
+                                    onclick: move |_| active_phase.set(Phase::Add),
+                                    span { class: "mr-wf-icon", "＋" }
+                                    span { class: "mr-wf-label", "Add" }
+                                    if !clips.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
+                                }
+                                button {
+                                    class: if active_phase() == Phase::Cut { "mr-wf active" } else { "mr-wf" },
+                                    title: "Trim, split and arrange the current clip",
+                                    onclick: move |_| {
+                                        if selected().is_none() {
+                                            if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
+                                        }
+                                        active_phase.set(Phase::Cut);
+                                    },
+                                    span { class: "mr-wf-icon", "✂" }
+                                    span { class: "mr-wf-label", "Cut" }
+                                }
+                                button {
+                                    class: if active_phase() == Phase::Style { "mr-wf active" } else { "mr-wf" },
+                                    title: "Effects, transform and Ken Burns for the current clip",
+                                    onclick: move |_| {
+                                        if selected().is_none() {
+                                            if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
+                                        }
+                                        active_phase.set(Phase::Style);
+                                    },
+                                    span { class: "mr-wf-icon", "✦" }
+                                    span { class: "mr-wf-label", "Style" }
+                                    if clips.read().iter().any(|c| c.effect != "None" || c.transform.scale.is_animated()) {
+                                        span { class: "mr-wf-tick", "✓" }
+                                    }
+                                }
+                                button {
+                                    class: if active_phase() == Phase::Effects { "mr-wf active" } else { "mr-wf" },
+                                    title: "Chroma key and image/particle effects for the current clip or overlay",
+                                    onclick: move |_| {
+                                        if selected().is_none() {
+                                            if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
+                                        }
+                                        active_phase.set(Phase::Effects);
+                                    },
+                                    span { class: "mr-wf-icon", "◧" }
+                                    span { class: "mr-wf-label", "FX" }
+                                    if clips.read().iter().any(|c| is_keyer(&c.effect))
+                                        || overlays.read().iter().any(|o| is_keyer(&o.effect) || !o.blend.is_empty()) {
+                                        span { class: "mr-wf-tick", "✓" }
+                                    }
+                                }
+                            }
+                            }
                             div {
                                 class: if matches!(drop_hover(), Some(Lane::V(_))) { "mr-phone mr-drop" } else { "mr-phone" },
                                 onmounted: move |evt| phone_el.set(Some(evt.data())),
@@ -5192,6 +5251,43 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                         }
                                     }
                                 }
+                            }
+                            if is_main {
+                            div { class: "mr-wf-flank",
+                                button {
+                                    class: if active_phase() == Phase::Background { "mr-wf active" } else { "mr-wf" },
+                                    title: "Frame background behind banded or shrunk clips",
+                                    onclick: move |_| active_phase.set(Phase::Background),
+                                    span { class: "mr-wf-icon", "▧" }
+                                    span { class: "mr-wf-label", "Bg" }
+                                    if clips.read().iter().any(|c| c.transform.bg != engine::Bg::Black) {
+                                        span { class: "mr-wf-tick", "✓" }
+                                    }
+                                }
+                                button {
+                                    class: if active_phase() == Phase::Text { "mr-wf active" } else { "mr-wf" },
+                                    title: "Text and captions",
+                                    onclick: move |_| active_phase.set(Phase::Text),
+                                    span { class: "mr-wf-icon", "T" }
+                                    span { class: "mr-wf-label", "Text" }
+                                    if !titles.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
+                                }
+                                button {
+                                    class: if active_phase() == Phase::Audio { "mr-wf active" } else { "mr-wf" },
+                                    title: "Music and voiceover under the picture",
+                                    onclick: move |_| active_phase.set(Phase::Audio),
+                                    span { class: "mr-wf-icon", "♪" }
+                                    span { class: "mr-wf-label", "Audio" }
+                                    if !audios.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
+                                }
+                                button {
+                                    class: if active_phase() == Phase::Export { "mr-wf active mr-wf-export" } else { "mr-wf mr-wf-export" },
+                                    title: "Export your reel",
+                                    onclick: move |_| active_phase.set(Phase::Export),
+                                    span { class: "mr-wf-icon", "⇪" }
+                                    span { class: "mr-wf-label", "Export" }
+                                }
+                            }
                             }
                             }
                         }
@@ -5377,94 +5473,6 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     // Hidden in the popped-out monitor window (stage only).
                     if !is_monitor {
                     div { class: "mr-rail",
-                    if is_main {
-                    div { class: "mr-workflow",
-                        button {
-                            class: if active_phase() == Phase::Add { "mr-wf active" } else { "mr-wf" },
-                            title: "Add clips, b-roll or music",
-                            onclick: move |_| active_phase.set(Phase::Add),
-                            span { class: "mr-wf-icon", "＋" }
-                            span { class: "mr-wf-label", "Add" }
-                            if !clips.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
-                        }
-                        button {
-                            class: if active_phase() == Phase::Cut { "mr-wf active" } else { "mr-wf" },
-                            title: "Trim, split and arrange the current clip",
-                            onclick: move |_| {
-                                if selected().is_none() {
-                                    if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
-                                }
-                                active_phase.set(Phase::Cut);
-                            },
-                            span { class: "mr-wf-icon", "✂" }
-                            span { class: "mr-wf-label", "Cut" }
-                        }
-                        button {
-                            class: if active_phase() == Phase::Style { "mr-wf active" } else { "mr-wf" },
-                            title: "Effects, transform and Ken Burns for the current clip",
-                            onclick: move |_| {
-                                if selected().is_none() {
-                                    if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
-                                }
-                                active_phase.set(Phase::Style);
-                            },
-                            span { class: "mr-wf-icon", "✦" }
-                            span { class: "mr-wf-label", "Style" }
-                            if clips.read().iter().any(|c| c.effect != "None" || c.transform.scale.is_animated()) {
-                                span { class: "mr-wf-tick", "✓" }
-                            }
-                        }
-                        button {
-                            class: if active_phase() == Phase::Effects { "mr-wf active" } else { "mr-wf" },
-                            title: "Chroma key and image/particle effects for the current clip or overlay",
-                            onclick: move |_| {
-                                if selected().is_none() {
-                                    if let Some((i, _)) = locate(&clips.read(), playhead()) { selected.set(Some(Sel::Main(i))); }
-                                }
-                                active_phase.set(Phase::Effects);
-                            },
-                            span { class: "mr-wf-icon", "◧" }
-                            span { class: "mr-wf-label", "FX" }
-                            if clips.read().iter().any(|c| is_keyer(&c.effect))
-                                || overlays.read().iter().any(|o| is_keyer(&o.effect) || !o.blend.is_empty()) {
-                                span { class: "mr-wf-tick", "✓" }
-                            }
-                        }
-                        button {
-                            class: if active_phase() == Phase::Background { "mr-wf active" } else { "mr-wf" },
-                            title: "Frame background behind banded or shrunk clips",
-                            onclick: move |_| active_phase.set(Phase::Background),
-                            span { class: "mr-wf-icon", "▧" }
-                            span { class: "mr-wf-label", "Bg" }
-                            if clips.read().iter().any(|c| c.transform.bg != engine::Bg::Black) {
-                                span { class: "mr-wf-tick", "✓" }
-                            }
-                        }
-                        button {
-                            class: if active_phase() == Phase::Text { "mr-wf active" } else { "mr-wf" },
-                            title: "Text and captions",
-                            onclick: move |_| active_phase.set(Phase::Text),
-                            span { class: "mr-wf-icon", "T" }
-                            span { class: "mr-wf-label", "Text" }
-                            if !titles.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
-                        }
-                        button {
-                            class: if active_phase() == Phase::Audio { "mr-wf active" } else { "mr-wf" },
-                            title: "Music and voiceover under the picture",
-                            onclick: move |_| active_phase.set(Phase::Audio),
-                            span { class: "mr-wf-icon", "♪" }
-                            span { class: "mr-wf-label", "Audio" }
-                            if !audios.read().is_empty() { span { class: "mr-wf-tick", "✓" } }
-                        }
-                        button {
-                            class: if active_phase() == Phase::Export { "mr-wf active mr-wf-export" } else { "mr-wf mr-wf-export" },
-                            title: "Export your reel",
-                            onclick: move |_| active_phase.set(Phase::Export),
-                            span { class: "mr-wf-icon", "⇪" }
-                            span { class: "mr-wf-label", "Export" }
-                        }
-                    }
-                    }
                     if is_main && !insp_open() {
                         button {
                             class: "mr-insp-reopen",
