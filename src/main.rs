@@ -5913,6 +5913,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     }
                                     }
                                     if c.has_audio {
+                                        h4 { class: "mr-fx-cat", "Audio" }
                                         Slider {
                                             label: Some("Clip volume"),
                                             min: 0.0,
@@ -6067,6 +6068,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     }
                                     }
                                     if active_phase() == Phase::Cut {
+                                    h4 { class: "mr-fx-cat", "Arrange" }
                                     div { class: "mr-toolbar",
                                         button { class: "mor-btn", onclick: move |_| move_sel(-1), "◀ Move left" }
                                         button { class: "mor-btn", onclick: move |_| move_sel(1), "Move right ▶" }

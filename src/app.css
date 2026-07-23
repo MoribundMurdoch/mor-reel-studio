@@ -575,6 +575,28 @@
 }
 /* Style sub-tabs sit above the panel's controls with a little room. */
 .mr-inspector .mor-tabs { margin: 4px 0 12px; }
+/* Compact parameter rows (AE/Blender style): label | track | value on one
+   line instead of a stacked header — roughly doubles the panel's density.
+   Scoped to the inspector so the shared kit and dialogs keep their layout. */
+.mr-inspector .mor-slider-shell {
+  display: grid;
+  grid-template-columns: minmax(90px, 34%) 1fr auto;
+  align-items: center; column-gap: 10px;
+}
+.mr-inspector .mor-slider-header { display: contents; }
+.mr-inspector .mor-slider-label {
+  grid-column: 1; grid-row: 1;
+  font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mr-inspector .mor-slider-input { grid-column: 2; grid-row: 1; margin: 0; }
+.mr-inspector .mor-slider-value { grid-column: 3; grid-row: 1; font-size: 11px; }
+/* Section headers read as dividers so the scroll chunks into groups. */
+.mr-inspector .mr-fx-cat { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.mr-inspector .mr-fx-cat::after {
+  content: ""; flex: 1; height: 1px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--mor-accent) 30%, var(--mor-border)), transparent);
+}
 /* Band presets + background swatches. */
 .mr-preset-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 12px; }
 .mr-preset-row .mor-btn { flex: 1; min-width: 68px; }
@@ -1309,7 +1331,7 @@
 .mr-xf-row { display: flex; align-items: center; gap: 6px; }
 .mr-xf-row .mor-slider-shell { flex: 1; min-width: 0; }
 .mr-kf-diamond {
-  flex: 0 0 auto; margin-top: 14px; width: 20px; height: 20px; padding: 0;
+  flex: 0 0 auto; width: 20px; height: 20px; padding: 0;
   border: none; background: none; cursor: pointer; line-height: 1;
   font-size: 13px; color: var(--mor-text-muted);
   transition: color 0.15s ease, transform 0.15s ease, text-shadow 0.18s ease;
@@ -1321,7 +1343,7 @@
 }
 /* Velocity chip — only shown when a key sits at the playhead. */
 .mr-kf-ease {
-  flex: 0 0 auto; margin-top: 14px; padding: 1px 5px; height: 18px;
+  flex: 0 0 auto; padding: 1px 5px; height: 18px;
   border: 1px solid color-mix(in srgb, var(--mor-accent) 45%, transparent);
   border-radius: 4px; background: none; cursor: pointer; line-height: 1;
   font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
