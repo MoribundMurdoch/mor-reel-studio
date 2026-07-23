@@ -1512,8 +1512,9 @@ impl std::hash::Hash for TitleStyle {
 pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
     use std::hash::{Hash, Hasher};
     // Bump when the rendering changes, so cards cached by an older build are
-    // re-rendered instead of served stale. v5: adds shapes.
-    const CACHE_VER: u32 = 5;
+    // re-rendered instead of served stale. v5: adds shapes. v6: supersampled
+    // emboss + soft cast shadow + specular sheen.
+    const CACHE_VER: u32 = 6;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     CACHE_VER.hash(&mut h);
     s.hash(&mut h);
@@ -1540,7 +1541,8 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
             return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
         }
         // Falls through to the bevel below, so a shape can be embossed too.
-        return finish_title(&png, s);
+        // Shapes are straight-edged, so they don't need the text supersample.
+        return finish_title(&png, s, 1);
     }
 
     // textfile= sidesteps drawtext's escaping rules entirely.
@@ -1551,24 +1553,29 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
     std::fs::write(&txt, s.text.replace("\\n", "\n")).map_err(|e| e.to_string())?;
     // Anything that already carries legibility — a backdrop box, an outline,
     // the bevel's own relief — makes the drop shadow redundant.
+    // Supersample beveled text so the emboss antialiases: draw at 2x, emboss at
+    // 2x, then downscale in finish_title. Thin strokes then survive the medial-
+    // axis relief instead of breaking into striations.
+    let ss: u32 = if s.bevel != "Off" { 2 } else { 1 };
+    let (cw, ch) = (W * ss, H * ss);
+    let fs = s.font_size * ss;
     let plain = s.bevel == "Off" && !s.boxed && s.outline <= 0.0;
     let shadow = if plain { ":shadowcolor=black@0.5:shadowx=3:shadowy=3" } else { "" };
     let boxp = if s.boxed {
-        format!(":box=1:boxcolor=black@{:.3}:boxborderw=18", s.box_opacity.clamp(0.0, 1.0))
+        format!(":box=1:boxcolor=black@{:.3}:boxborderw={}", s.box_opacity.clamp(0.0, 1.0), 18 * ss)
     } else {
         String::new()
     };
     let border = if s.outline > 0.0 {
-        format!(":borderw={:.0}:bordercolor={}", s.outline, s.outline_color)
+        format!(":borderw={:.0}:bordercolor={}", s.outline * ss as f64, s.outline_color)
     } else {
         String::new()
     };
     let fontp = if s.font.is_empty() { String::new() } else { format!(":font='{}'", s.font) };
     let vf = format!(
-        "drawtext=textfile={}{fontp}:fontsize={}:fontcolor={}:text_align={}\
+        "drawtext=textfile={}{fontp}:fontsize={fs}:fontcolor={}:text_align={}\
          :x=(w-text_w)/2:y=(h-text_h)*{:.3}{shadow}{boxp}{border}",
         txt.display(),
-        s.font_size,
         s.color,
         align_flag(&s.align),
         s.y_frac
@@ -1579,7 +1586,7 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
         // is thrown away, and a later format=rgba refills alpha at 255 — which
         // turns every title card into a black rectangle over the whole frame.
         .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
-        .arg(format!("color=c=black@0.0:s={W}x{H},format=rgba"))
+        .arg(format!("color=c=black@0.0:s={cw}x{ch},format=rgba"))
         .args(["-vf", &vf, "-frames:v", "1", "-pix_fmt", "rgba"])
         .arg(&png)
         .stdin(Stdio::null())
@@ -1591,37 +1598,43 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
 
-    finish_title(&png, s)
+    finish_title(&png, s, ss)
 }
 
 /// Bake the bevel, if any, into a rasterized card. Shared by text and shapes —
 /// an embossed box is as reasonable as embossed type.
-fn finish_title(png: &std::path::Path, s: &TitleStyle) -> Result<String, String> {
-    if s.bevel != "Off" {
-        let img = image::open(png).map_err(|e| e.to_string())?;
-        let mut rgba = img.to_rgba8();
-        let (w, h_px) = rgba.dimensions();
-        let result = crate::bevel::compute_bevel(
-            rgba.as_raw(),
-            w,
-            h_px,
-            &crate::bevel::BevelParams {
-                size: s.bevel_size.max(1.0) as u32,
-                soften: s.soften.max(0.0) as u32,
-                angle: s.angle as f32,
-                altitude: s.altitude as f32,
-                depth: s.depth.max(1.0) as u32,
-                hi_opacity: s.hi_opacity as f32,
-                sh_opacity: s.sh_opacity as f32,
-                cameo: s.bevel == "Cameo",
-            },
-        );
-        // Shadow first (multiply the black buffer), highlight second (screen the
-        // white one) — the layer order the designer app composites in, so the
-        // highlight is never dimmed by a shadow pass applied after it.
-        // Alpha is untouched: the bevel shades the glyphs, it never grows them.
+fn finish_title(png: &std::path::Path, s: &TitleStyle, ss: u32) -> Result<String, String> {
+    if s.bevel == "Off" {
+        return Ok(png.display().to_string());
+    }
+    let img = image::open(png).map_err(|e| e.to_string())?;
+    let mut rgba = img.to_rgba8();
+    let (w, h_px) = rgba.dimensions();
+    let n = (w * h_px) as usize;
+    // Emboss at the supersampled scale: rim and softening thicken with `ss` so the
+    // downscaled result keeps the thickness the user dialed in.
+    let result = crate::bevel::compute_bevel(
+        rgba.as_raw(),
+        w,
+        h_px,
+        &crate::bevel::BevelParams {
+            size: s.bevel_size.max(1.0) as u32 * ss,
+            soften: s.soften.max(0.0) as u32 * ss,
+            angle: s.angle as f32,
+            altitude: s.altitude as f32,
+            depth: s.depth.max(1.0) as u32,
+            hi_opacity: s.hi_opacity as f32,
+            sh_opacity: s.sh_opacity as f32,
+            cameo: s.bevel == "Cameo",
+        },
+    );
+    // Shadow first (multiply the black buffer), highlight second (screen the
+    // white one) — the layer order the designer app composites in, so the
+    // highlight is never dimmed by a shadow pass applied after it.
+    // Alpha is untouched here: the bevel shades the glyphs, it never grows them.
+    {
         let buf = rgba.as_mut();
-        for i in 0..(w * h_px) as usize {
+        for i in 0..n {
             let hi_a = result.hi_rgba[i * 4 + 3] as f32 / 255.0;
             let sh_a = result.sh_rgba[i * 4 + 3] as f32 / 255.0;
             for c in 0..3 {
@@ -1629,6 +1642,50 @@ fn finish_title(png: &std::path::Path, s: &TitleStyle) -> Result<String, String>
                 buf[i * 4 + c] = (shadowed + hi_a * (255.0 - shadowed)) as u8;
             }
         }
+    }
+    // Soft cast shadow *under* the glyph — a blurred, offset copy of its own
+    // alpha, black at ~0.5 — the lift the reference cards sit on. Turning the
+    // bevel on used to drop the shadow entirely. Skipped when boxed: the backdrop
+    // plate already lifts the text. This one grows alpha, on purpose.
+    if !s.boxed {
+        let (wu, hu) = (w as usize, h_px as usize);
+        let off = (3 * ss) as isize;
+        let mut sha = vec![0.0_f32; n];
+        {
+            let buf = rgba.as_raw();
+            for y in 0..h_px as isize {
+                for x in 0..w as isize {
+                    let (sx, sy) = (x - off, y - off);
+                    if sx >= 0 && sy >= 0 && (sx as u32) < w && (sy as u32) < h_px {
+                        sha[(y * w as isize + x) as usize] =
+                            buf[((sy as u32 * w + sx as u32) as usize) * 4 + 3] as f32 / 255.0;
+                    }
+                }
+            }
+        }
+        crate::bevel::gaussian_blur(&mut sha, wu, hu, 3.0 * ss as f32);
+        let buf = rgba.as_mut();
+        for i in 0..n {
+            let ga = buf[i * 4 + 3] as f32 / 255.0;
+            let sa = (sha[i] * 0.5).min(1.0) * (1.0 - ga); // hidden where the glyph covers
+            let out_a = (ga + sa).min(1.0);
+            if out_a > 0.0 {
+                // glyph over black shadow, premultiplied then un-premultiplied
+                for c in 0..3 {
+                    let gp = buf[i * 4 + c] as f32 / 255.0 * ga;
+                    buf[i * 4 + c] = (gp / out_a * 255.0) as u8;
+                }
+            }
+            buf[i * 4 + 3] = (out_a * 255.0) as u8;
+        }
+    }
+    // Back down to 1080×1920 — the downscale is where the supersampled emboss
+    // resolves into clean antialiased edges.
+    if ss > 1 {
+        image::imageops::resize(&rgba, W, H, image::imageops::FilterType::Lanczos3)
+            .save(png)
+            .map_err(|e| e.to_string())?;
+    } else {
         rgba.save(png).map_err(|e| e.to_string())?;
     }
     Ok(png.display().to_string())
@@ -3120,6 +3177,39 @@ fn b64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // finish_title (bevel path) must downscale the card to 1080×1920 and, when
+    // not boxed, cast a soft shadow that grows the card's alpha. Differential:
+    // same disc, boxed (shadow off) vs unboxed (shadow on) — no ffmpeg needed.
+    #[test]
+    fn bevel_card_downscales_and_casts_shadow() {
+        let (cw, ch) = (400u32, 400u32);
+        let (cx, cy, r) = (cw as f32 / 2.0, ch as f32 / 2.0, cw as f32 * 0.3);
+        let mut img = image::RgbaImage::new(cw, ch);
+        for y in 0..ch {
+            for x in 0..cw {
+                if ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt() < r {
+                    img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+                }
+            }
+        }
+        let run = |boxed: bool, name: &str| -> ((u32, u32), u64) {
+            let p = std::env::temp_dir().join(name);
+            img.save(&p).unwrap();
+            let st = TitleStyle { bevel: "Intaglio".into(), boxed, ..Default::default() };
+            finish_title(&p, &st, 2).unwrap();
+            let out = image::open(&p).unwrap().to_rgba8();
+            let dims = out.dimensions();
+            let asum: u64 = out.as_raw().chunks(4).map(|px| px[3] as u64).sum();
+            let _ = std::fs::remove_file(&p);
+            (dims, asum)
+        };
+        let (d_boxed, no_shadow) = run(true, "mr_bevel_boxed.png");
+        let (d_unboxed, with_shadow) = run(false, "mr_bevel_shadow.png");
+        assert_eq!(d_boxed, (W, H), "card must downscale to 1080x1920");
+        assert_eq!(d_unboxed, (W, H));
+        assert!(with_shadow > no_shadow, "cast shadow should add alpha ({with_shadow} vs {no_shadow})");
+    }
 
     #[test]
     fn b64_matches_rfc4648() {
