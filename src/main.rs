@@ -3386,6 +3386,9 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     // tracked, so a resized window can never leave stale geometry behind.
     let mut xf_drag = state.xf_drag;
     let mut title_drag = state.title_drag;
+    // Dragging a text card up/down between T-lanes restacks it. (title index,
+    // track at grab, grab client-y). Higher track composites on top.
+    let mut title_lane_drag = use_signal(|| Option::<(usize, u8, f64)>::None);
     // DOM element handles are per-window, never shared: window B can't focus
     // window A's node.
     let mut phone_el = use_signal(|| Option::<std::rc::Rc<MountedData>>::None);
@@ -7230,6 +7233,22 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                             }
                             return;
                         }
+                        // Text card dragged up/down between T-lanes restacks it —
+                        // higher track composites on top. Lane pitch is 36px
+                        // (.mr-lane: 30px height + 6px margin, app.css), fixed
+                        // regardless of the clip-height slider. Runs alongside the
+                        // horizontal shift below, so a diagonal drag does both.
+                        if let Some((k, start_tr, start_y)) = title_lane_drag() {
+                            let rows = ((start_y - p.y) / 36.0).round() as i32; // up = higher track
+                            let nt = (start_tr as i32 + rows).clamp(1, t_lanes() as i32) as u8;
+                            if titles.read().get(k).is_some_and(|t| t.track.max(1) != nt) {
+                                push_undo("drag-lane"); // same tag as shift_lane: one undo per drag
+                                if let Some(t) = titles.write().get_mut(k) {
+                                    t.track = nt;
+                                }
+                                drag_moved.set(true); // a lane hop is a drag, swallow the click
+                            }
+                        }
                         let Some((target, last_x, t0, acc)) = drag() else { return };
                         let dx = p.x - last_x;
                         if dx == 0.0 {
@@ -7303,6 +7322,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                             drag_moved.set(true);
                         }
                         drag.set(None);
+                        title_lane_drag.set(None);
                         fade_drag.set(None);
                         vol_drag.set(None);
                         len_drag.set(None);
@@ -7311,6 +7331,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     },
                     onmouseleave: move |_| {
                         drag.set(None);
+                        title_lane_drag.set(None);
                         fade_drag.set(None);
                         vol_drag.set(None);
                         len_drag.set(None);
@@ -7495,7 +7516,10 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                                     onmousedown: move |evt| {
                                                         if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
                                                             selected.set(Some(Sel::Title(k)));
-                                                            drag.set(Some((Sel::Title(k), evt.client_coordinates().x, 0.0, 0.0)));
+                                                            let p = evt.client_coordinates();
+                                                            drag.set(Some((Sel::Title(k), p.x, 0.0, 0.0)));
+                                                            let tr = titles.read().get(k).map_or(1, |t| t.track.max(1));
+                                                            title_lane_drag.set(Some((k, tr, p.y)));
                                                         }
                                                     },
                                                     onclick: move |evt| {
