@@ -127,6 +127,18 @@ impl<T: Copy> Animated<T> {
     pub fn has_key(&self, t: f64) -> bool {
         matches!(self, Animated::Curve(k) if k.iter().any(|k| (k.t - t).abs() < KEY_EPS))
     }
+
+    /// The easing of the key within a frame of `t`, if one sits there. Lets the
+    /// inspector show and cycle a keyframe's velocity (Hold/Linear/Smooth).
+    pub fn key_interp(&self, t: f64) -> Option<Interp> {
+        match self {
+            Animated::Curve(k) => k
+                .iter()
+                .find(|k| (k.t - t).abs() < KEY_EPS)
+                .map(|k| k.interp),
+            Animated::Const(_) => None,
+        }
+    }
 }
 
 impl<T> Default for Animated<T>

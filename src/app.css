@@ -1,0 +1,1385 @@
+/* --- Aero glass token layer -------------------------------------------------
+   Supplements the theme.rs :root tokens. These are the Windows-Aero pillar the
+   base palette lacked: translucent panel tints that let a backdrop blur read
+   through, chiseled inset/highlight framing, and a soft focus glow. Applied
+   only to overlay surfaces (float panel, modals, context menu, deck, sticky
+   heads) — the surfaces with live app content behind them for the blur to
+   sample. Docked panels stay opaque; there's nothing behind them to frost. */
+:root {
+  --mor-glass:        color-mix(in srgb, var(--mor-panel) 72%, transparent);
+  --mor-glass-strong: color-mix(in srgb, var(--mor-panel) 86%, transparent);
+  --mor-glass-blur:        16px;
+  --mor-glass-blur-strong: 26px;
+  --mor-inset:     inset 0 1px 2px rgba(0, 0, 0, 0.45), inset 0 -1px 0 color-mix(in srgb, white 5%, transparent);
+  --mor-highlight: inset 0 1px 0 color-mix(in srgb, white 10%, transparent);
+  --mor-focus-glow: 0 0 0 2px color-mix(in srgb, var(--mor-accent-hover) 55%, transparent),
+                    0 0 12px color-mix(in srgb, var(--mor-accent) 40%, transparent);
+}
+
+/* Fluid + a light retro MMO HUD: brass frames, soft glows, inventory-slot
+   clips. Motion is deliberate; labels stay plain English in the app itself. */
+.mr-root {
+  display: flex; flex-direction: column; gap: 12px; height: 100%; min-height: 0;
+  padding: 12px; box-sizing: border-box;
+  background:
+    radial-gradient(ellipse 90% 55% at 50% -8%, color-mix(in srgb, var(--mor-accent) 9%, transparent), transparent 58%),
+    radial-gradient(ellipse 50% 40% at 100% 100%, color-mix(in srgb, var(--mor-success) 5%, transparent), transparent 50%),
+    var(--mor-bg);
+}
+.mr-work { display: flex; gap: 16px; flex: 1; min-height: 0; }
+.mr-preview-col { display: flex; flex-direction: column; gap: 10px; align-items: center; min-height: 0; padding-top: 4px; flex: 0 0 auto; width: clamp(180px, 34vw, 560px); }
+/* The phone fills whatever height is left after the scrub controls; a definite
+   column width keeps the height-driven phone from overflowing (the old WebKit
+   intrinsic-width bug). 9:16 is tall, so height is the binding constraint. */
+.mr-stage { flex: 1; min-height: 0; width: 100%; display: flex; align-items: center; justify-content: center; }
+
+/* Buttons inside the editor: longer ease, slight lift, brass-rim primary. */
+.mr-root .mor-btn {
+  transition: background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.15s ease, color 0.15s ease;
+}
+.mr-root .mor-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.35), 0 0 0 1px color-mix(in srgb, var(--mor-border-light) 60%, transparent);
+}
+.mr-root .mor-btn:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: var(--mor-inset);
+  filter: brightness(0.94);
+}
+.mr-root .mor-btn.primary {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-accent-hover) 92%, white), var(--mor-accent));
+  border-color: color-mix(in srgb, var(--mor-accent) 70%, #2e2160);
+  color: #160f2b;
+  font-weight: 600;
+  text-shadow: 0 1px 0 color-mix(in srgb, white 25%, transparent);
+}
+.mr-root .mor-btn.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, var(--mor-accent-hover), color-mix(in srgb, var(--mor-accent) 85%, black));
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--mor-accent) 35%, transparent);
+}
+
+/* Signature: phone as a framed artifact — dual rim + soft brass bloom.
+   Width-driven: aspect-ratio height doesn't feed the flex column's intrinsic
+   width in WebKit, so a flex-sized phone overflows. 400px ≈ vertical chrome. */
+.mr-phone {
+  position: relative; flex: none;
+  height: 100%; width: auto; max-width: 100%; min-width: 0;
+  aspect-ratio: 9 / 16; background: #000;
+  border: 5px solid #06060a;
+  border-radius: 24px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--mor-text-muted); font-size: 13px;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--mor-accent) 45%, var(--mor-border-light)),
+    0 0 0 3px #0a0a10,
+    0 16px 44px rgba(0, 0, 0, 0.6),
+    0 0 48px color-mix(in srgb, var(--mor-accent) 14%, transparent);
+  transition: box-shadow 0.35s ease, transform 0.25s ease;
+}
+.mr-phone:hover {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--mor-accent) 65%, var(--mor-border-light)),
+    0 0 0 3px #0a0a10,
+    0 18px 48px rgba(0, 0, 0, 0.62),
+    0 0 64px color-mix(in srgb, var(--mor-accent) 22%, transparent);
+}
+.mr-phone > span { text-align: center; padding: 0 16px; }
+.mr-phone img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* Punch-hole speaker slit: the bezel reads as a phone at a glance. */
+.mr-phone::after {
+  content: ""; position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
+  width: 22%; height: 5px; border-radius: 3px; background: #06060a;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.06), 0 0 6px color-mix(in srgb, var(--mor-accent) 20%, transparent);
+  z-index: 2; pointer-events: none;
+}
+
+/* Drop target: pulse the brass rim without reflowing lane geometry. */
+.mr-drop {
+  box-shadow:
+    inset 0 0 0 2px var(--mor-accent),
+    0 0 18px color-mix(in srgb, var(--mor-accent) 38%, transparent) !important;
+  background-color: color-mix(in srgb, var(--mor-accent) 12%, transparent);
+  animation: mr-drop-pulse 1.1s ease-in-out infinite;
+}
+.mr-timeline.mr-drop { border-radius: var(--mor-radius); }
+@keyframes mr-drop-pulse {
+  0%, 100% { box-shadow: inset 0 0 0 2px var(--mor-accent), 0 0 12px color-mix(in srgb, var(--mor-accent) 28%, transparent); }
+  50% { box-shadow: inset 0 0 0 2px var(--mor-accent-hover), 0 0 22px color-mix(in srgb, var(--mor-accent) 48%, transparent); }
+}
+
+/* Transform handles: gem-square corners, gold dashed frame. */
+.mr-xf { position: absolute; inset: 0; z-index: 4; }
+.mr-xf-box {
+  position: absolute; box-sizing: border-box;
+  border: 1px dashed var(--mor-accent);
+  background: color-mix(in srgb, var(--mor-accent) 7%, transparent);
+  pointer-events: auto; cursor: move;
+  box-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 18%, transparent);
+}
+.mr-xf-h {
+  position: absolute; width: 13px; height: 13px; margin: -7px 0 0 -7px; box-sizing: border-box;
+  background: linear-gradient(145deg, var(--mor-accent-hover), var(--mor-accent));
+  border: 1px solid #0f0f12; border-radius: 2px;
+  pointer-events: auto; cursor: nwse-resize;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.6), 0 0 6px color-mix(in srgb, var(--mor-accent) 40%, transparent);
+  transition: transform 0.12s ease;
+}
+.mr-xf-h:hover { transform: scale(1.15); }
+.mr-xf-e { position: absolute; box-sizing: border-box; background: var(--mor-accent); border: 1px solid #0f0f12; border-radius: 2px; pointer-events: auto; box-shadow: 0 1px 3px rgba(0,0,0,0.6); }
+.mr-xf-e.wide { width: 9px; height: 17px; margin: -9px 0 0 -5px; cursor: ew-resize; }
+.mr-xf-e.tall { width: 17px; height: 9px; margin: -5px 0 0 -9px; cursor: ns-resize; }
+.mr-xf-rot {
+  position: absolute; width: 13px; height: 13px; margin: -22px 0 0 -7px; box-sizing: border-box;
+  background: radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--mor-warning) 35%, white), var(--mor-warning) 55%, color-mix(in srgb, var(--mor-warning) 55%, black));
+  border: 1px solid #0f0f12; border-radius: 50%;
+  pointer-events: auto; cursor: grab;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.6), 0 0 8px color-mix(in srgb, var(--mor-warning) 45%, transparent);
+}
+.mr-xf-rot::after {
+  content: ""; position: absolute; left: 50%; top: 100%; width: 1px; height: 14px;
+  background: var(--mor-warning); opacity: 0.75;
+}
+
+/* Safe-area guides (phone app chrome). Non-interactive. */
+.mr-safe { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+.mr-safe-zone {
+  position: absolute;
+  background: color-mix(in srgb, var(--mor-destructive) 15%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--mor-destructive) 55%, transparent);
+  box-sizing: border-box;
+}
+.mr-safe-zone span {
+  position: absolute; bottom: 2px; right: 4px; font-size: 8px; letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--mor-destructive) 85%, white);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); white-space: nowrap;
+}
+.mr-safe-top { top: 0; left: 0; right: 0; height: 8%; border-width: 0 0 1px 0; }
+.mr-safe-bottom { bottom: 0; left: 0; right: 0; height: 24%; border-width: 1px 0 0 0; }
+.mr-safe-bottom span { bottom: auto; top: 2px; }
+.mr-safe-rail { top: 8%; bottom: 24%; right: 0; width: 18%; border-width: 0 0 0 1px; }
+
+.mr-monitor {
+  height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 14px; box-sizing: border-box;
+  background:
+    radial-gradient(ellipse 70% 60% at 50% 40%, color-mix(in srgb, var(--mor-accent) 8%, transparent), transparent 65%),
+    var(--mor-bg);
+}
+.mr-monitor .mr-phone { width: auto; height: 100%; max-width: 100%; min-width: 0; }
+
+.mr-scrub { width: 100%; flex: none; }
+/* Deck: HUD readout — brass inset frame, amber at rest, record-red rolling. */
+.mr-deck {
+  display: flex; justify-content: center; align-items: baseline; gap: 7px;
+  margin-bottom: 4px; padding: 5px 14px 6px;
+  background: linear-gradient(180deg, #12121a, #08080c);
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 35%, var(--mor-border));
+  border-radius: 8px;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 18%, transparent),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.45),
+    0 0 16px color-mix(in srgb, var(--mor-accent) 12%, transparent);
+  font-size: 21px; color: var(--mor-accent); letter-spacing: 0.06em;
+  text-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 45%, transparent);
+  transition: color 0.25s ease, text-shadow 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+}
+.mr-deck.playing {
+  color: var(--mor-destructive);
+  border-color: color-mix(in srgb, var(--mor-destructive) 45%, var(--mor-border));
+  text-shadow: 0 0 14px color-mix(in srgb, var(--mor-destructive) 50%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--mor-destructive) 20%, transparent),
+    0 0 18px color-mix(in srgb, var(--mor-destructive) 18%, transparent);
+  animation: mr-deck-pulse 1.4s ease-in-out infinite;
+}
+@keyframes mr-deck-pulse {
+  0%, 100% { text-shadow: 0 0 10px color-mix(in srgb, var(--mor-destructive) 40%, transparent); }
+  50% { text-shadow: 0 0 18px color-mix(in srgb, var(--mor-destructive) 65%, transparent); }
+}
+.mr-deck-total { font-size: 12px; color: var(--mor-text-muted); text-shadow: none; letter-spacing: 0.03em; }
+.mr-play-row { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
+
+/* Inspector: framed panel like a classic side window. */
+.mr-inspector {
+  flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 12px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 92%, white), var(--mor-panel));
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border));
+  border-radius: var(--mor-radius);
+  padding: 0 14px 14px; overflow-y: auto;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 12%, transparent),
+    0 8px 28px rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+/* Popped-out inspector: it IS the window — fill it, drop the card chrome, and
+   breathe a little wider than the docked panel. */
+.mr-inspector.mr-inspector-solo {
+  flex: 1; min-width: 0; width: 100%; height: 100%;
+  /* border-box so the 18px padding sits INSIDE the window width — without it
+     (content-box, no global reset) the panel is width+36px and clips its right
+     edge, cutting the value readouts. overflow-x guards any stray child. */
+  box-sizing: border-box; overflow-x: hidden;
+  border: none; border-radius: 0; box-shadow: none;
+  padding: 0 18px 18px; gap: 14px;
+  background:
+    radial-gradient(120% 42% at 50% 0%, color-mix(in srgb, var(--mor-accent) 7%, transparent), transparent 62%),
+    linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 96%, white), var(--mor-panel));
+}
+/* Window identity: names what you're editing, in that element's colour (--kind).
+   The signature — a top accent rail + a glowing kind badge — is the one bold
+   mark; every control below it stays the app's quiet violet/glass. */
+.mr-solo-head {
+  position: sticky; top: 0; z-index: 6;
+  margin: 0 -18px 4px; padding: 18px 20px 15px;
+  border-bottom: 1px solid color-mix(in srgb, var(--kind) 26%, var(--mor-border));
+  background: linear-gradient(180deg,
+    color-mix(in srgb, var(--kind) 14%, var(--mor-panel)),
+    color-mix(in srgb, var(--kind) 4%, var(--mor-panel)));
+  box-shadow: inset 0 3px 0 var(--kind);
+}
+.mr-solo-eyebrow {
+  display: block; font-size: 10px; font-weight: 700;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--kind) 62%, var(--mor-text-muted));
+}
+.mr-solo-title-row { display: flex; align-items: center; gap: 13px; margin-top: 9px; }
+.mr-solo-badge {
+  flex: none; display: grid; place-items: center;
+  width: 36px; height: 36px; border-radius: 10px;
+  font-size: 18px; font-weight: 700; color: var(--kind);
+  background: color-mix(in srgb, var(--kind) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--kind) 42%, transparent);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--kind) 20%, transparent);
+}
+.mr-solo-title {
+  font-size: 27px; font-weight: 700; letter-spacing: -0.015em; line-height: 1;
+  color: var(--mor-text);
+}
+/* Floated inspector: movable + resizable sheet (geometry set inline). */
+.mr-inspector.mr-float-panel {
+  position: fixed; z-index: 320; flex: none;
+  box-sizing: border-box;
+  min-width: 280px; min-height: 220px;
+  max-width: calc(100vw - 16px); max-height: calc(100vh - 16px);
+  padding-bottom: 14px;
+  overflow-x: hidden; overflow-y: auto;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-glass-strong) 90%, white), var(--mor-glass-strong));
+  backdrop-filter: blur(var(--mor-glass-blur-strong)) saturate(1.35);
+  -webkit-backdrop-filter: blur(var(--mor-glass-blur-strong)) saturate(1.35);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 14%, transparent),
+    0 18px 48px rgba(0, 0, 0, 0.55),
+    0 0 0 1px color-mix(in srgb, var(--mor-accent) 30%, transparent),
+    0 0 36px color-mix(in srgb, var(--mor-accent) 12%, transparent);
+  animation: mr-float-in 0.18s ease-out;
+}
+@keyframes mr-float-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+.mr-panel-head {
+  display: flex; align-items: center; gap: 8px;
+  position: sticky; top: 0; z-index: 2;
+  margin: 0 -14px 4px; padding: 9px 12px 8px;
+  background: linear-gradient(180deg,
+    color-mix(in srgb, var(--mor-header) 82%, transparent),
+    color-mix(in srgb, var(--mor-header) 74%, transparent));
+  backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.2);
+  -webkit-backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.2);
+  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border));
+  border-radius: var(--mor-radius) var(--mor-radius) 0 0;
+  user-select: none;
+}
+.mr-float-panel .mr-panel-head { cursor: grab; }
+.mr-float-panel .mr-panel-head:active { cursor: grabbing; }
+
+/* Float resize grips — thin hit targets on edges, gem squares on corners. */
+.mr-float-grip {
+  position: absolute; z-index: 5;
+  background: transparent;
+}
+.mr-float-grip-n { top: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+.mr-float-grip-s { bottom: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+.mr-float-grip-e { top: 10px; right: 0; bottom: 10px; width: 6px; cursor: ew-resize; }
+.mr-float-grip-w { top: 10px; left: 0; bottom: 10px; width: 6px; cursor: ew-resize; }
+.mr-float-grip-ne, .mr-float-grip-nw, .mr-float-grip-se, .mr-float-grip-sw {
+  width: 12px; height: 12px;
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 55%, #0f0f12);
+  background: linear-gradient(145deg, var(--mor-accent-hover), var(--mor-accent));
+  border-radius: 2px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.5), 0 0 6px color-mix(in srgb, var(--mor-accent) 35%, transparent);
+  opacity: 0.85;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.mr-float-grip-ne:hover, .mr-float-grip-nw:hover, .mr-float-grip-se:hover, .mr-float-grip-sw:hover {
+  opacity: 1; transform: scale(1.12);
+}
+.mr-float-grip-ne { top: -1px; right: -1px; cursor: nesw-resize; }
+.mr-float-grip-nw { top: -1px; left: -1px; cursor: nwse-resize; }
+.mr-float-grip-se { bottom: -1px; right: -1px; cursor: nwse-resize; }
+.mr-float-grip-sw { bottom: -1px; left: -1px; cursor: nesw-resize; }
+/* Visible SE affordance so resize is discoverable without hunting. */
+.mr-float-grip-se::after {
+  content: ""; position: absolute; right: 2px; bottom: 2px;
+  width: 7px; height: 7px;
+  background:
+    linear-gradient(135deg, transparent 45%, color-mix(in srgb, #160f2b 70%, transparent) 46%, color-mix(in srgb, #160f2b 70%, transparent) 54%, transparent 55%),
+    linear-gradient(135deg, transparent 60%, color-mix(in srgb, #160f2b 55%, transparent) 61%, color-mix(in srgb, #160f2b 55%, transparent) 69%, transparent 70%);
+  pointer-events: none;
+}
+.mr-panel-title {
+  flex: 1; min-width: 0;
+  font-size: 12px; font-weight: 650; letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--mor-text) 88%, var(--mor-accent));
+}
+.mr-panel-tools { display: flex; gap: 2px; flex: none; }
+.mr-panel-btn {
+  width: 28px; height: 24px; padding: 0;
+  border: 1px solid transparent; border-radius: 5px;
+  background: transparent; color: var(--mor-text-muted);
+  font-size: 13px; line-height: 1; cursor: pointer;
+  transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+}
+.mr-panel-btn:hover {
+  color: var(--mor-accent-hover);
+  background: color-mix(in srgb, var(--mor-accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--mor-accent) 28%, transparent);
+}
+.mr-insp-reopen {
+  flex: none; align-self: stretch;
+  writing-mode: vertical-rl; text-orientation: mixed;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  font-size: 11px; font-weight: 650;
+  padding: 12px 8px; cursor: pointer;
+  color: color-mix(in srgb, var(--mor-text) 80%, var(--mor-accent));
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 90%, white), var(--mor-panel));
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 28%, var(--mor-border));
+  border-radius: var(--mor-radius);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 10%, transparent);
+  transition: color 0.15s ease, border-color 0.15s ease, box-shadow 0.18s ease;
+}
+.mr-insp-reopen:hover {
+  color: var(--mor-accent-hover);
+  border-color: var(--mor-accent);
+  box-shadow: 0 0 14px color-mix(in srgb, var(--mor-accent) 28%, transparent);
+}
+/* The title text field is a textarea; inherit the input look, allow wrapping
+   and a vertical drag to grow, and keep the editor font rather than monospace. */
+.mr-text-area {
+  min-height: 3.4em;
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+.mr-status-click { cursor: pointer; }
+.mr-status-click:hover { filter: brightness(1.1); }
+.mr-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+.mr-toolbar .mr-export {
+  margin-left: auto; color: var(--mor-warning);
+  border-color: color-mix(in srgb, var(--mor-warning) 50%, transparent);
+  background: color-mix(in srgb, var(--mor-warning) 8%, var(--mor-btn));
+}
+.mr-toolbar .mr-export:hover:not(:disabled) {
+  border-color: var(--mor-warning);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--mor-warning) 30%, transparent);
+  color: color-mix(in srgb, var(--mor-warning) 25%, white);
+}
+.mr-field-row {
+  display: flex; align-items: flex-end; gap: 8px;
+}
+.mr-field-grow { flex: 1; min-width: 0; }
+.mr-field-side {
+  flex: none; margin-bottom: 1px; font-size: 12px;
+  white-space: nowrap;
+}
+.mr-danger { color: var(--mor-destructive); }
+.mr-reset { align-self: flex-start; font-size: 11px; }
+.mr-keys { margin-top: auto; font-size: 11px; }
+
+/* Add-to-reel dialog cards. */
+.mr-add-dialog { display: flex; flex-direction: column; gap: 12px; }
+.mr-add-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+}
+.mr-add-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+  text-align: left; padding: 12px 12px 14px; cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border));
+  border-radius: 9px;
+  background: linear-gradient(165deg, color-mix(in srgb, var(--mor-btn) 92%, white), var(--mor-btn));
+  color: var(--mor-text);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 7%, transparent);
+  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.14s ease, filter 0.14s ease;
+}
+.mr-add-card:hover:not(:disabled) {
+  border-color: var(--mor-accent);
+  transform: translateY(-2px);
+  filter: brightness(1.05);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35), 0 0 14px color-mix(in srgb, var(--mor-accent) 22%, transparent);
+}
+.mr-add-card:disabled { opacity: 0.45; cursor: not-allowed; }
+.mr-add-card strong { font-size: 14px; font-weight: 650; }
+.mr-add-card .mor-statusbar-muted { font-size: 11px; line-height: 1.35; }
+.mr-add-tag {
+  font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px;
+  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
+  color: #141417;
+}
+.mr-add-tag.audio { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
+.mr-add-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
+.mr-add-extra { justify-content: flex-start; }
+.mr-fx-dialog { display: flex; flex-direction: column; gap: 8px; }
+
+/* Dialog chrome polish (export / effects / add / about) + browser resize grip. */
+.mor-modal {
+  display: flex !important;
+  flex-direction: column;
+  resize: both;
+  overflow: hidden !important;
+  min-width: 320px !important;
+  min-height: 180px;
+  max-width: min(96vw, 920px) !important;
+  max-height: 90vh;
+  width: min(520px, 92vw);
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 28%, var(--mor-border-light)) !important;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-glass-strong) 92%, white), var(--mor-glass-strong)) !important;
+  backdrop-filter: blur(var(--mor-glass-blur-strong)) saturate(1.35);
+  -webkit-backdrop-filter: blur(var(--mor-glass-blur-strong)) saturate(1.35);
+  box-shadow:
+    0 22px 56px rgba(0, 0, 0, 0.62),
+    0 0 0 1px rgba(0, 0, 0, 0.35),
+    var(--mor-highlight),
+    0 0 40px color-mix(in srgb, var(--mor-accent) 10%, transparent) !important;
+}
+.mor-modal-header {
+  flex: none;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-header) 90%, var(--mor-accent)), var(--mor-header)) !important;
+  border-bottom-color: color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border-light)) !important;
+  letter-spacing: 0.03em;
+}
+.mor-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none !important;
+  overflow-y: auto;
+}
+.mor-modal-backdrop {
+  background:
+    radial-gradient(ellipse 70% 50% at 50% 40%, color-mix(in srgb, var(--mor-accent) 8%, transparent), transparent 60%),
+    rgba(0, 0, 0, 0.55) !important;
+  backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.1);
+}
+
+.mr-progress {
+  height: 7px; background: var(--mor-border); border-radius: 4px; overflow: hidden;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+.mr-progress > div {
+  height: 100%;
+  background: linear-gradient(90deg, var(--mor-accent), var(--mor-accent-hover), var(--mor-warning));
+  background-size: 200% 100%;
+  transition: width 0.3s ease;
+  animation: mr-progress-sheen 2.2s linear infinite;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--mor-accent) 40%, transparent);
+}
+@keyframes mr-progress-sheen {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+/* Timeline: darkest bench, brass outer rim. */
+.mr-timeline {
+  position: relative;
+  /* Both bars always shown: horizontal is the time axis, vertical spans the
+     lane stack — keep them present so the scrollable extent is always obvious. */
+  display: flex; overflow-x: scroll; overflow-y: scroll; padding: 12px 10px 8px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--mor-header) 88%, var(--mor-accent)), var(--mor-header));
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
+  border-radius: var(--mor-radius);
+  min-height: 280px; max-height: 42vh;
+  align-items: flex-start; flex: none;
+  user-select: none; -webkit-user-select: none;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 10%, transparent),
+    0 6px 22px rgba(0, 0, 0, 0.4);
+}
+.mr-timeline-hint { align-self: center; margin: auto; }
+
+/* Phase emphasis on the timeline: dim the lanes the active phase doesn't touch,
+   spotlighting the ones it does. V1 is .mr-clips, V2 .mr-lane-v, T .mr-lane-t,
+   A1/A2 .mr-lane-a1. Add/Export set no phase class, so nothing dims. */
+.mr-lane, .mr-clips { transition: opacity 0.2s ease, filter 0.2s ease; }
+.mr-phase-text .mr-lane-v,
+.mr-phase-text .mr-clips,
+.mr-phase-text .mr-lane-a1,
+.mr-phase-audio .mr-lane-t,
+.mr-phase-audio .mr-lane-v,
+.mr-phase-audio .mr-clips,
+.mr-phase-cut .mr-lane-t,
+.mr-phase-cut .mr-lane-a1,
+.mr-phase-style .mr-lane-t,
+.mr-phase-style .mr-lane-a1 {
+  opacity: 0.38; filter: saturate(0.55);
+}
+
+/* Phase-driven inspector: stacked action buttons for Add/Export. */
+.mr-phase-actions { display: flex; flex-direction: column; gap: 8px; }
+.mr-phase-actions .mor-btn { width: 100%; }
+
+/* Text workspace: browse the T lane as a pick-to-edit list. */
+.mr-text-nav { margin: 2px 0 6px; }
+.mr-text-nav .mor-btn { flex: 1; font-size: 12px; }
+.mr-text-empty { margin-top: 12px; opacity: 0.8; }
+.mr-text-list { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+.mr-text-row {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 10px; text-align: left; cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
+  border-radius: 8px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-btn) 92%, white), var(--mor-btn));
+  color: var(--mor-text);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
+  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.14s ease, filter 0.14s ease;
+}
+.mr-text-row { cursor: default; }
+.mr-text-row:hover {
+  border-color: var(--mor-accent);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3), 0 0 12px color-mix(in srgb, var(--mor-accent) 22%, transparent);
+}
+.mr-text-row-label {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px;
+}
+/* Inline transcript editor: the words are editable in place. */
+.mr-text-row-edit {
+  flex: 1; min-width: 0; font-size: 12px; padding: 5px 8px; margin: 0;
+}
+.mr-text-jump {
+  flex: none; cursor: pointer; border: none; background: none;
+  padding: 0 2px; font-size: 13px; line-height: 1;
+}
+.mr-text-del {
+  flex: none; cursor: pointer; border: none; background: none;
+  color: var(--mor-text-muted); font-size: 13px; line-height: 1; padding: 0 2px;
+}
+.mr-text-del:hover { color: var(--mor-danger, #e5484d); }
+.mr-text-row-time {
+  flex: none; font-size: 11px; color: var(--mor-text-muted); cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+/* Style sub-tabs sit above the panel's controls with a little room. */
+.mr-inspector .mor-tabs { margin: 4px 0 12px; }
+/* Band presets + background swatches. */
+.mr-preset-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 12px; }
+.mr-preset-row .mor-btn { flex: 1; min-width: 68px; }
+.mr-bg-swatches { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.mr-bg-swatch {
+  flex: 1; min-width: 66px; height: 58px; padding: 5px;
+  border: 2px solid var(--mor-border); border-radius: 8px; cursor: pointer;
+  display: flex; align-items: flex-end; justify-content: center;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.mr-bg-swatch:hover { border-color: color-mix(in srgb, var(--mor-accent) 60%, transparent); }
+.mr-bg-swatch.active {
+  border-color: var(--mor-accent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 45%, transparent);
+}
+.mr-bg-name {
+  font-size: 10px; background: rgba(0, 0, 0, 0.55); color: #fff;
+  padding: 1px 6px; border-radius: 4px;
+}
+
+/* Workflow spine: the reel-building phases as a bottom bar. */
+.mr-workflow {
+  display: flex; justify-content: center; gap: 4px; flex: none;
+  padding: 5px 8px; margin-top: 6px;
+  background: rgba(127, 127, 127, 0.05);
+  border: 1px solid var(--mor-border);
+  border-radius: var(--mor-radius);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+.mr-wf {
+  position: relative;
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  min-width: 76px; padding: 5px 12px;
+  background: transparent; border: 1px solid transparent; border-radius: 7px;
+  color: var(--mor-text-muted); cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.mr-wf:hover:not(:disabled) { background: rgba(127, 127, 127, 0.09); color: var(--mor-text); }
+.mr-wf:disabled { opacity: 0.4; cursor: not-allowed; }
+.mr-wf.active {
+  color: var(--mor-text);
+  border-color: color-mix(in srgb, var(--mor-accent) 50%, transparent);
+  background: color-mix(in srgb, var(--mor-accent) 15%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 10%, transparent);
+}
+.mr-wf-export {
+  color: color-mix(in srgb, var(--mor-accent) 85%, white);
+  border-color: color-mix(in srgb, var(--mor-accent) 40%, transparent);
+}
+.mr-wf-icon { font-size: 16px; line-height: 1; }
+.mr-wf-label { font-size: 11px; letter-spacing: 0.03em; }
+.mr-wf-tick {
+  position: absolute; top: 2px; right: 7px;
+  font-size: 9px; color: var(--mor-success);
+  text-shadow: 0 0 6px color-mix(in srgb, var(--mor-success) 50%, transparent);
+}
+.mr-track { position: relative; flex: none; min-width: 100%; }
+
+.mr-tick, .mr-clip-dur, .mr-key, .mr-ph-badge, .mr-deck {
+  font-family: ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.mr-ruler {
+  position: relative; height: 22px; margin-bottom: 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 25%, var(--mor-border-light));
+  cursor: ew-resize;
+}
+.mr-tick {
+  position: absolute; bottom: 0; height: 5px;
+  border-left: 1px solid var(--mor-border);
+  font-size: 9px; color: var(--mor-text-muted);
+  pointer-events: none; white-space: nowrap;
+}
+.mr-tick.major {
+  height: 15px;
+  border-left-color: color-mix(in srgb, var(--mor-accent) 40%, var(--mor-border-light));
+  padding-left: 3px; color: color-mix(in srgb, var(--mor-text-muted) 80%, var(--mor-accent));
+}
+
+.mr-lane {
+  position: relative; height: 30px; margin-bottom: 6px;
+  background: rgba(127, 127, 127, 0.06);
+  border-radius: 5px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.mr-lane-tag {
+  position: absolute; top: 4px; left: 4px; z-index: 2;
+  font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px;
+  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
+  color: #141417; pointer-events: none;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+.mr-lane-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
+/* An eye-toggle tag opts back into clicks (the base tag is inert) and dims when
+   its lane is hidden from the monitor. */
+.mr-lane-toggle { pointer-events: auto; cursor: pointer; transition: opacity 0.15s ease, filter 0.15s ease; }
+.mr-lane-toggle:hover { filter: brightness(1.12); }
+.mr-lane-tag.off { opacity: 0.4; filter: grayscale(0.7); }
+.mr-lane-off .mr-lane-item { opacity: 0.32; filter: grayscale(0.5); }
+.mr-lane-a1 .mr-lane-tag { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
+/* Taller audio lanes so the waveform envelope has room to read and is an easier
+   drag/trim target. */
+.mr-lane-a1 {
+  height: 76px;
+  /* Empty bed reads as a drop target, like iMovie's music track. */
+  border: 1px dashed color-mix(in srgb, var(--mor-success) 28%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, #0e1418 70%, transparent);
+}
+.mr-audio-fx {
+  position: absolute; top: 2px; right: 4px; z-index: 2;
+  font-size: 9px; color: var(--mor-accent-hover);
+  text-shadow: 0 0 6px color-mix(in srgb, var(--mor-accent) 50%, transparent);
+  pointer-events: none;
+}
+
+/* On-lane audio handles: fade wedges, corner grips, a volume line. */
+.mr-fade-in, .mr-fade-out {
+  position: absolute; top: 0; bottom: 0; z-index: 2; pointer-events: none;
+}
+.mr-fade-in { left: 0; background: linear-gradient(to right, rgba(0,0,0,0.6), transparent); }
+.mr-fade-out { right: 0; background: linear-gradient(to left, rgba(0,0,0,0.6), transparent); }
+.mr-fade-grip {
+  position: absolute; top: 0; bottom: 0; width: 9px; z-index: 4;
+  cursor: ew-resize; opacity: 0; transition: opacity 0.15s ease;
+  background: color-mix(in srgb, var(--mor-success) 70%, white);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-success) 60%, transparent);
+}
+.mr-fade-grip.in { left: 0; border-radius: 5px 0 0 5px; }
+.mr-fade-grip.out { right: 0; border-radius: 0 5px 5px 0; }
+.mr-lane-item.audio:hover .mr-fade-grip { opacity: 0.55; }
+.mr-fade-grip:hover { opacity: 0.95 !important; }
+/* Dual-edge resize grips — left + right, same hit size as audio fade grips.
+   Titles tint gold; cutaways and V1 clips pick up the lane colour via parent. */
+.mr-len-grip {
+  position: absolute; top: 0; bottom: 0; width: 9px; z-index: 4;
+  cursor: ew-resize; opacity: 0; transition: opacity 0.15s ease;
+  background: color-mix(in srgb, var(--mor-title, gold) 75%, white);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-title, gold) 60%, transparent);
+}
+.mr-len-grip.in { left: 0; border-radius: 5px 0 0 5px; }
+.mr-len-grip.out { right: 0; border-radius: 0 5px 5px 0; }
+.mr-lane-item:hover .mr-len-grip,
+.mr-clip:hover .mr-len-grip { opacity: 0.55; }
+.mr-lane-item.selected .mr-len-grip,
+.mr-clip.selected .mr-len-grip { opacity: 0.7; }
+.mr-len-grip:hover { opacity: 0.95 !important; }
+.mr-clip .mr-len-grip,
+.mr-lane-item:not(.title) .mr-len-grip {
+  background: color-mix(in srgb, var(--mor-accent, #6af) 75%, white);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-accent, #6af) 60%, transparent);
+}
+.mr-vol-line {
+  position: absolute; left: 0; right: 0; height: 3px; z-index: 3;
+  margin-bottom: -1.5px; cursor: ns-resize;
+  background: color-mix(in srgb, var(--mor-warning) 85%, white);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--mor-warning) 70%, transparent);
+  opacity: 0.35; transition: opacity 0.15s ease;
+}
+.mr-lane-item.audio:hover .mr-vol-line { opacity: 0.85; }
+.mr-vol-line:hover { opacity: 1; height: 4px; }
+
+/* Track mixer strip in the Audio inspector. */
+.mr-mixer { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
+.mr-mixer-row { display: flex; align-items: center; gap: 8px; }
+.mr-mixer-tag {
+  flex: none; width: 26px; font-size: 10px; font-weight: 600; letter-spacing: 0.5px;
+  color: var(--mor-text-muted); text-align: center;
+}
+.mr-mixer-fader { flex: 1; min-width: 0; }
+.mr-mixer-btn {
+  flex: none; width: 22px; height: 20px; border-radius: 4px; font-size: 10px;
+  font-weight: 700; cursor: pointer; line-height: 1;
+  border: 1px solid var(--mor-border-light);
+  background: color-mix(in srgb, var(--mor-panel) 88%, white);
+  color: var(--mor-text-muted);
+}
+.mr-mixer-btn.on.m {
+  background: var(--mor-danger); border-color: var(--mor-danger); color: #140b0b;
+}
+.mr-mixer-btn.on.s {
+  background: var(--mor-warning); border-color: var(--mor-warning); color: #141002;
+}
+.mr-mixer-val { flex: none; width: 34px; font-size: 10px; text-align: right; color: var(--mor-text-muted); }
+
+/* Inspector waveform: whole source, kept window bright, trims/fades shaded. */
+.mr-insp-wave {
+  position: relative; height: 46px; width: 100%; margin: 6px 0 2px;
+  border-radius: 5px; background-repeat: no-repeat; background-size: 100% 100%;
+  background-color: color-mix(in srgb, #061412 75%, var(--mor-success));
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--mor-success) 35%, transparent),
+    inset 0 -6px 10px color-mix(in srgb, var(--mor-success) 18%, transparent);
+}
+.mr-insp-trim { position: absolute; top: 0; bottom: 0; background: rgba(0,0,0,0.58); }
+.mr-insp-fadein { position: absolute; top: 0; bottom: 0; background: linear-gradient(to right, rgba(0,0,0,0.5), transparent); }
+.mr-insp-fadeout { position: absolute; top: 0; bottom: 0; background: linear-gradient(to left, rgba(0,0,0,0.5), transparent); }
+
+/* Lane items: embossed inventory-slot feel. */
+.mr-lane-item {
+  position: absolute; top: 2px; bottom: 2px; box-sizing: border-box;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  font-size: 10px; line-height: 22px; padding: 0 6px 0 30px;
+  border-radius: 5px;
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 50%, transparent);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--mor-accent) 32%, transparent), color-mix(in srgb, var(--mor-accent) 16%, transparent));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 12%, transparent), 0 1px 2px rgba(0, 0, 0, 0.3);
+  cursor: grab;
+  transition: border-color 0.15s ease, box-shadow 0.18s ease, filter 0.15s ease;
+}
+.mr-lane-item:hover { filter: brightness(1.08); }
+.mr-lane-item.audio {
+  border-color: color-mix(in srgb, var(--mor-success) 55%, transparent);
+  /* Dark bed so the teal wave stands out; image sits on top via wave_css. */
+  background-color: color-mix(in srgb, #061412 88%, var(--mor-success));
+  background-image: linear-gradient(180deg, color-mix(in srgb, var(--mor-success) 22%, transparent), color-mix(in srgb, var(--mor-success) 8%, transparent));
+  line-height: 74px;
+  padding-left: 32px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, white 10%, transparent),
+    inset 0 -10px 18px color-mix(in srgb, var(--mor-success) 12%, transparent),
+    0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.mr-lane-item.title {
+  border-color: color-mix(in srgb, var(--mor-warning) 55%, transparent);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 34%, transparent), color-mix(in srgb, var(--mor-warning) 16%, transparent));
+}
+.mr-lane-item.selected {
+  border-color: var(--mor-accent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, var(--mor-accent) 40%, transparent);
+}
+.mr-lane-item.audio.selected {
+  border-color: var(--mor-success);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, var(--mor-success) 40%, transparent);
+}
+.mr-lane-item.title.selected {
+  border-color: var(--mor-warning);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, var(--mor-warning) 40%, transparent);
+}
+/* FX (adjustment) lane — a distinct violet so it reads apart from V2/T. */
+.mr-lane-fx { height: 30px; }
+.mr-lane-tag.fx { background: linear-gradient(180deg, #b9a6ff, #8f7bf0); }
+.mr-lane-item.fx {
+  border-color: color-mix(in srgb, #8f7bf0 60%, transparent);
+  background: linear-gradient(180deg, color-mix(in srgb, #8f7bf0 34%, transparent), color-mix(in srgb, #8f7bf0 15%, transparent));
+}
+.mr-lane-item.fx.selected {
+  border-color: #8f7bf0;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, #8f7bf0 45%, transparent);
+}
+
+.mr-lane-item.marked, .mr-clip.marked {
+  outline: 2px dashed var(--mor-accent-hover); outline-offset: 1px;
+}
+/* FCP-style Disable: dimmed on the timeline, still occupies its span. */
+.mr-clip.disabled, .mr-lane-item.disabled {
+  opacity: 0.38;
+  filter: grayscale(0.9);
+}
+.mr-clip.disabled.selected {
+  border-color: #8a8690;
+  box-shadow: 0 0 0 1px color-mix(in srgb, #8a8690 40%, transparent);
+}
+/* FCP-style Solo: yellow outline on soloed items; non-soloed go B&W when any solo is on. */
+.mr-clip.solo, .mr-lane-item.solo {
+  outline: 2px solid #f0c419;
+  outline-offset: 0;
+  z-index: 3;
+}
+.mr-timeline.soloing .mr-clip:not(.solo):not(.disabled),
+.mr-timeline.soloing .mr-lane-item:not(.solo):not(.disabled) {
+  filter: grayscale(1);
+  opacity: 0.72;
+}
+.mr-group-dot {
+  position: absolute; right: 5px; top: 6px; z-index: 3;
+  width: 7px; height: 7px; border-radius: 50%;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.7), 0 0 6px color-mix(in srgb, currentColor 40%, transparent);
+  pointer-events: none;
+}
+
+/* V1 story lane: filmstrip clips (iMovie) on a quiet bed. */
+.mr-clips {
+  position: relative; display: flex; margin-bottom: 6px;
+  min-height: 40px;
+  align-items: stretch;
+  background: color-mix(in srgb, #1a1a22 80%, transparent);
+  border-radius: 6px;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.28);
+}
+.mr-clip {
+  position: relative; flex: none; box-sizing: border-box; overflow: hidden;
+  cursor: grab; border: 2px solid transparent; border-radius: 5px;
+  /* No padding — the film fills edge-to-edge like iMovie. */
+  background: #0c0c10;
+  display: flex; flex-direction: column;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition: border-color 0.14s ease, box-shadow 0.18s ease, filter 0.15s ease;
+}
+.mr-clip:hover {
+  border-color: color-mix(in srgb, #f0c419 55%, transparent);
+  filter: brightness(1.04);
+}
+/* iMovie yellow selection ring — the filmstrip's strongest cue. */
+.mr-clip.selected {
+  border-color: #f0c419;
+  z-index: 2;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, #f0c419 40%, transparent),
+    0 0 12px color-mix(in srgb, #f0c419 35%, transparent);
+}
+/* Poster tiled across the span = filmstrip of frames. Height set inline
+   from Clip Appearance (film/wave modes + clip height slider). */
+.mr-clip-film {
+  position: relative; width: 100%; height: 72px; flex: 1 1 auto;
+  min-height: 0;
+  background-color: #000;
+  /* Vertical hairlines between tiles when the poster repeats. */
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.55);
+}
+.mr-clip-film.mr-clip-labels {
+  background: linear-gradient(180deg, #1c1c26, #12121a);
+  display: flex; align-items: center;
+}
+.mr-clip-film.mr-clip-labels .mr-clip-name {
+  position: static; background: none; padding: 0 6px;
+  width: 100%;
+}
+.mr-clip-film.mr-thumb-missing {
+  background:
+    repeating-linear-gradient(
+      90deg,
+      #121218 0 54px,
+      #0a0a0e 54px 56px
+    );
+}
+.mr-clip img { display: none; } /* legacy; film uses background-image */
+/* Clip's own audio under the picture — blue strip, drag to set gain.
+   Height set inline from Clip Appearance. */
+.mr-clip-wave {
+  position: relative; height: 22px; flex: none;
+  cursor: ns-resize;
+  /* Waveform URI is painted via inline style; this is the iMovie blue bed. */
+  background-color: #1a3a5c;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #7ec8ff 25%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, #2a6a9a 55%, transparent);
+}
+.mr-clip-wave .mr-clip-name {
+  z-index: 2;
+}
+.mr-clip-name-solo {
+  position: absolute; inset: 0; z-index: 2;
+  display: flex; align-items: center; padding: 0 6px;
+  background: linear-gradient(transparent, rgba(0,0,0,0.55));
+}
+/* Diagonal hatch sits above the wave image so the strip always reads as volume. */
+.mr-clip-wave::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 1;
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 3px,
+    color-mix(in srgb, #4a9fe0 22%, transparent) 3px,
+    color-mix(in srgb, #4a9fe0 22%, transparent) 6px
+  );
+}
+.mr-clip-wave:hover {
+  filter: brightness(1.08);
+}
+.mr-clip-wave .mr-vol-line {
+  z-index: 2;
+  opacity: 0.55;
+  background: #e8f4ff;
+  box-shadow: 0 0 4px color-mix(in srgb, #7ec8ff 70%, transparent);
+}
+.mr-clip-wave:hover .mr-vol-line { opacity: 0.95; }
+.mr-xtrans {
+  position: absolute; top: 4px; right: 4px; z-index: 3;
+  font-size: 8px; line-height: 12px; padding: 0 4px; border-radius: 3px;
+  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
+  color: #141417; letter-spacing: -1px; pointer-events: none;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+/* Name sits on the film as a bottom fade label. */
+.mr-clip-name {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 1;
+  padding: 10px 5px 2px;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 10px; color: #f2f0ea;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.72));
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+}
+/* Duration pill — top-left on the film, iMovie "1.5h" / "4.0s".
+   On T/V2 lane cards it sits inside the left padding so the name still reads. */
+.mr-clip-dur {
+  position: absolute; top: 5px; left: 5px; transform: none;
+  z-index: 3; pointer-events: none;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
+  color: #fff; padding: 1px 6px; border-radius: 4px;
+  background: rgba(0, 0, 0, 0.62);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  white-space: nowrap;
+}
+.mr-lane-item .mr-clip-dur {
+  top: 2px; left: 11px; font-size: 9px; padding: 0 4px; line-height: 16px;
+}
+.mr-clip.selected .mr-clip-dur,
+.mr-lane-item.selected .mr-clip-dur {
+  background: color-mix(in srgb, #f0c419 88%, #8a6a00);
+  color: #1a1400;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+}
+.mr-lane-item.title.selected .mr-clip-dur {
+  background: color-mix(in srgb, var(--mor-warning) 88%, #8a6a00);
+}
+
+.mr-marker {
+  position: absolute; top: 18px; bottom: 0; width: 1px;
+  background: color-mix(in srgb, var(--mor-warning) 70%, transparent);
+  pointer-events: none; z-index: 1;
+}
+.mr-marker::before {
+  content: ""; position: absolute; top: -6px; left: -3px;
+  border: 3px solid transparent; border-top: 5px solid var(--mor-warning);
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--mor-warning) 50%, transparent));
+}
+
+.mr-playhead {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  background: var(--mor-destructive);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--mor-destructive) 65%, transparent);
+  pointer-events: none;
+}
+/* Diamond cap — a tiny retro-UI gem on the playhead. */
+.mr-playhead::before {
+  content: ""; position: absolute; top: 1px; left: -4px;
+  width: 10px; height: 10px;
+  background: linear-gradient(145deg, #ff8a8e, var(--mor-destructive) 50%, #9a2024);
+  border: 1px solid color-mix(in srgb, white 25%, var(--mor-destructive));
+  border-radius: 1px;
+  transform: rotate(45deg);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-destructive) 55%, transparent);
+}
+.mr-ph-badge {
+  position: absolute; top: 0; left: 10px; padding: 0 5px; border-radius: 3px;
+  background: linear-gradient(180deg, #f06a6e, var(--mor-destructive));
+  color: #fff; font-size: 9px; line-height: 14px; white-space: nowrap;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+}
+
+.mr-ctx-backdrop { position: fixed; inset: 0; z-index: 400; }
+.mr-ctx {
+  display: block; position: fixed; margin: 0; width: 228px; z-index: 401;
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 28%, var(--mor-border)) !important;
+  background: var(--mor-glass) !important;
+  backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.3);
+  -webkit-backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.3);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5), var(--mor-highlight), 0 0 0 1px rgba(0, 0, 0, 0.3) !important;
+}
+.mr-ctx-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 10px 7px;
+  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 20%, var(--mor-border-light));
+  margin-bottom: 4px;
+}
+.mr-ctx-tag {
+  flex: none; font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px;
+  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
+  color: #141417;
+}
+.mr-ctx-tag.audio { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
+.mr-ctx-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
+.mr-ctx-name {
+  font-size: 11px; color: var(--mor-text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mr-ctx .mor-menu-action.mr-danger { color: var(--mor-destructive); }
+.mr-ctx .mor-menu-action.mr-danger:hover:not(:disabled) {
+  background-color: var(--mor-destructive); color: #fff;
+}
+
+.mr-zoom { display: inline-flex; gap: 4px; align-items: center; }
+.mr-zoom button {
+  background: none; border: none; color: var(--mor-text-muted);
+  font-size: 14px; line-height: 1; padding: 0 2px; cursor: pointer;
+  transition: color 0.15s ease, transform 0.12s ease;
+}
+.mr-zoom button:hover { color: var(--mor-accent-hover); transform: scale(1.12); }
+.mr-zoom-slider { width: 90px; accent-color: var(--mor-accent); }
+.mr-appear-btn.on { color: var(--mor-accent); }
+
+/* FCP-style Clip Appearance popover over the timeline. */
+.mr-appear-pop {
+  position: absolute; top: 8px; right: 12px; z-index: 40;
+  width: 280px; padding: 12px 12px 10px;
+  background: color-mix(in srgb, #1a1a22 96%, black);
+  border: 1px solid color-mix(in srgb, white 12%, transparent);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(0,0,0,0.3);
+  display: flex; flex-direction: column; gap: 10px;
+}
+.mr-appear-row {
+  display: flex; align-items: center; gap: 8px;
+}
+.mr-appear-label { font-size: 13px; opacity: 0.85; width: 1.4em; text-align: center; }
+.mr-appear-zoom { flex: 1; accent-color: var(--mor-accent); min-width: 0; }
+.mr-appear-icon-btn {
+  background: none; border: none; color: var(--mor-text-muted); cursor: pointer;
+  font-size: 14px; padding: 2px 4px;
+}
+.mr-appear-icon-btn:hover { color: var(--mor-accent); }
+.mr-appear-modes {
+  display: flex; gap: 4px; justify-content: space-between;
+}
+.mr-appear-mode {
+  flex: 1; min-width: 0; height: 36px; padding: 0 2px;
+  border: 1px solid color-mix(in srgb, white 12%, transparent);
+  border-radius: 6px; background: #121218; color: #c8c4ce;
+  font-size: 11px; letter-spacing: -0.5px; cursor: pointer;
+  font-family: ui-monospace, monospace;
+}
+.mr-appear-mode:hover { border-color: var(--mor-accent); color: #fff; }
+.mr-appear-mode.on {
+  border-color: var(--mor-accent);
+  background: color-mix(in srgb, var(--mor-accent) 22%, #121218);
+  color: #fff;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mor-accent) 40%, transparent);
+}
+.mr-appear-check {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--mor-text-muted); cursor: pointer; user-select: none;
+}
+.mr-appear-check input { accent-color: var(--mor-accent); }
+.mr-appear-close {
+  align-self: flex-end; margin-top: 2px;
+  background: color-mix(in srgb, var(--mor-accent) 25%, transparent);
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 50%, transparent);
+  color: #fff; border-radius: 6px; padding: 4px 12px; font-size: 12px; cursor: pointer;
+}
+.mr-appear-close:hover { background: color-mix(in srgb, var(--mor-accent) 40%, transparent); }
+
+.mr-tabs {
+  display: flex; gap: 2px;
+  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
+}
+.mr-tab {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--mor-text-muted); font-size: 12px; padding: 5px 14px; cursor: pointer;
+  transition: color 0.15s ease, border-color 0.18s ease, text-shadow 0.18s ease;
+}
+.mr-tab:hover { color: var(--mor-text); }
+.mr-tab.active {
+  color: var(--mor-accent-hover);
+  border-bottom-color: var(--mor-accent);
+  text-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 35%, transparent);
+}
+
+.mr-fx-cat {
+  margin: 4px 0 0; font-size: 10px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--mor-text-muted) 85%, var(--mor-accent));
+}
+.mr-fx-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; }
+.mr-fx-tile {
+  padding: 3px; border: 2px solid transparent; border-radius: 7px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-btn) 90%, white), var(--mor-btn));
+  cursor: pointer; display: flex; flex-direction: column; gap: 2px; align-items: center;
+  color: var(--mor-text); font-size: 10px;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
+  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.15s ease, filter 0.15s ease;
+}
+.mr-fx-tile:hover {
+  border-color: var(--mor-border-light);
+  transform: translateY(-2px);
+  filter: brightness(1.06);
+}
+.mr-fx-tile.active {
+  border-color: var(--mor-accent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 35%, transparent);
+}
+.mr-fx-tile img, .mr-fx-ph {
+  width: 100%; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 4px;
+  background: #000; display: block;
+}
+.mr-fx-tile span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* iMovie-inspired title style browser — mock look on black tiles. */
+.mr-title-gallery {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
+  gap: 8px; margin: 6px 0 12px;
+}
+.mr-title-tile {
+  padding: 3px; border: 2px solid transparent; border-radius: 7px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-btn) 90%, white), var(--mor-btn));
+  cursor: pointer; display: flex; flex-direction: column; gap: 3px; align-items: stretch;
+  color: var(--mor-text); font-size: 10px;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
+  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.15s ease, filter 0.15s ease;
+}
+.mr-title-tile:hover:not(:disabled) {
+  border-color: var(--mor-border-light);
+  transform: translateY(-2px);
+  filter: brightness(1.06);
+}
+.mr-title-tile:disabled { opacity: 0.45; cursor: not-allowed; }
+.mr-title-preview {
+  aspect-ratio: 16 / 10; border-radius: 4px; background: #0a0a0c;
+  display: flex; align-items: var(--mr-ts-seat, center); justify-content: center;
+  padding: 6px 4px; box-sizing: border-box; overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+.mr-title-preview span {
+  color: var(--mr-ts-color, #fff);
+  background: var(--mr-ts-bg, transparent);
+  text-shadow: var(--mr-ts-shadow, none);
+  font-size: var(--mr-ts-size, 12px);
+  font-weight: 700; letter-spacing: 0.04em; text-align: center;
+  line-height: 1.15; padding: 2px 4px; border-radius: 2px;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mr-title-tile-name {
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  text-align: center; color: var(--mor-text-muted);
+}
+
+/* Format bar under the phone — the knobs you hit while looking at the words. */
+.mr-format-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  margin: 6px 0 4px; padding: 6px 8px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 92%, white), var(--mor-panel));
+  border: 1px solid var(--mor-border);
+  border-radius: 8px;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
+}
+.mr-format-select {
+  max-width: 110px; min-width: 72px;
+  background: var(--mor-btn); color: var(--mor-text);
+  border: 1px solid var(--mor-border); border-radius: 5px;
+  padding: 3px 6px; font-size: 11px;
+}
+.mr-format-step { min-width: 28px; padding: 2px 6px !important; font-size: 12px !important; }
+.mr-format-size {
+  min-width: 28px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;
+  color: var(--mor-text-muted);
+}
+.mr-format-sep {
+  width: 1px; align-self: stretch; margin: 2px 3px;
+  background: color-mix(in srgb, var(--mor-border) 80%, transparent);
+}
+.mr-format-swatch {
+  width: 18px; height: 18px; border-radius: 50%; border: 2px solid transparent;
+  padding: 0; cursor: pointer;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+.mr-format-swatch.active {
+  border-color: var(--mor-accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mor-accent) 50%, transparent);
+}
+.mr-format-pos { font-size: 10px !important; padding: 2px 6px !important; }
+.mr-format-reset { margin-left: auto; font-size: 11px !important; }
+
+/* On-monitor title seat — drag the words like iMovie. */
+.mr-title-handle-layer {
+  position: absolute; inset: 0; z-index: 4;
+}
+/* iMovie-style text selection box on the monitor — light rim + corner ticks. */
+.mr-title-box {
+  position: absolute; left: 6%; right: 6%;
+  border: 1.5px solid rgba(255, 255, 255, 0.92);
+  border-radius: 2px;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.35),
+    0 0 10px rgba(0, 0, 0, 0.25);
+  cursor: grab;
+  pointer-events: auto;
+  box-sizing: border-box;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 18px;
+  background: color-mix(in srgb, white 6%, transparent);
+  transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+}
+.mr-title-box::before,
+.mr-title-box::after {
+  content: ""; position: absolute; width: 8px; height: 8px;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+.mr-title-box::before { top: -2px; left: -2px; border-right: none; border-bottom: none; }
+.mr-title-box::after { bottom: -2px; right: -2px; border-left: none; border-top: none; }
+.mr-title-box:hover {
+  background: color-mix(in srgb, white 12%, transparent);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.4),
+    0 0 14px rgba(255, 255, 255, 0.18);
+}
+.mr-title-box.dragging {
+  cursor: grabbing;
+  border-color: #fff;
+  background: color-mix(in srgb, white 14%, transparent);
+}
+.mr-title-ghost {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.03em;
+  text-align: center; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.85);
+  padding: 0 4px; pointer-events: none;
+}
+
+.mr-export-dialog { display: flex; flex-direction: column; gap: 10px; min-width: 320px; }
+.mr-export-blurb { margin: -4px 0 2px; font-size: 12px; }
+
+/* Keyframe diamond sits at the right end of an animatable Transform row. */
+.mr-xf-row { display: flex; align-items: center; gap: 6px; }
+.mr-xf-row .mor-slider-shell { flex: 1; min-width: 0; }
+.mr-kf-diamond {
+  flex: 0 0 auto; margin-top: 14px; width: 20px; height: 20px; padding: 0;
+  border: none; background: none; cursor: pointer; line-height: 1;
+  font-size: 13px; color: var(--mor-text-muted);
+  transition: color 0.15s ease, transform 0.15s ease, text-shadow 0.18s ease;
+}
+.mr-kf-diamond:hover { color: var(--mor-accent); transform: scale(1.15); }
+.mr-kf-diamond.on {
+  color: var(--mor-accent);
+  text-shadow: 0 0 7px color-mix(in srgb, var(--mor-accent) 55%, transparent);
+}
+/* Velocity chip — only shown when a key sits at the playhead. */
+.mr-kf-ease {
+  flex: 0 0 auto; margin-top: 14px; padding: 1px 5px; height: 18px;
+  border: 1px solid color-mix(in srgb, var(--mor-accent) 45%, transparent);
+  border-radius: 4px; background: none; cursor: pointer; line-height: 1;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
+  color: var(--mor-accent); transition: background 0.15s ease;
+}
+.mr-kf-ease:hover { background: color-mix(in srgb, var(--mor-accent) 18%, transparent); }
+.mr-export-dialog .mr-toolbar { justify-content: flex-end; margin-top: 4px; }
+.mr-settings-dialog { display: flex; flex-direction: column; gap: 12px; min-width: 360px; }
+.mr-settings-note { margin: -4px 0 2px; font-size: 12px; }
+.mr-settings-dialog .mr-toolbar { justify-content: flex-end; margin-top: 4px; }
+.mr-keys-dialog { display: flex; flex-direction: column; gap: 8px; min-width: 340px; }
+.mr-keys-opt { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.mr-keys-name { font-weight: 600; }
+.mr-keys-dialog .mr-toolbar { justify-content: flex-end; margin-top: 6px; }
+
+.mr-hub { display: flex; flex-direction: column; gap: 10px; min-width: 460px; max-width: 560px; }
+.mr-giphy-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-height: 420px; overflow-y: auto; padding: 2px; }
+.mr-giphy-thumb { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; cursor: pointer; background: var(--mor-surface-2, #2a2a33); border: 1px solid var(--mor-border, #333); }
+.mr-giphy-thumb:hover { border-color: var(--mor-accent, #b98cff); }
+.mr-hub-row { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--mor-border, #333); border-radius: 8px; }
+.mr-hub-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.mr-hub-name { font-weight: 600; }
+.mr-hub-kind { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; padding: 1px 6px; border-radius: 6px; background: var(--mor-surface-2, #2a2a33); }
+.mr-hub-kind-mcp { color: var(--mor-accent, #b98cff); }
+.mr-hub-kind-agent { color: #f0a860; }
+.mr-hub-kind-bundle { color: #5fd0c0; }
+.mr-hub-desc { margin: 0; }
+.mr-hub-repo { font-family: monospace; font-size: 11px; opacity: 0.7; }
+.mr-hub-actions { display: flex; gap: 8px; margin-top: 4px; }
+.mr-hub .mr-toolbar { justify-content: flex-end; margin-top: 6px; }
+
+.mr-shortcut-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.mr-shortcut-table td { padding: 4px 10px 4px 0; }
+.mr-key { color: var(--mor-accent-hover); white-space: nowrap; }
+
+@media (max-width: 700px) {
+  .mr-work { flex-direction: column; }
+  .mr-phone { flex: none; width: auto; height: 45vh; }
+  .mr-inspector { min-width: 0; }
+  .mr-inspector.mr-float-panel {
+    max-width: calc(100vw - 16px);
+    max-height: min(60vh, 520px);
+  }
+  .mr-add-grid { grid-template-columns: 1fr; }
+  .mr-insp-reopen {
+    writing-mode: horizontal-tb; align-self: stretch;
+    padding: 8px 12px;
+  }
+}
+
+.mr-root button:focus-visible,
+.mr-root input:focus-visible,
+.mr-fx-tile:focus-visible,
+.mr-tab:focus-visible,
+.mr-panel-btn:focus-visible,
+.mr-add-card:focus-visible,
+.mr-insp-reopen:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--mor-accent-hover) 70%, transparent);
+  outline-offset: 2px;
+  box-shadow: var(--mor-focus-glow);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mr-clip, .mr-lane-item, .mr-fx-tile, .mr-root .mor-btn, .mr-add-card,
+  .mr-progress > div, .mr-deck, .mr-tab, .mr-phone, .mr-xf-h, .mr-panel-btn,
+  .mr-float-grip-ne, .mr-float-grip-nw, .mr-float-grip-se, .mr-float-grip-sw {
+    transition: none !important; animation: none !important;
+  }
+  .mr-drop, .mr-deck.playing, .mr-progress > div, .mr-float-panel { animation: none !important; }
+  .mr-text-row { transition: none !important; }
+  .mr-root .mor-btn:hover:not(:disabled),
+  .mr-fx-tile:hover, .mr-add-card:hover:not(:disabled),
+  .mr-text-row:hover { transform: none; }
+}

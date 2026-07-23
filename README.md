@@ -76,9 +76,21 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
   the two clips it joins, so the reel gets shorter by exactly its length and
   everything downstream moves with it — and scrubbing one shows the blend, not
   a cut, because the monitor composites it the same way the export does.
-- **V2 overlay track** — B-roll cutaways with their own speed and transform;
+- **Multi-track timeline** — stack as many picture, text and audio layers as a
+  reel needs:
+  - **V2…V7** free-timed overlay tracks (video or photo) over magnetic **V1**.
+    Higher numbers composite on top — full-frame B-roll, PiP stickers, light
+    leaks, or image-over-video at the same time. Drop files onto a lane or use
+    **Insert › Add video track**. Right-click **Move track up/down**.
+  - **T1…T4** text tracks above the picture (titles, lower-thirds, shapes).
+    Stack multiple captions; higher track wins. **Insert › Add text track**.
+  - **A1…A6** audio beds under V1 (music, VO, SFX…) with mixer strips that grow
+    as you add tracks. **Insert › Add audio track**.
+  Preview composites every active layer in the same order as export, so what
+  you scrub is what you ship. Older `.morreel` projects open as V2 + T1 + A1/A2.
+- **V2+ overlays** — B-roll cutaways with their own speed and transform;
   main audio keeps playing underneath.
-- **T text track** — drawtext-rasterized text cards on a transparent canvas.
+- **T text tracks** — drawtext-rasterized text cards on a transparent canvas.
   Any installed font (not three generics), line-up, `\n` for manual breaks,
   and a **slide-on entrance** — the card is composited with `overlay`, whose
   x/y take time expressions, so it carries on and off with the fade. Styles

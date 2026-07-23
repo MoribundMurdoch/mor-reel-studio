@@ -414,11 +414,7 @@ mod tests {
     fn one_clip_snapshot() -> Snapshot {
         Snapshot {
             clips: vec![clip()],
-            overlays: vec![],
-            audios: vec![],
-            titles: vec![],
-            markers: vec![],
-            mixer: Mixer::default(),
+            ..Default::default()
         }
     }
 

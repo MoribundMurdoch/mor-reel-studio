@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // MorReel Studio — portrait-only (9:16) video editor.
 // V1: main clip track (trim/reorder/split, ripple by construction).
-// V2: full-frame cutaway overlays. A1: audio mixed under. Effects per video item.
+// V2..Vn: free-timed overlay tracks (video/photo), higher number on top.
+// T1..Tn: text/shape tracks above picture. A1..An: audio beds under V1.
+// FX: adjustment layers between picture and text.
 
 mod bevel;
 mod coords;
 mod engine;
+mod giphy;
 mod hub;
 mod keyframe;
 mod plugin;
@@ -107,2387 +110,8 @@ fn main() {
     dioxus::LaunchBuilder::desktop().with_cfg(cfg).launch(App);
 }
 
-/// Named looks — (category, name, ffmpeg filter snippet), applied identically
-/// to preview frames and export so preview = export. "Motion" ports moranima's
-/// BgMotion camera moves (Zoom/Drift/Sway) with the same phase math
-/// (ph = 0.1π·t, so 2ph ≈ 0.628t) translated to ffmpeg time-expressions.
-// ponytail: moranima's particle overlays (fireflies/snow/embers) need a second
-// video input; the per-clip effect slot is one linear chain, so they wait
-// until effects can be filter_complex branches. Tilt (animated perspective)
-// has no per-frame ffmpeg equivalent — Sway covers the feel.
-const EFFECTS: &[(&str, &str, &str)] = &[
-    ("Color", "None", ""),
-    ("Color", "B&W", "hue=s=0"),
-    ("Color", "Sepia", "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131"),
-    ("Color", "Warm", "colortemperature=4500"),
-    ("Color", "Cool", "colortemperature=8500"),
-    ("Color", "Punch", "eq=contrast=1.18:saturation=1.45"),
-    ("Color", "Noir", "hue=s=0,eq=contrast=1.5:brightness=-0.02"),
-    ("Color", "Negative", "negate"),
-    ("Color", "X-Ray", "negate,hue=s=0,eq=contrast=1.3"),
-    ("Color", "Matrix", "colorchannelmixer=0.3:0.6:0.1:0:0.25:0.7:0.05:0:0.2:0.5:0.1,eq=contrast=1.2"),
-    ("Look", "Dreamy", "gblur=sigma=2,eq=brightness=0.04:saturation=1.15"),
-    ("Look", "Vignette", "vignette"),
-    ("Look", "Vintage", "curves=preset=vintage"),
-    ("Look", "Cross process", "curves=preset=cross_process"),
-    ("Look", "Faded", "curves=preset=lighter,eq=saturation=0.82"),
-    ("Look", "Golden hour", "colortemperature=3800,eq=saturation=1.2:brightness=0.02"),
-    ("Look", "Blockbuster", "colorbalance=rs=.12:gs=.02:bs=-.12:rh=-.06:bh=.12,eq=saturation=1.15"),
-    ("Look", "Bleach bypass", "eq=saturation=0.35:contrast=1.35:brightness=0.02"),
-    ("Look", "Film grain", "noise=alls=18:allf=t"),
-    ("Look", "Ink", "edgedetect=mode=colormix:high=0"),
-    // Keyed on input time, not on zoompan's own `zoom` accumulator. With d=1
-    // (one output frame per input frame) that accumulator resets every frame
-    // instead of compounding, so `min(zoom+0.0006,1.25)` pinned this at a flat
-    // 1.005x — it never actually zoomed, in the preview or the export. Against
-    // input time it ramps as advertised: 0.0006 per frame at 30 fps is 0.018
-    // per second, reaching the 1.25 cap in about 14 s.
-    ("Motion", "Slow zoom", "zoompan=z='min(1+0.018*it,1.25)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1"),
-    // moranima Zoom: z = 1 + 0.12·(0.5+0.5·sin(2ph)), and 2ph = 0.628t
-    ("Motion", "Pulse zoom", "zoompan=z='1.06+0.06*sin(0.628*it)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1"),
-    // moranima Drift: 1.12× overscan, window slides ±0.05w / ±0.03h on offset sines
-    ("Motion", "Drift", "scale=1210:2150,crop=1080:1920:x='65+54*sin(0.628*t)':y='115+58*cos(0.408*t)',setsar=1"),
-    // moranima Sway: 1.1× overscan hides the corners of a ±0.035 rad rock
-    ("Motion", "Sway", "scale=1188:2112,rotate=0.035*sin(0.628*t):ow=1080:oh=1920,setsar=1"),
-    // Keyers — produce alpha, so on a V2 overlay V1 shows through the keyed area,
-    // and on a V1 clip the frame background does. chromakey works in YUV; colorkey/
-    // lumakey need rgba first. The Effect-strength slider drives the key tolerance
-    // (see effect_filter_amt), moranima's background-removal sensitivity analog.
-    ("Key", "Green screen", "chromakey=0x00d400:0.13:0.07"),
-    ("Key", "Blue screen", "chromakey=0x2b6fdf:0.13:0.07"),
-    // Drop black/white suit particle & light-leak plates shot on a flat backdrop.
-    ("Key", "Drop black", "format=rgba,colorkey=0x000000:0.16:0.10"),
-    ("Key", "Drop white", "format=rgba,colorkey=0xffffff:0.16:0.10"),
-    ("Key", "Luma key", "format=rgba,lumakey=threshold=0.18:tolerance=0.12"),
-];
-
-/// Compositing blend modes for a V2 image/particle layer — the moranima look for
-/// light leaks and glowing particles, which brighten V1 rather than cover it.
-/// (label, ffmpeg `blend=all_mode` value); "Normal" is the default alpha-over.
-const BLEND_MODES: &[(&str, &str)] = &[
-    ("Normal", ""),
-    ("Screen", "screen"),
-    ("Add", "addition"),
-    ("Lighten", "lighten"),
-    ("Multiply", "multiply"),
-    ("Overlay", "overlay"),
-];
-
-/// Effects contributed by installed+enabled `bundle` plugins from the hub, held in
-/// a process-global the free effect functions can read (they aren't in the reactive
-/// scope). Set once at startup and re-set when the Plugin Hub changes a bundle.
-/// ponytail: a global `RwLock<Vec>`, not a signal — the lookup is a free fn; the
-/// UI bumps a `hub_gen` signal separately to re-render the picker.
-static HUB_EFFECTS: std::sync::OnceLock<std::sync::RwLock<Vec<(String, String, String)>>> = std::sync::OnceLock::new();
-
-fn hub_effects() -> &'static std::sync::RwLock<Vec<(String, String, String)>> {
-    HUB_EFFECTS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
-}
-
-/// Replace the active hub bundle effects (called after a hub install/enable).
-fn set_hub_effects(effects: Vec<(String, String, String)>) {
-    *hub_effects().write().unwrap() = effects;
-}
-
-/// Built-in effects plus every active hub bundle effect — what the picker lists.
-/// A bundle name that collides with a built-in loses (built-ins win the lookup).
-fn all_effects() -> Vec<(String, String, String)> {
-    let mut v: Vec<_> = EFFECTS.iter().map(|(c, n, f)| (c.to_string(), n.to_string(), f.to_string())).collect();
-    for e in hub_effects().read().unwrap().iter() {
-        if !v.iter().any(|(_, n, _)| n == &e.1) {
-            v.push(e.clone());
-        }
-    }
-    v
-}
-
-/// Whether `name` is a keyer (the "Key" family) — used for the Effects tab's
-/// done-tick and to keep keyers out of the Style look palette.
-fn is_keyer(name: &str) -> bool {
-    EFFECTS.iter().any(|(cat, n, _)| *cat == "Key" && *n == name)
-}
-
-/// The ffmpeg snippet for a named effect: built-ins first, then hub bundle effects.
-/// Returns `String` (not `&'static str`) because a hub effect is owned at runtime.
-fn effect_filter(name: &str) -> String {
-    if let Some((_, _, f)) = EFFECTS.iter().find(|(_, n, _)| *n == name) {
-        return f.to_string();
-    }
-    hub_effects().read().unwrap().iter().find(|(_, n, _)| n == name).map(|(_, _, f)| f.clone()).unwrap_or_default()
-}
-
-/// Effect at strength `a` (0..=1): parameters interpolate from identity to the
-/// full look, so a=1 is exactly the EFFECTS table and a=0 is no filter. Motion
-/// amounts scale amplitude, matching moranima's `amount` semantics.
-fn effect_filter_amt(name: &str, a: f64) -> String {
-    let a = a.clamp(0.0, 1.0);
-    let full = effect_filter(name);
-    if full.is_empty() || a <= 0.001 {
-        return String::new();
-    }
-    if a >= 0.999 {
-        return full.to_string(); // byte-identical to the table at full strength
-    }
-    match name {
-        "B&W" => format!("hue=s={:.3}", 1.0 - a),
-        // sepia matrix lerped toward identity
-        "Sepia" => format!(
-            "colorchannelmixer={:.3}:{:.3}:{:.3}:0:{:.3}:{:.3}:{:.3}:0:{:.3}:{:.3}:{:.3}",
-            1.0 - 0.607 * a, 0.769 * a, 0.189 * a,
-            0.349 * a, 1.0 - 0.314 * a, 0.168 * a,
-            0.272 * a, 0.534 * a, 1.0 - 0.869 * a
-        ),
-        "Warm" => format!("colortemperature={:.0}", 6500.0 - 2000.0 * a),
-        "Cool" => format!("colortemperature={:.0}", 6500.0 + 2000.0 * a),
-        "Punch" => format!("eq=contrast={:.3}:saturation={:.3}", 1.0 + 0.18 * a, 1.0 + 0.45 * a),
-        "Noir" => format!("hue=s={:.3},eq=contrast={:.3}:brightness={:.3}", 1.0 - a, 1.0 + 0.5 * a, -0.02 * a),
-        "Golden hour" => format!("colortemperature={:.0},eq=saturation={:.3}:brightness={:.3}", 6500.0 - 2700.0 * a, 1.0 + 0.2 * a, 0.02 * a),
-        "Blockbuster" => format!("colorbalance=rs={:.3}:gs={:.3}:bs={:.3}:rh={:.3}:bh={:.3},eq=saturation={:.3}", 0.12 * a, 0.02 * a, -0.12 * a, -0.06 * a, 0.12 * a, 1.0 + 0.15 * a),
-        "Bleach bypass" => format!("eq=saturation={:.3}:contrast={:.3}:brightness={:.3}", 1.0 - 0.65 * a, 1.0 + 0.35 * a, 0.02 * a),
-        "Film grain" => format!("noise=alls={:.0}:allf=t", 18.0 * a),
-        "Dreamy" => format!(
-            "gblur=sigma={:.2},eq=brightness={:.3}:saturation={:.3}",
-            2.0 * a, 0.04 * a, 1.0 + 0.15 * a
-        ),
-        "Vignette" => format!("vignette=angle={:.4}", 0.6283 * a), // PI/5 at full
-        "Slow zoom" => format!(
-            "zoompan=z='min(1+{:.4}*it,{:.3})':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1",
-            0.018 * a, 1.0 + 0.25 * a
-        ),
-        "Pulse zoom" => format!(
-            "zoompan=z='{:.3}+{:.3}*sin(0.628*it)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1",
-            1.0 + 0.06 * a, 0.06 * a
-        ),
-        "Drift" => format!(
-            "scale=1210:2150,crop=1080:1920:x='65+{:.1}*sin(0.628*t)':y='115+{:.1}*cos(0.408*t)',setsar=1",
-            54.0 * a, 58.0 * a
-        ),
-        "Sway" => format!(
-            "scale=1188:2112,rotate={:.4}*sin(0.628*t):ow=1080:oh=1920,setsar=1",
-            0.035 * a
-        ),
-        // Keyers: strength = how much colour spread the key eats. similarity spans
-        // a tight 0.03 to a loose 0.30; blend trails it so edges stay feathered.
-        "Green screen" => format!("chromakey=0x00d400:{:.3}:{:.3}", 0.03 + 0.27 * a, (0.03 + 0.27 * a) * 0.5),
-        "Blue screen" => format!("chromakey=0x2b6fdf:{:.3}:{:.3}", 0.03 + 0.27 * a, (0.03 + 0.27 * a) * 0.5),
-        "Drop black" => format!("format=rgba,colorkey=0x000000:{:.3}:{:.3}", 0.04 + 0.30 * a, (0.04 + 0.30 * a) * 0.6),
-        "Drop white" => format!("format=rgba,colorkey=0xffffff:{:.3}:{:.3}", 0.04 + 0.30 * a, (0.04 + 0.30 * a) * 0.6),
-        "Luma key" => format!("format=rgba,lumakey=threshold={:.3}:tolerance={:.3}", 0.36 * a, 0.08 + 0.12 * a),
-        _ => full.to_string(),
-    }
-}
-
-const TITLE_COLORS: &[(&str, &str)] = &[
-    ("White", "white"),
-    ("Black", "black"),
-    ("Gold", "#E8C060"),
-    ("Red", "#E5484D"),
-    ("Cyan", "#3DD6D0"),
-];
-
-const TITLE_POS: &[(&str, f64)] = &[("Top", 0.10), ("Middle", 0.45), ("Lower third", 0.72)];
-
-/// How close a free seat must be to a named preset for the format bar to light
-/// that preset up (and for Shift-drag to snap onto it).
-const TITLE_SEAT_SNAP: f64 = 0.05;
-
-/// Bevel styles from the mor_cameo_emboss plugin. The stored value keeps the
-/// cameo/intaglio lineage; the label says what it actually looks like, the way
-/// the designer app words it — "raised" and "sunken" mean something to someone
-/// who has never cut a seal.
-const BEVELS: &[(&str, &str)] = &[
-    ("Off", "Off"),
-    ("Cameo", "Raised — stands off the video"),
-    ("Intaglio", "Sunken — carved into it"),
-];
-
-fn bevel_label(value: &str) -> String {
-    BEVELS.iter().find(|(v, _)| *v == value).map_or("Off", |(_, l)| l).to_string()
-}
-
-fn bevel_value(label: &str) -> String {
-    BEVELS.iter().find(|(_, l)| *l == label).map_or("Off", |(v, _)| v).to_string()
-}
-
-/// How a source fills 9:16 — mostly for landscape imports. Crop covers and
-/// center-crops, Blur fits over a blurred fill, Fit letterboxes on black, Zoom
-/// punches in 1.5× then crops.
-const FRAMINGS: &[&str] = &["Crop", "Blur", "Fit", "Zoom"];
-
-/// One-line explanation of a framing mode, shown under the picker.
-fn framing_hint(name: &str) -> &'static str {
-    match name {
-        "Blur" => "Whole picture over a blurred fill of itself — best for landscape footage.",
-        "Fit" => "Letterboxed on black — nothing cropped, bars top and bottom.",
-        "Zoom" => "Punches in 1.5× then crops — tighter, loses the edges.",
-        _ => "Fills the frame and center-crops — the usual portrait fit.",
-    }
-}
-
-/// What V1 and V2 accept: video and photos on the same lanes, since ffmpeg
-/// loops a still and a Motion effect turns it into a camera move over it.
-fn media_ext() -> Vec<&'static str> {
-    engine::VIDEO_EXT.iter().chain(engine::IMAGE_EXT).copied().collect()
-}
-
-/// Timeline span a freshly imported source takes: a video keeps its whole
-/// length, a still gets a sensible default the Out point can stretch.
-fn initial_out(path: &str, duration: f64) -> f64 {
-    if engine::is_still(path) { engine::STILL_DEFAULT } else { duration }
-}
-
-/// Upload ceilings for a portrait video, shortest first. Going over doesn't
-/// break the export — it just means that platform will reject or truncate it,
-/// which is worth knowing before you render rather than after.
-// ponytail: static table, not a fetched policy — platforms change these rarely
-// and a stale number here is a nudge, not a hard block.
-const LIMITS: &[(&str, f64)] = &[("Shorts", 60.0), ("Reels", 90.0), ("TikTok", 600.0)];
-
-/// Which platforms the reel has outgrown, e.g. "over Shorts 1:00.0". `platform`
-/// narrows the check to a single target ("All platforms" checks every cap).
-/// None while it still fits.
-fn over_limits(total: f64, platform: &str) -> Option<String> {
-    let over: Vec<String> = LIMITS
-        .iter()
-        .filter(|(name, _)| platform == "All platforms" || *name == platform)
-        .filter(|(_, cap)| total > *cap)
-        .map(|(name, cap)| format!("{name} {}", fmt_t(*cap)))
-        .collect();
-    (!over.is_empty()).then(|| format!("over {}", over.join(", ")))
-}
-
-/// Editing-key schemes for people arriving from another NLE. MorReel's command
-/// set is small, so a scheme only remaps the verbs that genuinely differ between
-/// editors — today that's the blade (split at playhead), the muscle memory that
-/// trips people up most, and every editor spells it differently.
-///
-/// Mac Cmd shortcuts are given in their Ctrl form (MorReel is a Linux/Windows
-/// desktop build). Avid (Add Edit = Ctrl+E) is left off because it collides with
-/// Export, and Pro Tools is a DAW — better to omit them than fake a mapping.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum KeyScheme {
-    MorReel,
-    Resolve,
-    Premiere,
-    FinalCut,
-}
-
-impl KeyScheme {
-    const ALL: [KeyScheme; 4] = [Self::MorReel, Self::Resolve, Self::Premiere, Self::FinalCut];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::MorReel => "MorReel (default)",
-            Self::Resolve => "DaVinci Resolve",
-            Self::Premiere => "Adobe Premiere Pro",
-            Self::FinalCut => "Final Cut Pro",
-        }
-    }
-
-    /// Stable token for persistence — never shown, so it can stay terse.
-    fn id(self) -> &'static str {
-        match self {
-            Self::MorReel => "morreel",
-            Self::Resolve => "resolve",
-            Self::Premiere => "premiere",
-            Self::FinalCut => "finalcut",
-        }
-    }
-
-    fn from_id(s: &str) -> Self {
-        Self::ALL.into_iter().find(|k| k.id() == s).unwrap_or(Self::MorReel)
-    }
-
-    /// The split-at-playhead (blade / add-edit) key in this editor's convention.
-    fn split(self) -> &'static str {
-        match self {
-            Self::MorReel => "S",
-            Self::Resolve => "Ctrl+\\",
-            Self::Premiere => "Ctrl+K",
-            Self::FinalCut => "Ctrl+B",
-        }
-    }
-}
-
-/// The help table's displayed key for a row: the blade row follows the active
-/// scheme; every other row is fixed. Pulled out of the rsx loop because an inline
-/// `if`-expression there parses as a conditional-render node, not a value.
-fn help_key<'a>(keys: &'a str, what: &str, scheme: KeyScheme) -> &'a str {
-    if what == "Split at playhead" {
-        scheme.split()
-    } else {
-        keys
-    }
-}
-
-/// The reel-building phases. The bottom workflow bar switches between them and
-/// the inspector reconfigures to show that phase's tools — the panel is organized
-/// by task, not by whatever was last clicked.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Phase {
-    Add,
-    Cut,
-    Style,
-    Effects,
-    Background,
-    Text,
-    Audio,
-    Export,
-}
-
-/// The timeline's phase-emphasis class: the CSS rules keyed on it dim the lanes
-/// the active phase doesn't touch, spotlighting the ones it does. Add/Export
-/// touch everything, so they emphasize nothing (empty string).
-fn phase_lane_class(p: Phase) -> &'static str {
-    match p {
-        Phase::Cut => "mr-phase-cut",
-        Phase::Style => "mr-phase-style",
-        // Keying/compositing is all about the picture layers → spotlight video.
-        Phase::Effects => "mr-phase-cut",
-        Phase::Text => "mr-phase-text",
-        Phase::Audio => "mr-phase-audio",
-        // Background and Cut/Style are all about the picture → spotlight video.
-        Phase::Background => "mr-phase-cut",
-        Phase::Add | Phase::Export => "",
-    }
-}
-
-/// The phase a selection naturally belongs to — used to auto-jump when you click
-/// an item on the timeline. A clip/overlay stays in Style if you're already there
-/// (so browsing clips while grading doesn't kick you back to Cut); everything
-/// else maps to its own phase, and an empty selection keeps the current phase.
-fn phase_for_selection(sel: Option<Sel>, current: Phase) -> Phase {
-    match sel {
-        Some(Sel::Title(_)) => Phase::Text,
-        Some(Sel::Aud(_)) => Phase::Audio,
-        Some(Sel::Over(_)) | Some(Sel::Main(_)) => {
-            // Style and Effects both edit the picture layers — browsing clips there
-            // shouldn't kick you back to Cut.
-            if current == Phase::Style || current == Phase::Effects {
-                current
-            } else {
-                Phase::Cut
-            }
-        }
-        None => current,
-    }
-}
-
-fn keyscheme_path() -> std::path::PathBuf {
-    engine::config_dir().join("keyscheme")
-}
-
-/// App-wide, not per-project — a keyboard preference belongs to the person, like
-/// the window mode, not to any one reel. Persisted beside the other app config.
-fn load_keyscheme() -> KeyScheme {
-    std::fs::read_to_string(keyscheme_path())
-        .map(|s| KeyScheme::from_id(s.trim()))
-        .unwrap_or(KeyScheme::MorReel)
-}
-
-fn save_keyscheme(k: KeyScheme) {
-    let _ = std::fs::create_dir_all(engine::config_dir());
-    let _ = std::fs::write(keyscheme_path(), k.id());
-}
-
-fn title_color(name: &str) -> &'static str {
-    TITLE_COLORS.iter().find(|(n, _)| *n == name).map_or("white", |(_, c)| c)
-}
-
-fn title_y(name: &str) -> f64 {
-    TITLE_POS.iter().find(|(n, _)| *n == name).map_or(0.45, |(_, y)| *y)
-}
-
-/// Vertical seat for a card: free `y_frac` when the user dragged it, otherwise
-/// the named Top/Middle/Lower-third preset. Matches drawtext's
-/// `y=(h-text_h)*y_frac` (0 = top of free space).
-fn seat_y(t: &TitleItem) -> f64 {
-    t.y_frac.unwrap_or_else(|| title_y(&t.pos)).clamp(0.0, 1.0)
-}
-
-/// Named preset whose seat is within snap distance of `y`, if any.
-fn nearest_title_pos(y: f64) -> Option<&'static str> {
-    TITLE_POS
-        .iter()
-        .filter(|(_, py)| (y - *py).abs() <= TITLE_SEAT_SNAP)
-        .min_by(|a, b| (y - a.1).abs().partial_cmp(&(y - b.1).abs()).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(n, _)| *n)
-}
-
-/// Write a free vertical seat. Snaps onto a named preset when close enough so
-/// the format-bar seat buttons still light up after a careful drag.
-fn set_seat_y(t: &mut TitleItem, y: f64) {
-    let y = y.clamp(0.02, 0.95);
-    if let Some(name) = nearest_title_pos(y) {
-        t.pos = name.to_string();
-        t.y_frac = None; // named seat is enough; keep projects tidy
-    } else {
-        t.y_frac = Some(y);
-        // Leave `pos` as the last named seat for gallery/CSS fallbacks.
-    }
-}
-
-/// Seat the card on a named preset (clears any free drag offset).
-fn set_seat_named(t: &mut TitleItem, name: &str) {
-    t.pos = name.to_string();
-    t.y_frac = None;
-}
-
-/// Whether the format-bar seat button for `name` should show as active.
-fn seat_matches(t: &TitleItem, name: &str) -> bool {
-    (seat_y(t) - title_y(name)).abs() <= TITLE_SEAT_SNAP
-}
-
-/// Greedy word-wrap for caption cards — drawtext has no auto-wrap, so long
-/// transcript segments would run off the 1080px frame.
-fn wrap_caption(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    let mut line = 0;
-    for w in text.split_whitespace() {
-        let wlen = w.chars().count();
-        if line > 0 && line + 1 + wlen > max {
-            out.push('\n');
-            line = 0;
-        } else if line > 0 {
-            out.push(' ');
-            line += 1;
-        }
-        out.push_str(w);
-        line += wlen;
-    }
-    out
-}
-
-/// Split a Whisper segment into short caption chunks of at most `max_words`
-/// words each, sharing the segment's time in proportion to each chunk's word
-/// count. A whole spoken sentence becomes several punchy captions instead of one
-/// wall of text held for five seconds — the phone-editor default.
-fn chunk_caption(start: f64, end: f64, text: &str, max_words: usize) -> Vec<(f64, f64, String)> {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() <= max_words {
-        return vec![(start, end, text.trim().to_string())];
-    }
-    let span = (end - start).max(0.01);
-    let n = words.len();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < n {
-        let j = (i + max_words).min(n);
-        // Time boundaries fall on word fractions, so longer chunks hold longer.
-        let cs = start + span * i as f64 / n as f64;
-        let ce = start + span * j as f64 / n as f64;
-        out.push((cs, ce, words[i..j].join(" ")));
-        i = j;
-    }
-    out
-}
-
-#[test]
-fn chunk_caption_splits_and_conserves_time() {
-    let c = chunk_caption(0.0, 6.0, "one two three four five six", 2);
-    assert_eq!(c.len(), 3);
-    assert_eq!(c[0].2, "one two");
-    assert!((c[0].0 - 0.0).abs() < 1e-9 && (c[2].1 - 6.0).abs() < 1e-9);
-    // Short segments pass through untouched.
-    assert_eq!(chunk_caption(0.0, 2.0, "hi there", 5).len(), 1);
-}
-
-/// Rasterize every card a title is made of — one normally, one per word when
-/// the words come in individually. Content-addressed, so re-rendering after an
-/// edit only pays for the steps that actually changed.
-async fn render_one(t: &TitleItem) -> Result<Vec<String>, String> {
-    let mut cards = Vec::new();
-    for (text, _, _, active) in t.segments() {
-        let png = match active {
-            // Karaoke card: full line, one word highlighted — rendered via libass.
-            Some(w) => engine::render_karaoke(&t.style_of(&text), w, title_color(&t.karaoke_color)).await?,
-            None => engine::render_title(&t.style_of(&text)).await?,
-        };
-        cards.push(png);
-    }
-    Ok(cards)
-}
-
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct TitleItem {
-    text: String,
-    at: f64,
-    dur: f64,
-    font_size: f64,
-    color: String,
-    /// Named vertical seat: "Top" | "Middle" | "Lower third". Used when
-    /// `y_frac` is unset; still updated to the nearest named seat after a drag
-    /// so style galleries and old UI paths keep making sense.
-    pos: String,
-    /// Free vertical seat as a fraction of free space (0 = top), set by
-    /// dragging the title on the monitor. `None` = use the named `pos` preset.
-    /// Older projects load with None and look exactly as before.
-    #[serde(default)]
-    y_frac: Option<f64>,
-    bevel: String,
-    bevel_size: f64,
-    /// Any installed fontconfig family.
-    font: String,
-    /// How multiple lines line up: "Centre" | "Left" | "Right".
-    #[serde(default = "centre")]
-    align: String,
-    /// How the card arrives and leaves; see engine::TITLE_ANIMS.
-    #[serde(default = "none_label")]
-    anim: String,
-    /// Bring the words in one at a time instead of all at once — the caption
-    /// style every phone editor has. Costs one rendered card per word.
-    #[serde(default)]
-    reveal: bool,
-    /// Karaoke: keep the whole line on screen and recolour each word as it is
-    /// "spoken" (its even slice of the card's duration). Its own kinetic mode,
-    /// distinct from `reveal`'s one-word-at-a-time build; renders via libass.
-    #[serde(default)]
-    karaoke: bool,
-    /// The colour the active word takes in karaoke mode — the rest of the line
-    /// stays `color`.
-    #[serde(default = "karaoke_hi")]
-    karaoke_color: String,
-    /// "Text" or one of the shapes. A shape is a T-lane card like any other —
-    /// it just draws a box instead of words.
-    #[serde(default = "text_kind")]
-    kind: String,
-    #[serde(default = "shape_w_default")]
-    shape_w: f64,
-    #[serde(default = "shape_h_default")]
-    shape_h: f64,
-    #[serde(default)]
-    shape_x: f64,
-    /// Semi-opaque backdrop box behind the text (caption legibility).
-    boxed: bool,
-    /// Backdrop-box opacity, 0..1. The punchy caption plate wants ~0.85; the
-    /// old fixed value was 0.45, which stays the default so nothing shifts.
-    #[serde(default = "box_opacity_default")]
-    box_opacity: f64,
-    /// Outline width in px, 0 = none — legibility without an opaque plate.
-    #[serde(default)]
-    outline: f64,
-    #[serde(default = "black")]
-    outline_color: String,
-    /// The rest of the bevel's own controls. Defaults match the designer app
-    /// this bevel came from, so an older project loads looking as it did.
-    #[serde(default = "bevel_soften")]
-    soften: f64,
-    #[serde(default = "bevel_depth")]
-    depth: f64,
-    #[serde(default = "bevel_angle")]
-    angle: f64,
-    #[serde(default = "bevel_altitude")]
-    altitude: f64,
-    #[serde(default = "bevel_opacity")]
-    hi_opacity: f64,
-    #[serde(default = "bevel_opacity")]
-    sh_opacity: f64,
-    /// Made by Auto captions — lets "Remove captions" clear them in bulk.
-    caption: bool,
-    /// Rendered cards, one per revealed step (just one unless the words
-    /// come in one at a time). Empty while a render is in flight.
-    #[serde(skip)]
-    pngs: Vec<String>,
-    /// Drag-together group id; 0 = ungrouped.
-    group: usize,
-    /// When false: not composited (FCP-style disable for text cards).
-    #[serde(default = "enabled_true")]
-    enabled: bool,
-}
-
-/// The palette name, not the CSS colour — `title_color` looks these up by
-/// display name and falls back to white on a miss.
-fn black() -> String {
-    "Black".to_string()
-}
-fn bevel_soften() -> f64 {
-    4.0
-}
-fn bevel_depth() -> f64 {
-    100.0
-}
-fn bevel_angle() -> f64 {
-    120.0
-}
-fn bevel_altitude() -> f64 {
-    30.0
-}
-fn bevel_opacity() -> f64 {
-    0.75
-}
-
-/// The historical fixed caption-box opacity — the default so old projects and
-/// untouched cards look exactly as before.
-fn box_opacity_default() -> f64 {
-    0.45
-}
-
-/// Default highlight colour for the active word in karaoke mode.
-fn karaoke_hi() -> String {
-    "Gold".to_string()
-}
-
-/// Which part of the on-screen transform box is being dragged.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum XfGrab {
-    Move,
-    /// A corner: both axes together, so the picture keeps its shape.
-    Scale,
-    /// A side: one axis only. This is the stretch.
-    StretchX,
-    StretchY,
-    Rotate,
-}
-
-/// The four corners of the transform box, as fractions across the monitor
-/// (0,0 = top left, 1,1 = bottom right).
-///
-/// The rotation has to be applied in *pixel* space and converted back, or on a
-/// 9:16 frame a rotated box comes out sheared: one fraction of width is not the
-/// same distance as one fraction of height.
-fn xf_corners(t: &engine::Transform) -> [(f64, f64); 4] {
-    let (half_w, half_h) = (t.scale * t.scale_x / 2.0, t.scale * t.scale_y / 2.0);
-    let (sin, cos) = t.rotation.to_radians().sin_cos();
-    let ar = engine::W as f64 / engine::H as f64;
-    // The box turns about its own centre, and that centre is where the
-    // position offset put it.
-    let (cx, cy) = (0.5 + t.x, 0.5 + t.y);
-    [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(sx, sy)| {
-        let (fx, fy) = (sx * half_w, sy * half_h);
-        (cx + (fx * cos - fy * sin / ar), cy + (fx * sin * ar + fy * cos))
-    })
-}
-
-/// The midpoints of the four sides, where the stretch handles live. Same
-/// rotation treatment as the corners so they stay glued to the box.
-fn xf_edges(t: &engine::Transform) -> [(f64, f64); 4] {
-    let (half_w, half_h) = (t.scale * t.scale_x / 2.0, t.scale * t.scale_y / 2.0);
-    let (sin, cos) = t.rotation.to_radians().sin_cos();
-    let ar = engine::W as f64 / engine::H as f64;
-    let (cx, cy) = (0.5 + t.x, 0.5 + t.y);
-    // left, right, top, bottom — the first two stretch across, the last two down
-    [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)].map(|(sx, sy)| {
-        let (fx, fy) = (sx * half_w, sy * half_h);
-        (cx + (fx * cos - fy * sin / ar), cy + (fx * sin * ar + fy * cos))
-    })
-}
-
-/// A dragged handle updates the transform from where the pointer is now,
-/// relative to where it went down and to the centre of the frame on screen.
-/// `rect` is the monitor's on-screen box: (left, top, width, height).
-fn xf_apply(
-    grab: XfGrab,
-    start: engine::Transform,
-    from: (f64, f64),
-    to: (f64, f64),
-    rect: (f64, f64, f64, f64),
-    snap: bool,
-) -> engine::Transform {
-    let (rl, rt, rw, rh) = rect;
-    if rw < 1.0 || rh < 1.0 {
-        return start;
-    }
-    let (cx, cy) = (rl + rw / 2.0, rt + rh / 2.0);
-    let mut t = start;
-    match grab {
-        XfGrab::Move => {
-            t.x = start.x + (to.0 - from.0) / rw;
-            t.y = start.y + (to.1 - from.1) / rh;
-        }
-        XfGrab::Scale => {
-            // Ratio of distances from the centre, so grabbing any corner (or a
-            // corner clamped back into view) scales the same way.
-            let d0 = ((from.0 - cx).powi(2) + (from.1 - cy).powi(2)).sqrt();
-            let d1 = ((to.0 - cx).powi(2) + (to.1 - cy).powi(2)).sqrt();
-            if d0 > 2.0 {
-                t.scale = (start.scale * d1 / d0).clamp(0.1, 4.0);
-            }
-        }
-        // A side handle stretches one axis, measured along that axis alone —
-        // radial distance would make dragging sideways change the height too.
-        XfGrab::StretchX => {
-            let (d0, d1) = ((from.0 - cx).abs(), (to.0 - cx).abs());
-            if d0 > 2.0 {
-                t.scale_x = (start.scale_x * d1 / d0).clamp(0.1, 4.0);
-            }
-        }
-        XfGrab::StretchY => {
-            let (d0, d1) = ((from.1 - cy).abs(), (to.1 - cy).abs());
-            if d0 > 2.0 {
-                t.scale_y = (start.scale_y * d1 / d0).clamp(0.1, 4.0);
-            }
-        }
-        XfGrab::Rotate => {
-            let a0 = (from.1 - cy).atan2(from.0 - cx);
-            let a1 = (to.1 - cy).atan2(to.0 - cx);
-            let mut deg = start.rotation + (a1 - a0).to_degrees();
-            // Shift snaps to 15°, which is how you get a level horizon or a
-            // clean right angle without nudging a slider.
-            if snap {
-                deg = (deg / 15.0).round() * 15.0;
-            }
-            // Keep it in the -180..180 the slider shows.
-            t.rotation = (deg + 180.0).rem_euclid(360.0) - 180.0;
-        }
-    }
-    t
-}
-
-/// Shape size and offset, as fractions of the frame. Vertical placement reuses
-/// the Position control a title already has.
-type ShapeKnob = (&'static str, f64, fn(&mut TitleItem, f64));
-
-fn shape_knobs(t: &TitleItem) -> Vec<ShapeKnob> {
-    let set_w: fn(&mut TitleItem, f64) = |i, v| i.shape_w = v;
-    vec![
-        ("Width", t.shape_w, set_w),
-        ("Height", t.shape_h, |i, v| i.shape_h = v),
-        ("Across", t.shape_x, |i, v| i.shape_x = v),
-    ]
-}
-
-/// One row of the Transform panel: label, value, min, max, step, and how to
-/// write it back. Both lanes carry the same struct, so one table serves both.
-type XformKnob = (&'static str, f64, f64, f64, f64, fn(&mut engine::Transform, f64));
-
-/// Opacity is only offered where it composites over something — on V1 there is
-/// nothing underneath it but black.
-fn transform_knobs(t: &engine::Transform, with_opacity: bool) -> Vec<XformKnob> {
-    // Vertical order under Mirror: place → size → spin → anchor → opacity.
-    let set_scale: fn(&mut engine::Transform, f64) = |x, v| x.scale = v;
-    let mut knobs: Vec<XformKnob> = vec![
-        ("Position X", t.x, -1.0, 1.0, 0.005, |x, v| x.x = v),
-        ("Position Y", t.y, -1.0, 1.0, 0.005, |x, v| x.y = v),
-        ("Scale", t.scale, 0.1, 4.0, 0.01, set_scale),
-        ("Stretch across", t.scale_x, 0.1, 4.0, 0.01, |x, v| x.scale_x = v),
-        ("Stretch down", t.scale_y, 0.1, 4.0, 0.01, |x, v| x.scale_y = v),
-        ("Rotation", t.rotation, -180.0, 180.0, 1.0, |x, v| x.rotation = v),
-        // The pivot rotation turns around; moving it shifts the picture (Position
-        // places the anchor), so a spin can swing/orbit instead of turning in place.
-        ("Anchor X", t.anchor_x, -1.0, 1.0, 0.005, |x, v| x.anchor_x = v),
-        ("Anchor Y", t.anchor_y, -1.0, 1.0, 0.005, |x, v| x.anchor_y = v),
-    ];
-    if with_opacity {
-        knobs.push(("Opacity", t.opacity, 0.0, 1.0, 0.01, |x, v| x.opacity = v));
-    }
-    knobs
-}
-
-/// Which transform rows carry a keyframe diamond. `scale` animates through the
-/// proven zoompan (Ken Burns) path; `opacity` (offered only on composited V2
-/// layers) drives the alpha plane; `rotation` animates via a time-varying
-/// `rotate=a='…'` angle (see `AnimatedTransform::chain`). Position stays static
-/// until the geometry pipeline moves onto zoompan wholesale.
-fn xf_keyable(label: &str) -> bool {
-    matches!(label, "Scale" | "Opacity" | "Rotation")
-}
-
-/// The `Animated` field a transform-row label edits. Every knob maps to one, so
-/// a slider drag can key an animated field in place rather than flattening it.
-fn xf_field<'a>(
-    at: &'a mut engine::AnimatedTransform,
-    label: &str,
-) -> Option<&'a mut keyframe::Animated<f64>> {
-    Some(match label {
-        "Scale" => &mut at.scale,
-        "Stretch across" => &mut at.scale_x,
-        "Stretch down" => &mut at.scale_y,
-        "Position X" => &mut at.x,
-        "Position Y" => &mut at.y,
-        "Rotation" => &mut at.rotation,
-        "Opacity" => &mut at.opacity,
-        _ => return None,
-    })
-}
-
-/// Write a slider value: re-key an animated field at the playhead (`t`, clip-
-/// local seconds), or set a plain constant when it isn't animated. Preserving
-/// the curve is the whole point — dragging one row must never wipe a sibling's
-/// keyframes, which `set_pose` would.
-fn xf_write(at: &mut engine::AnimatedTransform, label: &str, v: f64, t: f64) {
-    if let Some(f) = xf_field(at, label) {
-        if f.is_animated() {
-            f.set_key(t, v, keyframe::Interp::Smooth);
-        } else {
-            *f = keyframe::Animated::Const(v);
-        }
-    }
-}
-
-/// Diamond click: drop a key at the playhead holding the value shown there, or
-/// pull the key already sitting there back out.
-fn xf_toggle_key(at: &mut engine::AnimatedTransform, label: &str, t: f64) {
-    if let Some(f) = xf_field(at, label) {
-        if f.has_key(t) {
-            f.remove_key(t);
-        } else {
-            let v = f.sample(t);
-            f.set_key(t, v, keyframe::Interp::Smooth);
-        }
-    }
-}
-
-/// Is this row's field currently a curve? Fills its diamond.
-fn xf_field_animated(at: &engine::AnimatedTransform, label: &str) -> bool {
-    match label {
-        "Scale" => at.scale.is_animated(),
-        "Opacity" => at.opacity.is_animated(),
-        "Rotation" => at.rotation.is_animated(),
-        _ => false,
-    }
-}
-
-/// One row of the grade panel: label, current value, min, max, step, and how to
-/// write it back — the same shape as [`XformKnob`], so both drive the identical
-/// slider loop. Ranges are the reel-sane subset of each ffmpeg control.
-type GradeKnob = (&'static str, f64, f64, f64, f64, fn(&mut engine::Grade, f64));
-
-fn grade_knobs(g: &engine::Grade) -> Vec<GradeKnob> {
-    let set_exp: fn(&mut engine::Grade, f64) = |x, v| x.exposure = v;
-    vec![
-        ("Exposure", g.exposure, -0.3, 0.3, 0.01, set_exp),
-        ("Contrast", g.contrast, 0.5, 1.8, 0.01, |x, v| x.contrast = v),
-        ("Saturation", g.saturation, 0.0, 2.5, 0.01, |x, v| x.saturation = v),
-        ("Warmth (K)", g.warmth, 4000.0, 9000.0, 100.0, |x, v| x.warmth = v),
-    ]
-}
-
-/// One row of the bevel panel: label, current value, max, step, and how to
-/// write it back. A table beats seven near-identical slider blocks, and the
-/// ranges are the designer app's.
-type BevelKnob = (&'static str, f64, f64, f64, fn(&mut TitleItem, f64));
-
-fn bevel_knobs(t: &TitleItem) -> Vec<BevelKnob> {
-    let set_size: fn(&mut TitleItem, f64) = |i, v| i.bevel_size = v;
-    vec![
-        ("Size", t.bevel_size, 100.0, 1.0, set_size),
-        ("Softness", t.soften, 100.0, 1.0, |i, v| i.soften = v),
-        ("Depth", t.depth, 100.0, 1.0, |i, v| i.depth = v),
-        ("Light angle", t.angle, 360.0, 5.0, |i, v| i.angle = v),
-        ("Light height", t.altitude, 90.0, 5.0, |i, v| i.altitude = v),
-        ("Highlight strength", t.hi_opacity, 1.0, 0.05, |i, v| i.hi_opacity = v),
-        ("Shadow strength", t.sh_opacity, 1.0, 0.05, |i, v| i.sh_opacity = v),
-    ]
-}
-
-/// A word-by-word reveal finishes this far into the card's life, so the
-/// finished line still holds long enough to read.
-const REVEAL_SPAN: f64 = 0.6;
-
-/// Prefixes of `text` ending at each word, cut out of the original string so
-/// the line breaks it already has survive exactly. Rejoining split words with
-/// spaces would unwrap a caption and make it jump between lines mid-reveal.
-fn word_prefixes(text: &str) -> Vec<String> {
-    let mut ends = Vec::new();
-    let mut in_word = false;
-    for (i, c) in text.char_indices() {
-        if c.is_whitespace() {
-            if in_word {
-                ends.push(i);
-            }
-            in_word = false;
-        } else {
-            in_word = true;
-        }
-    }
-    if in_word {
-        ends.push(text.len());
-    }
-    ends.into_iter().map(|e| text[..e].to_string()).collect()
-}
-
-impl TitleItem {
-    /// The cards this title is actually made of: (text, start, length, active).
-    /// One card normally; one per word for a reveal (growing prefix) or for
-    /// karaoke (full line, `active` = the highlighted word index).
-    fn segments(&self) -> Vec<(String, f64, f64, Option<usize>)> {
-        // Karaoke: the whole line every card, one card per word, spread evenly
-        // across the full duration — the highlight jumps word to word.
-        if self.kind == "Text" && self.karaoke {
-            let n = self.text.split_whitespace().count();
-            if n >= 2 {
-                let step = self.dur / n as f64;
-                return (0..n)
-                    .map(|k| {
-                        let at = self.at + k as f64 * step;
-                        let end = if k + 1 == n {
-                            self.at + self.dur
-                        } else {
-                            self.at + (k + 1) as f64 * step
-                        };
-                        (self.text.clone(), at, (end - at).max(0.01), Some(k))
-                    })
-                    .collect();
-            }
-        }
-        let steps = word_prefixes(&self.text);
-        if !self.reveal || self.kind != "Text" || steps.len() < 2 {
-            return vec![(self.text.clone(), self.at, self.dur, None)];
-        }
-        let n = steps.len();
-        let step = self.dur * REVEAL_SPAN / n as f64;
-        steps
-            .into_iter()
-            .enumerate()
-            .map(|(k, text)| {
-                let at = self.at + k as f64 * step;
-                // The last word holds until the card is done.
-                let end =
-                    if k + 1 == n { self.at + self.dur } else { self.at + (k + 1) as f64 * step };
-                (text, at, (end - at).max(0.01), None)
-            })
-            .collect()
-    }
-
-    /// Which card is on screen at `t`, if any.
-    fn card_at(&self, t: f64) -> Option<usize> {
-        self.segments().iter().position(|(_, at, dur, _)| t >= *at && t < at + dur)
-    }
-
-    /// Map the timeline item onto the engine's render parameters. The item
-    /// stores friendly choices (a colour name, a position name); the style
-    /// stores what ffmpeg and the bevel actually need.
-    /// This card's look, carrying whichever words this step shows.
-    fn style_of(&self, text: &str) -> engine::TitleStyle {
-        engine::TitleStyle {
-            text: text.to_string(),
-            font_size: self.font_size as u32,
-            color: title_color(&self.color).to_string(),
-            y_frac: seat_y(self),
-            font: self.font.clone(),
-            align: self.align.clone(),
-            outline: self.outline,
-            outline_color: title_color(&self.outline_color).to_string(),
-            boxed: self.boxed,
-            box_opacity: self.box_opacity,
-            kind: self.kind.clone(),
-            shape_w: self.shape_w,
-            shape_h: self.shape_h,
-            shape_x: self.shape_x,
-            bevel: self.bevel.clone(),
-            bevel_size: self.bevel_size,
-            soften: self.soften,
-            depth: self.depth,
-            angle: self.angle,
-            altitude: self.altitude,
-            hi_opacity: self.hi_opacity,
-            sh_opacity: self.sh_opacity,
-        }
-    }
-}
-
-/// The export fade's opacity at global time `t`, for the scrub preview.
-fn title_alpha(t: f64, at: f64, dur: f64) -> f64 {
-    let f = engine::title_fade(dur).max(0.01);
-    ((t - at) / f).min((at + dur - t) / f).clamp(0.0, 1.0)
-}
-
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Clip {
-    path: String,
-    name: String,
-    duration: f64,
-    in_s: f64,
-    out_s: f64,
-    has_audio: bool,
-    effect: String,
-    /// Effect strength 0..=1 (parameter interpolation, not a crossfade).
-    effect_amount: f64,
-    framing: String,
-    /// Where the picture sits in the frame — scale, position, rotation.
-    #[serde(default)]
-    transform: engine::AnimatedTransform,
-    /// Primary colour grade — exposure/contrast/saturation/warmth. Runs before
-    /// the effect preset in `look()`; identity by default so old projects load.
-    #[serde(default)]
-    grade: engine::Grade,
-    /// Playback rate: 0.5 is slow motion, 2.0 is double speed.
-    #[serde(default = "unity")]
-    speed: f64,
-    /// Play the trimmed span backwards. Off by default so old projects load.
-    #[serde(default)]
-    reverse: bool,
-    /// Gain on this clip's own audio; 0.0 mutes it.
-    #[serde(default = "unity")]
-    volume: f64,
-    /// "Reduce background noise" strength 0..=1 for this clip's own audio.
-    #[serde(default)]
-    denoise: f64,
-    /// EQ / voice treatment (engine::AUDIO_TREATS); "None" = flat.
-    #[serde(default = "none_label")]
-    treat: String,
-    /// Transition *into* this clip. Stored on the incoming clip so it survives
-    /// reordering, and ignored on the first clip — nothing precedes it.
-    #[serde(default = "none_label")]
-    transition: String,
-    #[serde(default = "half")]
-    trans_dur: f64,
-    #[serde(skip)]
-    thumb: String,
-    /// Full-source waveform data URI for this clip's own audio; empty until the
-    /// background render lands, and always empty for a silent source.
-    #[serde(skip)]
-    wave: String,
-    /// 480p scrub proxy path; empty until the background build finishes.
-    #[serde(skip)]
-    proxy: String,
-    /// Drag-together group id; 0 = ungrouped.
-    group: usize,
-    /// When false: invisible and silent in preview/export, still on the
-    /// timeline (FCP Clip › Disable). Default true for older projects.
-    #[serde(default = "enabled_true")]
-    enabled: bool,
-    /// When true and any item is soloed, only soloed items contribute audio;
-    /// non-soloed clips render B&W (FCP Clip › Solo).
-    #[serde(default)]
-    solo: bool,
-}
-
-impl Clip {
-    fn spec(&self) -> ClipSpec {
-        ClipSpec {
-            path: self.path.clone(),
-            in_s: self.in_s,
-            out_s: self.out_s,
-            has_audio: self.has_audio,
-            effect: self.look(),
-            framing: self.framing.clone(),
-            bg: self.transform.bg,
-            speed: self.speed,
-            reverse: self.reverse,
-            volume: self.volume,
-            denoise: self.denoise,
-            treat: self.treat.clone(),
-            transition: self.transition.clone(),
-            trans_dur: self.trans_dur,
-            enabled: self.enabled,
-        }
-    }
-
-    /// The whole video chain for this clip: geometry first, then the look.
-    /// Every preview, thumbnail and export goes through here, so they cannot
-    /// drift apart.
-    fn look(&self) -> String {
-        join_chain(
-            join_chain(self.transform.chain(engine::W, engine::H, false), self.grade.chain()),
-            effect_filter_amt(&self.effect, self.effect_amount),
-        )
-    }
-
-    /// Seconds on the timeline — the source span retimed by the speed.
-    fn trimmed(&self) -> f64 {
-        (self.out_s - self.in_s) / self.speed.max(0.01)
-    }
-
-    /// Source-file time for a point `off` seconds of *source* into the trimmed
-    /// span — mirrored when reversed, so preview and export read the same frame.
-    fn src_at(&self, off: f64) -> f64 {
-        if self.reverse { self.out_s - off } else { self.in_s + off }
-    }
-
-    /// What preview/scrub extraction should read: the proxy once built.
-    fn scrub_path(&self) -> String {
-        if self.proxy.is_empty() { self.path.clone() } else { self.proxy.clone() }
-    }
-}
-
-impl Default for Clip {
-    fn default() -> Self {
-        Clip {
-            path: String::new(),
-            name: String::new(),
-            duration: 0.0,
-            in_s: 0.0,
-            out_s: 0.0,
-            has_audio: false,
-            effect: "None".into(),
-            effect_amount: 1.0,
-            framing: "Crop".into(),
-            transform: engine::AnimatedTransform::default(),
-            grade: engine::Grade::default(),
-            speed: 1.0,
-            reverse: false,
-            volume: 1.0,
-            denoise: 0.0,
-            treat: "None".into(),
-            transition: "None".into(),
-            trans_dur: 0.5,
-            thumb: String::new(),
-            wave: String::new(),
-            proxy: String::new(),
-            group: 0,
-            enabled: true,
-            solo: false,
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct OverlayItem {
-    path: String,
-    name: String,
-    duration: f64,
-    in_s: f64,
-    out_s: f64,
-    at: f64,
-    effect: String,
-    /// Effect strength 0..=1 (parameter interpolation, not a crossfade).
-    effect_amount: f64,
-    framing: String,
-    /// Where the picture sits in the frame. A scaled-down overlay is a
-    /// picture-in-picture, since V2 composites over V1.
-    #[serde(default)]
-    transform: engine::AnimatedTransform,
-    /// Primary colour grade — same as a V1 clip, runs before the effect look.
-    #[serde(default)]
-    grade: engine::Grade,
-    /// Playback rate, same as a V1 clip: 0.5 is slow motion.
-    #[serde(default = "unity")]
-    speed: f64,
-    /// Play the trimmed span backwards.
-    #[serde(default)]
-    reverse: bool,
-    /// ffmpeg `blend=all_mode` value for compositing this layer (empty = alpha-over).
-    /// Screen/Add turn a black-backed light-leak or particle plate into a glow over V1.
-    #[serde(default)]
-    blend: String,
-    #[serde(skip)]
-    proxy: String,
-    /// Drag-together group id; 0 = ungrouped.
-    group: usize,
-    /// When false: skip compositing (invisible). Still sits on V2.
-    #[serde(default = "enabled_true")]
-    enabled: bool,
-    /// Solo isolate — see [`Clip::solo`].
-    #[serde(default)]
-    solo: bool,
-}
-
-impl OverlayItem {
-    /// Seconds this cutaway covers V1 for — its source span, retimed.
-    fn trimmed(&self) -> f64 {
-        (self.out_s - self.in_s) / self.speed.max(0.01)
-    }
-
-    /// Source-file time for a point `off` seconds into the cutaway, mirrored
-    /// when reversed. (Preview maps timeline seconds 1:1, matching the old code.)
-    fn src_at(&self, off: f64) -> f64 {
-        if self.reverse { self.out_s - off } else { self.in_s + off }
-    }
-
-    /// Same as a clip's, but built for a layer that composites: the area the
-    /// picture vacates is transparent, so V1 shows through around it.
-    fn look(&self) -> String {
-        join_chain(
-            join_chain(self.transform.chain(engine::W, engine::H, true), self.grade.chain()),
-            effect_filter_amt(&self.effect, self.effect_amount),
-        )
-    }
-
-    fn scrub_path(&self) -> String {
-        if self.proxy.is_empty() { self.path.clone() } else { self.proxy.clone() }
-    }
-}
-
-fn audio_lane_default() -> u8 {
-    1
-}
-/// Sentinel for "volume end equals volume start" so older projects stay flat.
-fn vol_end_default() -> f64 {
-    -1.0
-}
-/// afftdn noise floor for projects saved before the knob existed — the value
-/// that was hardcoded, so old projects denoise exactly as they used to.
-fn noise_floor_default() -> f64 {
-    -25.0
-}
-
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct AudioItem {
-    path: String,
-    name: String,
-    duration: f64,
-    in_s: f64,
-    out_s: f64,
-    at: f64,
-    /// Start gain; with `vol_end` forms a linear automation ramp.
-    volume: f64,
-    /// End gain for volume automation. Negative = same as `volume`.
-    #[serde(default = "vol_end_default")]
-    vol_end: f64,
-    /// How hard this bed ducks under the main track while it is talking.
-    /// 0 = never. Music under a voiceover is the reason this exists.
-    #[serde(default)]
-    duck: f64,
-    /// Fade in from silence (seconds of the kept span).
-    #[serde(default)]
-    fade_in: f64,
-    /// Fade out to silence (seconds of the kept span).
-    #[serde(default)]
-    fade_out: f64,
-    /// Spectral denoise 0..=1.
-    #[serde(default)]
-    denoise: f64,
-    /// afftdn noise floor in dB (−80..=−20); the sensitivity knob.
-    #[serde(default = "noise_floor_default")]
-    noise_floor: f64,
-    /// Adaptively track the noise floor over the clip (afftdn `tn`).
-    #[serde(default)]
-    track_noise: bool,
-    /// Broadband compression 0..=1.
-    #[serde(default)]
-    compress: f64,
-    /// Noise gate 0..=1 (`agate`) — kills room tone between words.
-    #[serde(default)]
-    gate: f64,
-    /// De-click strength 0..=1 (`adeclick`) — pops in field audio.
-    #[serde(default)]
-    declick: f64,
-    /// One of engine::AUDIO_TREATS — EQ / voice shaping.
-    #[serde(default = "none_label")]
-    treat: String,
-    /// Mix bus: 1 = A1 (music), 2 = A2 (VO / second bed). Both under V1.
-    #[serde(default = "audio_lane_default")]
-    lane: u8,
-    /// Full-source waveform data URI; empty until the background render lands.
-    #[serde(skip)]
-    wave: String,
-    /// Drag-together group id; 0 = ungrouped.
-    group: usize,
-    /// When false: silent and out of the mix (still on the lane).
-    #[serde(default = "enabled_true")]
-    enabled: bool,
-    /// Solo isolate — see [`Clip::solo`].
-    #[serde(default)]
-    solo: bool,
-}
-
-impl AudioItem {
-    fn end_gain(&self) -> f64 {
-        if self.vol_end < 0.0 {
-            self.volume
-        } else {
-            self.vol_end
-        }
-    }
-
-    fn lane_tag(&self) -> &'static str {
-        if self.lane >= 2 { "A2" } else { "A1" }
-    }
-
-    fn span(&self) -> f64 {
-        (self.out_s - self.in_s).max(0.01)
-    }
-}
-
-impl Default for AudioItem {
-    fn default() -> Self {
-        AudioItem {
-            path: String::new(),
-            name: String::new(),
-            duration: 0.0,
-            in_s: 0.0,
-            out_s: 0.0,
-            at: 0.0,
-            volume: 1.0,
-            vol_end: -1.0,
-            duck: 0.0,
-            fade_in: 0.0,
-            fade_out: 0.0,
-            denoise: 0.0,
-            noise_floor: -25.0,
-            track_noise: false,
-            compress: 0.0,
-            gate: 0.0,
-            declick: 0.0,
-            treat: "None".into(),
-            lane: 1,
-            wave: String::new(),
-            group: 0,
-            enabled: true,
-            solo: false,
-        }
-    }
-}
-
-/// One mixer channel: a gain fader, a mute, and a solo. The three strips the
-/// mixer holds are V1 (every clip's own audio), A1 and A2 (the two beds).
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Strip {
-    #[serde(default = "unity")]
-    gain: f64,
-    #[serde(default)]
-    mute: bool,
-    #[serde(default)]
-    solo: bool,
-}
-impl Default for Strip {
-    fn default() -> Self {
-        Strip { gain: 1.0, mute: false, solo: false }
-    }
-}
-
-/// Track index into [`Mixer::tracks`]. Kept as plain constants — three fixed
-/// buses, not a growing list, so an enum would be ceremony.
-const MIX_V1: usize = 0;
-const MIX_A1: usize = 1;
-const MIX_A2: usize = 2;
-const MIX_LABELS: [&str; 3] = ["V1", "A1", "A2"];
-
-/// A tiny 3-channel mixer plus a master fader. It is the one place track-level
-/// level, mute and solo live; per-clip gain still rides on top. Applied once in
-/// `gather_specs`, so preview and export hear exactly the same balance.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Mixer {
-    #[serde(default)]
-    tracks: [Strip; 3],
-    #[serde(default = "unity")]
-    master: f64,
-}
-impl Default for Mixer {
-    fn default() -> Self {
-        Mixer { tracks: Default::default(), master: 1.0 }
-    }
-}
-impl Mixer {
-    fn any_solo(&self) -> bool {
-        self.tracks.iter().any(|s| s.solo)
-    }
-    /// Effective linear gain for track `i`, folding in mute, solo and master.
-    /// 0.0 means silent — muted, or soloed-out while another track solos.
-    fn gain_of(&self, i: usize) -> f64 {
-        let s = &self.tracks[i];
-        if s.mute || (self.any_solo() && !s.solo) {
-            0.0
-        } else {
-            (s.gain * self.master).max(0.0)
-        }
-    }
-    /// Track index for an audio bed's lane number (1 = A1, ≥2 = A2).
-    fn lane_track(lane: u8) -> usize {
-        if lane >= 2 {
-            MIX_A2
-        } else {
-            MIX_A1
-        }
-    }
-}
-
-/// Inline CSS windowing a full-source waveform image to the span an item keeps.
-/// The image spans the whole source, so it is stretched to `duration` seconds
-/// wide and shifted left by the in point; trims and splits are then free, since
-/// they only move this window rather than re-rendering anything.
-///
-/// `speed` compresses both, so a retimed V1 clip's waveform still lines up with
-/// its retimed width on the timeline. A1 items are never retimed and pass 1.0.
-fn wave_css(wave: &str, duration: f64, in_s: f64, scale: f64, speed: f64) -> String {
-    if wave.is_empty() {
-        return String::new();
-    }
-    let px = scale / speed.max(0.01);
-    format!(
-        "background-image:url({wave});background-size:{:.1}px 100%;\
-         background-position:-{:.1}px 0;background-repeat:no-repeat;",
-        duration * px,
-        in_s * px
-    )
-}
-
-/// Serde fallback for rate-like fields, so a project written before they
-/// existed loads as 1x rather than as a divide-by-zero.
-fn unity() -> f64 {
-    1.0
-}
-/// Clip/overlay/audio/title `enabled` default — older projects load as on.
-fn enabled_true() -> bool {
-    true
-}
-/// Solid black monitor frame for a disabled V1 clip under the playhead.
-const BLACK_PREVIEW: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='540' height='960'%3E%3Crect fill='black' width='100%25' height='100%25'/%3E%3C/svg%3E";
-fn none_label() -> String {
-    "None".to_string()
-}
-fn centre() -> String {
-    "Centre".to_string()
-}
-fn text_kind() -> String {
-    "Text".to_string()
-}
-fn shape_w_default() -> f64 {
-    0.6
-}
-fn shape_h_default() -> f64 {
-    0.12
-}
-/// Default transition length. Short, because a reel cut is quick.
-fn half() -> f64 {
-    0.5
-}
-
-/// A saved title look, kept outside any project so a series of reels can share
-/// one. The whole item is stored and only its styling is applied — that way a
-/// preset gains any field a title gains, with nothing to keep in step.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct TitlePreset {
-    name: String,
-    style: TitleItem,
-}
-
-fn presets_path() -> std::path::PathBuf {
-    engine::config_dir().join("title-presets.json")
-}
-
-fn load_presets() -> Vec<TitlePreset> {
-    std::fs::read_to_string(presets_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-fn save_presets(all: &[TitlePreset]) -> Result<(), String> {
-    let dir = engine::config_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let json = serde_json::to_string_pretty(all).map_err(|e| e.to_string())?;
-    std::fs::write(presets_path(), json).map_err(|e| e.to_string())
-}
-
-/// The out-of-the-box title look every new card and every built-in style starts
-/// from. Callers override `text`/`at`/`dur` per instance.
-fn base_title() -> TitleItem {
-    TitleItem {
-        text: "Text".to_string(),
-        at: 0.0,
-        dur: 3.0,
-        font_size: 110.0,
-        color: "White".to_string(),
-        pos: "Middle".to_string(),
-        y_frac: None,
-        // Flat by default: bevel is an opt-in effect, not the default look. An
-        // outline still carries legibility on its own.
-        bevel: "Off".to_string(),
-        bevel_size: 21.0,
-        font: "Sans".to_string(),
-        align: "Centre".to_string(),
-        anim: "None".to_string(),
-        reveal: false,
-        karaoke: false,
-        karaoke_color: karaoke_hi(),
-        kind: "Text".to_string(),
-        shape_w: 0.6,
-        shape_h: 0.12,
-        shape_x: 0.0,
-        // Transparent + outline: the video shows through with no opaque plate.
-        boxed: false,
-        box_opacity: box_opacity_default(),
-        outline: 4.0,
-        outline_color: "Black".to_string(),
-        soften: 4.0,
-        depth: 100.0,
-        angle: 120.0,
-        altitude: 30.0,
-        hi_opacity: 0.75,
-        sh_opacity: 0.75,
-        caption: false,
-        pngs: Vec::new(),
-        group: 0,
-        enabled: true,
-    }
-}
-
-/// Ready-made looks offered above the user's saved presets — the starter
-/// gallery OpenShot/kdenlive ship, but built from MorReel's own knobs so every
-/// one renders through the real title engine. `restyle` keeps each card's own
-/// words and timing; only the look is copied.
-///
-/// Layout and entrance names lean on the iMovie/FCP vocabulary (Slide, Lower
-/// third, Expand) so a creator scanning the grid already knows what they'll get.
-fn builtin_title_styles() -> Vec<TitlePreset> {
-    let named = |name: &str, style: TitleItem| TitlePreset { name: name.to_string(), style };
-    vec![
-        // Full-frame centered title — the classic open card.
-        named("Centered title", TitleItem { font_size: 140.0, outline: 8.0, pos: "Middle".into(), ..base_title() }),
-        // The punchy phone caption: big, heavy outline, sat in the lower third.
-        named("Bold caption", TitleItem { font_size: 150.0, outline: 12.0, pos: "Lower third".into(), ..base_title() }),
-        // News lower-third: opaque plate instead of an outline.
-        named("Lower-third box", TitleItem { boxed: true, outline: 0.0, font_size: 90.0, pos: "Lower third".into(), ..base_title() }),
-        // The social-caption plate: white words on a punchy near-solid slab,
-        // words arriving one at a time — the FCP-style caption over busy video.
-        named("Caption plate", TitleItem { boxed: true, box_opacity: 0.85, outline: 0.0, font_size: 100.0, reveal: true, pos: "Lower third".into(), ..base_title() }),
-        // Slide-on entrances — iMovie's "Slide" family, driven by TITLE_ANIMS.
-        named("Slide up", TitleItem { anim: "Slide up".into(), font_size: 120.0, pos: "Middle".into(), outline: 6.0, ..base_title() }),
-        named("Slide lower third", TitleItem {
-            anim: "Slide up".into(), font_size: 100.0, pos: "Lower third".into(), outline: 6.0, ..base_title()
-        }),
-        named("Slide in", TitleItem { anim: "Slide in left".into(), font_size: 130.0, pos: "Middle".into(), outline: 6.0, ..base_title() }),
-        // Expanding plate that rides up into the frame.
-        named("Expand plate", TitleItem {
-            boxed: true, box_opacity: 0.9, outline: 0.0, font_size: 110.0,
-            pos: "Middle".into(), anim: "Slide up".into(), ..base_title()
-        }),
-        named("Top title", TitleItem { font_size: 90.0, pos: "Top".into(), outline: 5.0, ..base_title() }),
-        // The embossed look — MorReel's signature bevel, in gold.
-        named("Gold chisel", TitleItem { color: "Gold".into(), bevel: "Cameo".into(), outline: 0.0, font_size: 130.0, ..base_title() }),
-        named("Neon pop", TitleItem { color: "Cyan".into(), outline: 8.0, font_size: 130.0, ..base_title() }),
-        named("Red alert", TitleItem { color: "Red".into(), outline_color: "White".into(), outline: 6.0, font_size: 140.0, ..base_title() }),
-        // Carved into the video rather than standing off it.
-        named("Carved", TitleItem { bevel: "Intaglio".into(), outline: 0.0, font_size: 130.0, ..base_title() }),
-        // The CapCut/TikTok karaoke: whole line up, each word lights gold in turn.
-        named("Karaoke", TitleItem { karaoke: true, karaoke_color: "Gold".into(), outline: 8.0, font_size: 110.0, pos: "Lower third".into(), ..base_title() }),
-        // Karaoke on a plate, for busy footage.
-        named("Karaoke plate", TitleItem { karaoke: true, karaoke_color: "Cyan".into(), boxed: true, box_opacity: 0.85, outline: 0.0, font_size: 96.0, pos: "Lower third".into(), ..base_title() }),
-        // The small, unobtrusive movie subtitle.
-        named("Subtitle", TitleItem { font_size: 70.0, outline: 5.0, pos: "Lower third".into(), ..base_title() }),
-    ]
-}
-
-/// A named workspace arrangement. In this app the Inspector is the only panel
-/// that docks/floats/hides, so a "layout" is just its state — no per-panel
-/// registry until a second dockable panel exists (see the View menu comment).
-/// Saved outside the project (like title presets) so every reel shares them.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Layout {
-    name: String,
-    inspector_open: bool,
-    inspector_float: bool,
-    #[serde(default)]
-    float_xy: Option<(f64, f64)>,
-    #[serde(default)]
-    float_size: Option<(f64, f64)>,
-}
-
-/// Built-in arrangements, always offered above the user's saved ones.
-fn preset_layouts() -> [Layout; 3] {
-    [
-        Layout { name: "Editing".into(), inspector_open: true, inspector_float: false, float_xy: None, float_size: None },
-        Layout { name: "Focus".into(), inspector_open: false, inspector_float: false, float_xy: None, float_size: None },
-        Layout { name: "Floating".into(), inspector_open: true, inspector_float: true, float_xy: None, float_size: None },
-    ]
-}
-
-fn layouts_path() -> std::path::PathBuf {
-    engine::config_dir().join("layouts.json")
-}
-
-fn load_layouts() -> Vec<Layout> {
-    std::fs::read_to_string(layouts_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-fn save_layouts(all: &[Layout]) -> Result<(), String> {
-    let dir = engine::config_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let json = serde_json::to_string_pretty(all).map_err(|e| e.to_string())?;
-    std::fs::write(layouts_path(), json).map_err(|e| e.to_string())
-}
-
-/// Take `src`'s look but keep `dst`'s own words, timing and lane identity.
-/// A style is everything a card looks like; it is never what it says or when.
-fn restyle(dst: &TitleItem, src: &TitleItem) -> TitleItem {
-    TitleItem {
-        text: dst.text.clone(),
-        at: dst.at,
-        dur: dst.dur,
-        group: dst.group,
-        caption: dst.caption,
-        enabled: dst.enabled,
-        pngs: Vec::new(),
-        ..src.clone()
-    }
-}
-
-/// A whole-timeline snapshot for undo/redo. Snapshotting every lane is cheaper
-/// to get *right* than per-action inverse operations — those silently miss a
-/// field the moment someone adds one — and a reel is tens of items, not
-/// thousands. Rendered PNGs and proxies ride along; they're content-addressed,
-/// so restoring an old one costs a cache hit, not a re-render.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Snapshot {
-    clips: Vec<Clip>,
-    overlays: Vec<OverlayItem>,
-    audios: Vec<AudioItem>,
-    titles: Vec<TitleItem>,
-    /// Beat markers, in timeline seconds, sorted. Not a lane — they hold no
-    /// media, they are just the places you want cuts to land.
-    #[serde(default)]
-    markers: Vec<f64>,
-    /// Track mixer (V1/A1/A2 level, mute, solo + master). Older projects load
-    /// with a flat, un-muted mixer.
-    #[serde(default)]
-    mixer: Mixer,
-}
-
-/// Whether `current` differs from the last-saved baseline JSON — the "● Edited"
-/// test. Comparing serialized JSON (not the struct) is deliberate: thumb/wave/
-/// proxy are `#[serde(skip)]`, so a background proxy or waveform landing never
-/// counts as an edit — only what would be written to disk does. With no baseline
-/// (never saved this session), any content on the timeline counts as unsaved.
-fn timeline_dirty(current: &Snapshot, baseline: Option<&str>) -> bool {
-    let empty = current.clips.is_empty()
-        && current.overlays.is_empty()
-        && current.audios.is_empty()
-        && current.titles.is_empty();
-    let cur = serde_json::to_string(current).unwrap_or_default();
-    baseline.map_or(!empty, |b| b != cur)
-}
-
-// --- OpenTimelineIO export (principle 8) ---------------------------------
-//
-// OTIO is a documented JSON schema, so it's emitted directly with serde_json —
-// pulling in the OTIO crate to write a few nested objects would be the kind of
-// dependency ponytail exists to refuse. This is export only: a one-way bridge
-// out to FCP / Resolve / Premiere, not a round-trip project format (that's what
-// .morreel is). Speed retimes and transitions are dropped — clips land at their
-// source spans, which is what an interchange hand-off actually needs.
-
-/// An OTIO `RationalTime`: a count of frames at `fps`.
-fn otio_rt(seconds: f64, fps: f64) -> serde_json::Value {
-    serde_json::json!({ "OTIO_SCHEMA": "RationalTime.1", "rate": fps, "value": (seconds * fps).round() })
-}
-
-fn otio_range(start: f64, dur: f64, fps: f64) -> serde_json::Value {
-    serde_json::json!({
-        "OTIO_SCHEMA": "TimeRange.1",
-        "start_time": otio_rt(start, fps),
-        "duration": otio_rt(dur.max(0.0), fps),
-    })
-}
-
-/// A clip referencing an external media file by `source_range` (the portion of
-/// the source used). `path` becomes a `file://` URL the receiving app resolves.
-fn otio_clip(name: &str, path: &str, src_start: f64, src_dur: f64, fps: f64) -> serde_json::Value {
-    serde_json::json!({
-        "OTIO_SCHEMA": "Clip.1",
-        "name": name,
-        "source_range": otio_range(src_start, src_dur, fps),
-        "media_reference": { "OTIO_SCHEMA": "ExternalReference.1", "target_url": format!("file://{path}") },
-    })
-}
-
-fn otio_gap(dur: f64, fps: f64) -> serde_json::Value {
-    serde_json::json!({ "OTIO_SCHEMA": "Gap.1", "source_range": otio_range(0.0, dur, fps) })
-}
-
-/// Lay `(at, dur, node)` items onto one track, inserting a `Gap` before any item
-/// that doesn't start where the previous one ended. Items must be sorted by `at`.
-fn otio_lay(items: Vec<(f64, f64, serde_json::Value)>, fps: f64) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    let mut cursor = 0.0;
-    for (at, dur, node) in items {
-        if at > cursor + 1e-6 {
-            out.push(otio_gap(at - cursor, fps));
-        }
-        out.push(node);
-        cursor = at + dur;
-    }
-    out
-}
-
-/// Serialize a timeline snapshot to an OpenTimelineIO document. V1 is the
-/// primary storyline (contiguous); V2 / A1 / A2 / captions are placed by their
-/// absolute `at` with gaps. Captions carry a `MissingReference` — they're timed
-/// text, not media — so an NLE shows them on their own track to re-style.
-fn snapshot_to_otio(snap: &Snapshot, name: &str, fps: f64) -> String {
-    let v1: Vec<_> = snap
-        .clips
-        .iter()
-        .map(|c| otio_clip(&c.name, &c.path, c.in_s, c.out_s - c.in_s, fps))
-        .collect();
-
-    let mut ov: Vec<_> = snap
-        .overlays
-        .iter()
-        .map(|o| (o.at, o.trimmed(), otio_clip(&o.name, &o.path, o.in_s, o.out_s - o.in_s, fps)))
-        .collect();
-    ov.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-    let audio_track = |bus_hi: bool| {
-        let mut a: Vec<_> = snap
-            .audios
-            .iter()
-            .filter(|a| (a.lane >= 2) == bus_hi)
-            .map(|a| (a.at, a.out_s - a.in_s, otio_clip(&a.name, &a.path, a.in_s, a.out_s - a.in_s, fps)))
-            .collect();
-        a.sort_by(|x, y| x.0.total_cmp(&y.0));
-        otio_lay(a, fps)
-    };
-
-    let mut caps: Vec<_> = snap
-        .titles
-        .iter()
-        .map(|t| {
-            let node = serde_json::json!({
-                "OTIO_SCHEMA": "Clip.1",
-                "name": t.text.replace('\n', " ").chars().take(48).collect::<String>(),
-                "source_range": otio_range(0.0, t.dur, fps),
-                "media_reference": { "OTIO_SCHEMA": "MissingReference.1" },
-            });
-            (t.at, t.dur, node)
-        })
-        .collect();
-    caps.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-    let track = |name: &str, kind: &str, children: Vec<serde_json::Value>| {
-        serde_json::json!({ "OTIO_SCHEMA": "Track.1", "name": name, "kind": kind, "children": children })
-    };
-
-    let doc = serde_json::json!({
-        "OTIO_SCHEMA": "Timeline.1",
-        "name": name,
-        "global_start_time": otio_rt(0.0, fps),
-        "tracks": {
-            "OTIO_SCHEMA": "Stack.1",
-            "name": "tracks",
-            "children": [
-                track("V1", "Video", v1),
-                track("V2", "Video", otio_lay(ov, fps)),
-                track("A1", "Audio", audio_track(false)),
-                track("A2", "Audio", audio_track(true)),
-                track("Captions", "Video", otio_lay(caps, fps)),
-            ],
-        },
-    });
-    serde_json::to_string_pretty(&doc).unwrap()
-}
-
-/// Per-project settings — the portrait-reel analog of kdenlive's project
-/// profile/metadata. Kept out of `Snapshot` on purpose: these are not edits, so
-/// changing the platform or the title must not land on the undo stack. Saved
-/// alongside the timeline via [`Project`], defaulted so old files still load.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-struct ProjectSettings {
-    /// One of the `LIMITS` names, or "All platforms" to warn against every cap.
-    platform: String,
-    /// Target export width (a `SIZES` entry); 9:16 fixes the height.
-    resolution: u32,
-    /// Whether safe-area guides start on for this project.
-    guides: bool,
-    title: String,
-    author: String,
-}
-
-impl Default for ProjectSettings {
-    fn default() -> Self {
-        Self { platform: "All platforms".into(), resolution: 1080, guides: false, title: String::new(), author: String::new() }
-    }
-}
-
-/// The on-disk `.morreel` file: the timeline plus its settings. `flatten` keeps
-/// the timeline fields at the top level, so a pre-settings project (a bare
-/// `Snapshot`) still deserializes — `settings` just falls back to default.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Project {
-    #[serde(flatten)]
-    snap: Snapshot,
-    #[serde(default)]
-    settings: ProjectSettings,
-}
-
-/// The duration cap for one platform, if it has one.
-fn platform_cap(platform: &str) -> Option<f64> {
-    LIMITS.iter().find(|(n, _)| *n == platform).map(|(_, c)| *c)
-}
-
-/// What the inspector is editing.
-#[derive(Clone, Copy, PartialEq)]
-enum Sel {
-    Main(usize),
-    Over(usize),
-    Aud(usize),
-    Title(usize),
-}
-
-/// The noun for whatever's selected, shown in the inspector title so the panel
-/// header names what you're editing instead of a redundant in-body label.
-fn sel_noun(sel: Option<Sel>, titles: &[TitleItem]) -> Option<&'static str> {
-    Some(match sel? {
-        Sel::Main(_) => "Clip",
-        Sel::Over(_) => "Cutaway",
-        Sel::Aud(_) => "Audio",
-        Sel::Title(k) => {
-            let t = titles.get(k)?;
-            if t.caption { "Caption" } else if t.kind != "Text" { "Shape" } else { "Text" }
-        }
-    })
-}
-
-/// The popped inspector window's identity: what you're editing, in that kind's
-/// own colour, so the window reads as a purpose-built tool rather than a
-/// stretched panel. A live selection wins; with nothing selected it names the
-/// current workspace instead. Returns (accent hex, glyph, title, eyebrow).
-fn solo_identity(
-    sel: Option<Sel>,
-    phase: Phase,
-    titles: &[TitleItem],
-) -> (&'static str, &'static str, String, &'static str) {
-    if let Some(noun) = sel_noun(sel, titles) {
-        // Each element kind carries its own accent — instant "what is this window
-        // for". Text/Caption ride the app violet; the rest borrow palette hues.
-        let (color, glyph) = match noun {
-            "Caption" => ("#8f7bf0", "T"),
-            "Text" => ("#8f7bf0", "T"),
-            "Shape" => ("#a48ff5", "◆"),
-            "Clip" => ("#5b8def", "▦"),
-            "Cutaway" => ("#e86aa6", "⧉"),
-            "Audio" => ("#3dd6c8", "♪"),
-            _ => ("#8f7bf0", "◆"),
-        };
-        (color, glyph, noun.to_string(), "Now editing")
-    } else {
-        let (color, glyph, name) = match phase {
-            Phase::Add => ("#8f7bf0", "＋", "Add"),
-            Phase::Cut => ("#8f7bf0", "✂", "Cut"),
-            Phase::Style => ("#8f7bf0", "✦", "Style"),
-            Phase::Effects => ("#f0a04f", "◧", "Effects"),
-            Phase::Background => ("#8f7bf0", "▧", "Background"),
-            Phase::Text => ("#8f7bf0", "T", "Text"),
-            Phase::Audio => ("#3dd6c8", "♪", "Audio"),
-            Phase::Export => ("#8f7bf0", "⇪", "Export"),
-        };
-        (color, glyph, name.to_string(), "Workspace")
-    }
-}
-
-/// What was right-clicked; picks the context menu's contents.
-#[derive(Clone, Copy, PartialEq)]
-enum Ctx {
-    Monitor,
-    Timeline,
-    Clip(usize),
-    Over(usize),
-    Aud(usize),
-    Title(usize),
-}
-
-/// The transition leading into clip `i`, clamped to something both it and the
-/// clip before it can accommodate. 0 for a cut, and always 0 for the first clip.
-fn fade_in(clips: &[Clip], i: usize) -> f64 {
-    if i == 0 || i >= clips.len() {
-        return 0.0;
-    }
-    if engine::xfade_name(&clips[i].transition).is_empty() {
-        return 0.0;
-    }
-    clips[i].trans_dur.clamp(0.0, clips[i].trimmed().min(clips[i - 1].trimmed()) * 0.9)
-}
-
-/// How much of the timeline each clip owns. A transition overlaps a clip's tail
-/// with the next clip's head, so a clip followed by one owns less than it runs
-/// for. These sum to the finished length, and every position on the timeline —
-/// the ruler, the playhead, the magnet, clip widths — is derived from them.
-fn extents(clips: &[Clip]) -> Vec<f64> {
-    (0..clips.len())
-        .map(|i| (clips[i].trimmed() - fade_in(clips, i + 1)).max(0.05))
-        .collect()
-}
-
-/// If `t` falls inside the transition leading into some clip, return that
-/// clip's index, how far the blend has run (0..1), and the source time to pull
-/// its frame from. The overlap sits at the end of the outgoing clip's extent,
-/// which is exactly where the next clip's own footage has already started.
-fn transition_at(clips: &[Clip], t: f64) -> Option<(usize, f64, f64)> {
-    let ext = extents(clips);
-    let mut start = 0.0;
-    for i in 0..clips.len() {
-        let end = start + ext[i];
-        let d = fade_in(clips, i + 1);
-        if d > 0.0 && t >= end - d && t < end {
-            let progress = ((t - (end - d)) / d).clamp(0.0, 1.0);
-            let next = &clips[i + 1];
-            // The incoming clip is already running during the overlap.
-            let into = (t - (end - d)) * next.speed.max(0.01);
-            return Some((i + 1, progress, next.src_at(into)));
-        }
-        start = end;
-    }
-    None
-}
-
-/// Map a global timeline position to (clip index, source-file time) on V1.
-/// A retimed clip covers `speed` seconds of source per timeline second.
-fn locate(clips: &[Clip], t: f64) -> Option<(usize, f64)> {
-    let mut acc = 0.0;
-    for (i, d) in extents(clips).into_iter().enumerate() {
-        let c = &clips[i];
-        if t < acc + d || i + 1 == clips.len() {
-            return Some((i, c.src_at((t - acc).clamp(0.0, d) * c.speed.max(0.01))));
-        }
-        acc += d;
-    }
-    None
-}
-
-fn fmt_t(s: f64) -> String {
-    let s = s.max(0.0); // squash negatives and -0.0 → "0:00.0"
-    format!("{}:{:04.1}", (s / 60.0) as u32, s % 60.0)
-}
-
-/// Short clip length for the filmstrip badge — iMovie-style "4.0s" under a
-/// minute, "1.5h" at an hour and up, full deck readout in between.
-fn fmt_clip_dur(s: f64) -> String {
-    let s = s.max(0.0);
-    if s < 60.0 {
-        format!("{s:.1}s")
-    } else if s >= 3600.0 {
-        format!("{:.1}h", s / 3600.0)
-    } else {
-        fmt_t(s)
-    }
-}
-
-/// Resize a title from either edge. Left keeps the right edge fixed on the
-/// timeline; right only changes duration. `dt` is timeline seconds (drag right
-/// is positive). Minimum hold is 0.3s so a card can't vanish under the grip.
-fn title_edge_resize(at0: f64, dur0: f64, left: bool, dt: f64) -> (f64, f64) {
-    const MIN: f64 = 0.3;
-    if left {
-        let end = at0 + dur0;
-        let at = (at0 + dt).clamp(0.0, (end - MIN).max(0.0));
-        (at, (end - at).max(MIN))
-    } else {
-        (at0, (dur0 + dt).max(MIN))
-    }
-}
-
-/// Resize media from either edge. `free_at` is true for free-positioned items
-/// (V2 overlays): the left edge moves `at` so the right edge stays put. For V1
-/// (`free_at` false) only in/out change — timeline position is owned by extents.
-/// `dt` is timeline seconds; source in/out move by `dt * speed`.
-fn media_edge_resize(
-    at0: f64,
-    in0: f64,
-    out0: f64,
-    src_dur: f64,
-    speed: f64,
-    left: bool,
-    dt: f64,
-    free_at: bool,
-) -> (f64, f64, f64) {
-    const MIN_T: f64 = 0.1;
-    let speed = speed.max(0.01);
-    let min_src = MIN_T * speed;
-    if left {
-        let mut new_in = (in0 + dt * speed).clamp(0.0, (out0 - min_src).max(0.0));
-        if free_at {
-            let mut actual_dt = (new_in - in0) / speed;
-            // Don't let the card walk off the left of the timeline.
-            if at0 + actual_dt < 0.0 {
-                actual_dt = -at0;
-                new_in = (in0 + actual_dt * speed).clamp(0.0, (out0 - min_src).max(0.0));
-                actual_dt = (new_in - in0) / speed;
-            }
-            (at0 + actual_dt, new_in, out0)
-        } else {
-            (at0, new_in, out0)
-        }
-    } else {
-        let new_out = (out0 + dt * speed).clamp(in0 + min_src, src_dur.max(in0 + min_src));
-        (at0, in0, new_out)
-    }
-}
-
-/// CSS custom props that paint a cheap on-tile mock of a title look — colour,
-/// plate, outline, and vertical seat — so the style gallery reads without
-/// waiting on ffmpeg rasterize for every preset.
-fn title_preview_css(t: &TitleItem) -> String {
-    let color = title_color(&t.color);
-    let outline = title_color(&t.outline_color);
-    let bg = if t.boxed {
-        format!("rgba(0,0,0,{:.2})", t.box_opacity.clamp(0.35, 0.95))
-    } else {
-        "transparent".into()
-    };
-    let shadow = if t.outline > 0.0 {
-        let w = (t.outline / 3.5).clamp(1.0, 4.0);
-        format!("{w:.0}px {w:.0}px 0 {outline}, -{w:.0}px -{w:.0}px 0 {outline}, {w:.0}px -{w:.0}px 0 {outline}, -{w:.0}px {w:.0}px 0 {outline}")
-    } else {
-        "none".into()
-    };
-    let y = seat_y(t);
-    let seat = if y <= 0.22 {
-        "flex-start"
-    } else if y >= 0.62 {
-        "flex-end"
-    } else {
-        "center"
-    };
-    let size = (t.font_size / 9.0).clamp(9.0, 18.0);
-    format!(
-        "--mr-ts-color:{color};--mr-ts-bg:{bg};--mr-ts-shadow:{shadow};--mr-ts-seat:{seat};--mr-ts-size:{size:.0}px"
-    )
-}
-
-/// Timeline item class string: base + selection + group-mark + disable/solo.
-fn item_class(base: &str, sel: bool, mark: bool, disabled: bool, solo: bool) -> String {
-    format!(
-        "{base}{}{}{}{}",
-        if sel { " selected" } else { "" },
-        if mark { " marked" } else { "" },
-        if disabled { " disabled" } else { "" },
-        if solo { " solo" } else { "" },
-    )
-}
-
-/// How V1 clips paint filmstrip vs waveform — FCP Clip Appearance modes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ClipAppear {
-    /// Large waveforms only.
-    Wave,
-    /// Large wave + small film.
-    WaveFilm,
-    /// Film and wave the same height.
-    Equal,
-    /// Large film + small wave (the default iMovie-style look).
-    FilmWave,
-    /// Filmstrips only.
-    Film,
-    /// Clip labels only — compact name bars.
-    Labels,
-}
-
-impl ClipAppear {
-    const ALL: [ClipAppear; 6] = [
-        Self::Wave,
-        Self::WaveFilm,
-        Self::Equal,
-        Self::FilmWave,
-        Self::Film,
-        Self::Labels,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Wave => "Waveforms only",
-            Self::WaveFilm => "Large wave + small film",
-            Self::Equal => "Equal film and wave",
-            Self::FilmWave => "Large film + small wave",
-            Self::Film => "Filmstrips only",
-            Self::Labels => "Labels only",
-        }
-    }
-
-    /// Icon glyph for the mode button (Unicode stand-ins for FCP's icons).
-    fn glyph(self) -> &'static str {
-        match self {
-            Self::Wave => "▁▃▅",
-            Self::WaveFilm => "▬▁▃",
-            Self::Equal => "▬▃",
-            Self::FilmWave => "▬▁",
-            Self::Film => "▬",
-            Self::Labels => "▭",
-        }
-    }
-
-    /// Base film / wave heights in px before the clip-height multiplier.
-    fn base_heights(self) -> (f64, f64) {
-        match self {
-            Self::Wave => (0.0, 72.0),
-            Self::WaveFilm => (22.0, 56.0),
-            Self::Equal => (48.0, 48.0),
-            Self::FilmWave => (72.0, 22.0),
-            Self::Film => (72.0, 0.0),
-            Self::Labels => (28.0, 0.0),
-        }
-    }
-
-    /// `(film_px, wave_px)` after applying the height slider (0.5..=2.0).
-    fn heights(self, height: f64) -> (f64, f64) {
-        let m = height.clamp(0.5, 2.0);
-        let (f, w) = self.base_heights();
-        (f * m, w * m)
-    }
-
-    fn show_film(self) -> bool {
-        !matches!(self, Self::Wave)
-    }
-
-    fn show_wave(self) -> bool {
-        !matches!(self, Self::Film | Self::Labels)
-    }
-
-    fn labels_only(self) -> bool {
-        matches!(self, Self::Labels)
-    }
-}
-
-/// A cut at source-time `local` is valid only if both halves keep at least
-/// `min` seconds; returns the cut point when it is.
-fn cut_local(in_s: f64, out_s: f64, local: f64, min: f64) -> Option<f64> {
-    (local >= in_s + min && local <= out_s - min).then_some(local)
-}
-
-/// How long a freeze frame holds by default. Edge-resize stretches it after.
-const FREEZE_HOLD: f64 = 2.0;
-
-/// Instant replay: source seconds rewound from the playhead, played back at
-/// half speed so the beat reads on a short-form reel.
-const REPLAY_SRC: f64 = 1.5;
-const REPLAY_SPEED: f64 = 0.5;
-
-/// Two V1 clips can be joined when they are the same source file, same rate and
-/// direction, and the right clip's in-point continues the left's out-point —
-/// i.e. they were a split (or a freeze was removed) and the cut is still clean.
-fn can_join_clips(a: &Clip, b: &Clip) -> bool {
-    if a.path != b.path || a.reverse != b.reverse {
-        return false;
-    }
-    if (a.speed - b.speed).abs() > 1e-4 {
-        return false;
-    }
-    // Source continuity: forward clips abut out→in; reversed clips run the
-    // other way (right's out meets left's in on the file timeline).
-    if a.reverse {
-        (b.out_s - a.in_s).abs() < 1e-3
-    } else {
-        (a.out_s - b.in_s).abs() < 1e-3
-    }
-}
-
-/// Source in/out for an instant-replay segment ending at `local` (source time).
-/// Returns `None` if less than a tenth of a second of source is available.
-fn replay_span(in_s: f64, out_s: f64, local: f64, src_len: f64) -> Option<(f64, f64)> {
-    let local = local.clamp(in_s, out_s);
-    let start = (local - src_len).max(in_s);
-    if local - start < 0.1 {
-        return None;
-    }
-    Some((start, local))
-}
-
-/// Where a freeze frame lands relative to the V1 clip under the playhead.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum FreezePlace {
-    /// Split the clip at source-time `local`; freeze sits between the halves.
-    Split { local: f64 },
-    /// Playhead is near the head — freeze goes *before* this clip.
-    Before,
-    /// Playhead is near the tail (or the clip is tiny) — freeze goes *after*.
-    After,
-}
-
-/// Decide freeze placement from the clip's source range and the source time
-/// under the playhead. `None` if the local time is outside the kept span.
-fn freeze_place(in_s: f64, out_s: f64, local: f64, min: f64) -> Option<FreezePlace> {
-    if local < in_s - 1e-6 || local > out_s + 1e-6 {
-        return None;
-    }
-    let head = local - in_s >= min;
-    let tail = out_s - local >= min;
-    Some(match (head, tail) {
-        (true, true) => FreezePlace::Split { local },
-        (false, true) => FreezePlace::Before,
-        _ => FreezePlace::After,
-    })
-}
-
-/// In-memory clipboard for timeline items — not part of a project snapshot.
-#[derive(Clone, PartialEq)]
-enum ClipboardItem {
-    Main(Clip),
-    Over(OverlayItem),
-    Aud(AudioItem),
-    Title(TitleItem),
-}
-
-/// Magnetic timeline: how far an item anchored at `at` moves when a V1 edit
-/// rearranges the clips. `old` is each clip's (start, end) span before the
-/// edit; `new_start` maps an old clip index to its start after the edit
-/// (None = clip deleted). Unattached or orphaned items hold position.
-fn magnet_delta(at: f64, old: &[(f64, f64)], new_start: impl Fn(usize) -> Option<f64>) -> f64 {
-    old.iter()
-        .position(|&(s, e)| at >= s && at < e)
-        .and_then(|k| new_start(k).map(|ns| ns - old[k].0))
-        .unwrap_or(0.0)
-}
-
-/// A timeline lane, as a drop target.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Lane {
-    V1,
-    V2,
-    A1,
-    A2,
-}
-
-/// What a file is, by extension. An unknown extension is treated as video:
-/// `probe` decides for real, and its no-duration fallback catches images in
-/// containers these tables have never heard of.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
-    Video,
-    Still,
-    Audio,
-}
-
-fn kind_of(path: &str) -> Kind {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    if engine::AUDIO_EXT.contains(&ext.as_str()) {
-        Kind::Audio
-    } else if engine::IMAGE_EXT.contains(&ext.as_str()) {
-        Kind::Still
-    } else {
-        Kind::Video
-    }
-}
-
-/// Comma-join two filter chains, either of which may be empty.
-fn join_chain(a: String, b: String) -> String {
-    match (a.is_empty(), b.is_empty()) {
-        (true, _) => b,
-        (_, true) => a,
-        _ => format!("{a},{b}"),
-    }
-}
-
-fn file_name_of(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
-}
-
-/// Where a dropped file actually lands. The lane you drop on says what you
-/// meant, but the file has the final say: sound can't go on a video track and
-/// a photo has nothing to contribute to an audio one. Returns the lane to use,
-/// plus a note when that differs from where it was dropped.
-fn route_drop(kind: Kind, onto: Lane) -> Result<(Lane, Option<&'static str>), &'static str> {
-    match (kind, onto) {
-        // Sound is sound — A1/A2 both accept it; elsewhere it defaults to A1.
-        (Kind::Audio, Lane::A1) | (Kind::Audio, Lane::A2) => Ok((onto, None)),
-        (Kind::Audio, _) => Ok((Lane::A1, Some("audio goes to A1"))),
-        // A video dropped on an audio lane contributes its soundtrack.
-        (Kind::Video, Lane::A1) | (Kind::Video, Lane::A2) => {
-            Ok((onto, Some("using its soundtrack")))
-        }
-        (Kind::Still, Lane::A1) | (Kind::Still, Lane::A2) => {
-            Err("a photo has no sound to mix")
-        }
-        (_, lane) => Ok((lane, None)),
-    }
-}
-
-/// Lane tag → bus number stored on AudioItem.
-fn lane_num(lane: Lane) -> u8 {
-    match lane {
-        Lane::A2 => 2,
-        _ => 1,
-    }
-}
-
-/// Which index a drop at `t` seconds should insert before on V1. The main track
-/// is a concat with no gaps, so a drop can only ever mean "between these two
-/// clips" — never "at 12.4s". Past the midpoint of a clip means after it.
-fn insert_index(clips: &[Clip], t: f64) -> usize {
-    let mut acc = 0.0;
-    for (i, d) in extents(clips).into_iter().enumerate() {
-        if t < acc + d / 2.0 {
-            return i;
-        }
-        acc += d;
-    }
-    clips.len()
-}
-
-/// Snap `at` to the nearest of `targets` within `tol` seconds, else leave it.
-/// Targets are the things an editor actually lines up against: clip cuts, the
-/// end of the reel, and the playhead.
-fn snap_to(at: f64, targets: &[f64], tol: f64) -> f64 {
-    targets
-        .iter()
-        .copied()
-        .filter(|t| (t - at).abs() <= tol)
-        .min_by(|a, b| (a - at).abs().total_cmp(&(b - at).abs()))
-        .unwrap_or(at)
-}
-
-/// Old→new index for a drag-reorder: clips[lo..lo+len] move so the block
-/// starts at `dest`, where `dest` indexes the sequence with the block removed.
-fn block_map(k: usize, lo: usize, len: usize, dest: usize) -> usize {
-    if k >= lo && k < lo + len {
-        dest + (k - lo)
-    } else {
-        let w = if k < lo { k } else { k - len };
-        if w < dest { w } else { w + len }
-    }
-}
-
-/// Localhost port the running editor listens on for live coordinate commands from
-/// the MCP server. ponytail: fixed port; `MORREEL_LIVE_PORT` overrides on a clash.
-const LIVE_PORT: u16 = 8177;
-
-fn live_port() -> u16 {
-    std::env::var("MORREEL_LIVE_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(LIVE_PORT)
-}
-
-/// One live command in flight: a plugin call and the channel to answer it on.
-struct LiveCmd {
-    plugin: String,
-    tool: String,
-    params: serde_json::Value,
-    reply: tokio::sync::oneshot::Sender<Result<String, String>>,
-}
-
-/// Accept newline-delimited JSON commands on localhost and hand each to the UI
-/// coroutine, writing its result back on the same connection. A request is
-/// `{"plugin","tool","params"}`; a reply is `{"ok": msg}` or `{"error": msg}`.
-///
-/// One connection at a time — a single editor driven by a single model needs no
-/// concurrency, and serial handling keeps every edit ordered on the undo stack.
-/// ponytail: loopback only, no auth — any local process can drive the editor,
-/// which is fine for a personal tool. Add a shared token the day it isn't.
-async fn live_server(live: Coroutine<LiveCmd>) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let port = live_port();
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("MorReel live control off — can't bind 127.0.0.1:{port}: {e}");
-            return;
-        }
-    };
-    eprintln!("MorReel live control listening on 127.0.0.1:{port}");
-    loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
-        let (rd, mut wr) = stream.into_split();
-        let mut lines = BufReader::new(rd).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let resp = match serde_json::from_str::<serde_json::Value>(&line) {
-                Ok(req) => {
-                    let plugin = req.get("plugin").and_then(|v| v.as_str()).unwrap_or("coords").to_string();
-                    let tool = req.get("tool").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                    let params = req.get("params").cloned().unwrap_or(serde_json::json!({}));
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    live.send(LiveCmd { plugin, tool, params, reply: tx });
-                    match rx.await {
-                        Ok(Ok(msg)) => serde_json::json!({ "ok": msg }),
-                        Ok(Err(e)) => serde_json::json!({ "error": e }),
-                        Err(_) => serde_json::json!({ "error": "editor dropped the command" }),
-                    }
-                }
-                Err(e) => serde_json::json!({ "error": format!("bad request: {e}") }),
-            };
-            let _ = wr.write_all(format!("{resp}\n").as_bytes()).await;
-        }
-    }
-}
-
-/// What the user asked to do to a hub plugin, carried up to the one handler that
-/// mutates install state and runs the per-kind side effects.
-#[derive(Clone, Copy, PartialEq)]
-enum HubAction {
-    Install,
-    Uninstall,
-    Enable,
-    Disable,
-}
+mod model;
+use model::*;
 
 /// One plugin's row in the Plugin Hub panel. A child component so its `id` can be
 /// cloned freely for each button's handler — the parent's rsx `for` loop can't
@@ -2596,10 +220,14 @@ editor_state! {
     overlays: Vec<OverlayItem> = Vec::<OverlayItem>::new,
     audios: Vec<AudioItem> = Vec::<AudioItem>::new,
     titles: Vec<TitleItem> = Vec::<TitleItem>::new,
+    adjustments: Vec<AdjustmentItem> = Vec::<AdjustmentItem>::new,
     selected: Option<Sel> = || None,
     playhead: f64 = || 0.0f64,
     show_overlays: bool = || true,
     show_titles: bool = || true,
+    v_lanes: u8 = || DEF_V_LANES,
+    t_lanes: u8 = || DEF_T_LANES,
+    a_lanes: u8 = || DEF_A_LANES,
     preview: String = String::new,
     status: String = || "Ready — add clips to start.".to_string(),
     export_progress: Option<f64> = || None,
@@ -2622,6 +250,11 @@ editor_state! {
     saved_json: Option<String> = || None,
     hub_gen: u64 = || 0u64,
     show_hub: bool = || false,
+    show_giphy: bool = || false,
+    giphy_query: String = String::new,
+    giphy_stickers: bool = || false,
+    giphy_results: Vec<giphy::Gif> = Vec::<giphy::Gif>::new,
+    giphy_busy: bool = || false,
     show_autocut: bool = || false,
     autocut_busy: bool = || false,
     autocut_noise: f64 = || 32.0_f64,
@@ -2681,6 +314,8 @@ editor_state! {
     // `vo_stop` is flipped true by Stop / V / Escape; the capture task watches it.
     vo_session: Option<(String, f64)> = || None,
     vo_stop: bool = || false,
+    // Seconds captured so far — grows the live A2 ghost tile during a take.
+    vo_len: f64 = || 0.0,
     // insp_open/insp_float/float_* are per-window inspector chrome, NOT shared —
     // localized in Editor so a popped window always shows the inspector even when
     // the main window has it docked or hidden.
@@ -2888,6 +523,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     let mut overlays = state.overlays;
     let mut audios = state.audios;
     let mut titles = state.titles;
+    let mut adjustments = state.adjustments;
     let mut selected = state.selected;
     let mut playhead = state.playhead; // global timeline seconds
     // Declutter the monitor while editing: hide the overlay (V2) or title (T)
@@ -2987,42 +623,53 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     let mut active_phase = state.active_phase;
 
     // Seek: playhead moves, selection follows the V1 clip underneath (only in the
-    // picture phases), preview shows whatever is on top (a V2 overlay covers V1
-    // while it runs).
+    // picture phases). Preview composites V1 → overlays (by track) → FX → titles,
+    // matching export so multi-track stacks read the same on the monitor.
     let mut seek_to = move |t: f64| {
         playhead.set(t);
         let any_solo = clips.read().iter().any(|c| c.enabled && c.solo)
             || overlays.read().iter().any(|o| o.enabled && o.solo)
             || audios.read().iter().any(|a| a.enabled && a.solo);
-        // Topmost title active at t, composited onto the preview frame.
-        let title_png = show_titles()
-            .then(|| {
-                titles
-                    .read()
-                    .iter()
-                    .rev()
-                    .find(|ti| ti.enabled && t >= ti.at && t < ti.at + ti.dur && !ti.pngs.is_empty())
-                    .and_then(|ti| {
-                        // A revealed title is a run of cards; show whichever is up
-                        // now, faded against the whole title rather than its step.
-                        let k = ti.card_at(t).unwrap_or(0).min(ti.pngs.len().saturating_sub(1));
-                        ti.pngs.get(k).map(|p| (p.clone(), title_alpha(t, ti.at, ti.dur)))
-                    })
-            })
-            .flatten();
-        let over = show_overlays()
-            .then(|| {
-                overlays.read().iter().find(|o| {
-                    o.enabled && t >= o.at && t < o.at + o.trimmed()
-                }).map(|o| {
+        // All title cards active at t, low track under high (export order).
+        let title_stack: Vec<(String, f64)> = if show_titles() {
+            let ts = titles.read();
+            let mut active: Vec<&TitleItem> = ts
+                .iter()
+                .filter(|ti| ti.enabled && t >= ti.at && t < ti.at + ti.dur && !ti.pngs.is_empty())
+                .collect();
+            active.sort_by_key(|ti| ti.track);
+            active
+                .into_iter()
+                .filter_map(|ti| {
+                    let k = ti.card_at(t).unwrap_or(0).min(ti.pngs.len().saturating_sub(1));
+                    ti.pngs
+                        .get(k)
+                        .map(|p| (p.clone(), title_alpha(t, ti.at, ti.dur)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // All enabled overlays at t, sorted low track → high (V2 under V3…).
+        let overlay_layers: Vec<(String, f64, String, String)> = if show_overlays() {
+            let ov = overlays.read();
+            let mut ovs: Vec<&OverlayItem> = ov
+                .iter()
+                .filter(|o| o.enabled && t >= o.at && t < o.at + o.trimmed())
+                .collect();
+            ovs.sort_by_key(|o| o.track);
+            ovs.into_iter()
+                .map(|o| {
                     let mut look = o.look();
                     if any_solo && !o.solo {
                         look = join_chain(look, "hue=s=0".into());
                     }
                     (o.scrub_path(), o.src_at(t - o.at), o.framing.clone(), look)
                 })
-            })
-            .flatten();
+                .collect()
+        } else {
+            Vec::new()
+        };
         let loc = locate(&clips.read(), t);
         if let Some((i, _)) = loc {
             // Only follow the clip under the playhead in the picture-editing
@@ -3037,10 +684,24 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 selected.set(Some(Sel::Main(i)));
             }
         }
-        let mut layers = engine::Over { title: title_png, ..Default::default() };
-        if let Some((path, local, fr, eff)) = over {
-            request_preview(path, local, fr, eff, layers);
-        } else if let Some((i, local)) = loc {
+        // Adjustment layers covering the playhead grade the composite below the
+        // titles. Chaining every active look mirrors the export, where each
+        // adjustment applies in sequence over the running picture.
+        let active_adjust: Vec<String> = adjustments
+            .read()
+            .iter()
+            .filter(|a| a.enabled && t >= a.at && t < a.at + a.dur)
+            .map(|a| a.look())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let adjust = (!active_adjust.is_empty()).then(|| active_adjust.join(","));
+        let mut layers = engine::Over {
+            titles: title_stack,
+            layers: overlay_layers,
+            adjust,
+            ..Default::default()
+        };
+        if let Some((i, local)) = loc {
             let (path, fr, eff) = {
                 let cl = clips.read();
                 let c = &cl[i];
@@ -3076,6 +737,11 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 }
             }
             request_preview(path, local, fr, eff, layers);
+        } else if let Some((path, local, fr, eff)) = layers.layers.first().cloned() {
+            // No V1: still show stacked cutaways (edge case / empty main track).
+            let mut rest = layers;
+            rest.layers.remove(0);
+            request_preview(path, local, fr, eff, rest);
         }
     };
 
@@ -3177,13 +843,20 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     // item lands on the beat instead of near it.
     let mut markers = state.markers;
     let mut mixer = state.mixer;
+    let mut v_lanes = state.v_lanes;
+    let mut t_lanes = state.t_lanes;
+    let mut a_lanes = state.a_lanes;
     let snapshot = move || Snapshot {
         clips: clips(),
         overlays: overlays(),
         audios: audios(),
         titles: titles(),
+        adjustments: adjustments(),
         markers: markers(),
         mixer: mixer(),
+        v_lanes: v_lanes(),
+        t_lanes: t_lanes(),
+        a_lanes: a_lanes(),
     };
     // Unsaved-changes tracking. Baseline = the reel's serialized form as last
     // saved or opened; None means never saved this session. Comparing the *JSON*
@@ -3192,12 +865,18 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     let mut saved_json = state.saved_json;
     let is_dirty = move || timeline_dirty(&snapshot(), saved_json().as_deref());
     let mut restore = move |s: Snapshot| {
+        let mut s = s;
+        normalize_lanes(&mut s);
         clips.set(s.clips);
         overlays.set(s.overlays);
         audios.set(s.audios);
         titles.set(s.titles);
+        adjustments.set(s.adjustments);
         markers.set(s.markers);
         mixer.set(s.mixer);
+        v_lanes.set(s.v_lanes);
+        t_lanes.set(s.t_lanes);
+        a_lanes.set(s.a_lanes);
         // Indices just moved under us; a stale selection would edit the wrong item.
         selected.set(None);
         marked.write().clear();
@@ -3324,6 +1003,40 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     // bumps to re-render when the Plugin Hub panel installs/toggles something.
     let mut hub_gen = state.hub_gen;
     let mut show_hub = state.show_hub;
+    let mut show_giphy = state.show_giphy;
+    let mut giphy_query = state.giphy_query;
+    let mut giphy_stickers = state.giphy_stickers;
+    let mut giphy_results = state.giphy_results;
+    let mut giphy_busy = state.giphy_busy;
+    // Search GIPHY (or clear on empty). One coroutine-free spawn, guarded by busy.
+    let run_giphy_search = move |_: ()| {
+        if giphy_busy() {
+            return;
+        }
+        spawn(async move {
+            let q = giphy_query().trim().to_string();
+            if q.is_empty() {
+                return;
+            }
+            let key = match giphy::api_key() {
+                Ok(k) => k,
+                Err(e) => {
+                    status.set(e);
+                    return;
+                }
+            };
+            giphy_busy.set(true);
+            status.set(format!("Searching GIPHY for “{q}”…"));
+            match giphy::search(&q, giphy_stickers(), &key).await {
+                Ok(hits) => {
+                    status.set(format!("{} result(s) — click one to drop it on V2.", hits.len()));
+                    giphy_results.set(hits);
+                }
+                Err(e) => status.set(format!("GIPHY: {e}")),
+            }
+            giphy_busy.set(false);
+        });
+    };
     use_hook(|| {
         if let Some(dir) = hub::hub_dir() {
             let manifests = hub::load_manifests(&dir);
@@ -3376,6 +1089,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             Sel::Over(j) => overlays.read().get(j).map_or(0, |o| o.group),
             Sel::Aud(k) => audios.read().get(k).map_or(0, |a| a.group),
             Sel::Title(k) => titles.read().get(k).map_or(0, |t| t.group),
+            Sel::Adjust(k) => adjustments.read().get(k).map_or(0, |a| a.group),
         }
     };
     let mut group_marked = move |_: ()| {
@@ -3466,6 +1180,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             Sel::Over(j) => overlays.read().get(j).map(|o| o.at),
             Sel::Aud(k) => audios.read().get(k).map(|a| a.at),
             Sel::Title(k) => titles.read().get(k).map(|t| t.at),
+            Sel::Adjust(k) => adjustments.read().get(k).map(|a| a.at),
             Sel::Main(_) => None,
         }
     };
@@ -3479,6 +1194,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 Sel::Over(j) => overlays.write()[j].at = at,
                 Sel::Aud(k) => audios.write()[k].at = at,
                 Sel::Title(k) => titles.write()[k].at = at,
+                Sel::Adjust(k) => adjustments.write()[k].at = at,
                 Sel::Main(_) => {}
             }
             return;
@@ -3486,6 +1202,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         let min_at = overlays.read().iter().filter(|o| o.group == gid).map(|o| o.at)
             .chain(audios.read().iter().filter(|a| a.group == gid).map(|a| a.at))
             .chain(titles.read().iter().filter(|t| t.group == gid).map(|t| t.at))
+            .chain(adjustments.read().iter().filter(|a| a.group == gid).map(|a| a.at))
             .fold(f64::MAX, f64::min);
         let dt = dt.max(-min_at);
         for o in overlays.write().iter_mut().filter(|o| o.group == gid) {
@@ -3496,6 +1213,9 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         }
         for t in titles.write().iter_mut().filter(|t| t.group == gid) {
             t.at += dt;
+        }
+        for a in adjustments.write().iter_mut().filter(|a| a.group == gid) {
+            a.at += dt;
         }
     };
 
@@ -3844,6 +1564,15 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             }
         }
         ride(old, &|k| Some(start_of(k)));
+        // Park the playhead on the edge you just trimmed so the monitor shows it,
+        // not a stale frame — the whole point of a ripple trim is seeing the cut.
+        // OUT → last kept frame (edge minus a frame); IN → the clip's new first.
+        let frame = 1.0 / engine::FPS as f64;
+        seek_to(if edge_out {
+            (start_of(i + 1) - frame).max(start_of(i))
+        } else {
+            start_of(i)
+        });
         let (a, b) = { let c = &clips.read()[i]; (c.in_s, c.out_s) };
         status.set(format!(
             "Trim {} {:+}f  →  {a:.2}..{b:.2}s",
@@ -3954,13 +1683,21 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         });
     };
 
-    // A cutaway on V2 starting at `at`. Shared by the dialog and by drops.
-    let add_overlay_path = move |path: String, at: f64| {
+    // A cutaway on overlay track `track` (2=V2…) starting at `at`.
+    let mut add_overlay_path = move |path: String, at: f64, track: u8| {
+        let track = track.max(2).min(1 + v_lanes());
+        // Ensure the destination track is visible.
+        if track > 1 + v_lanes() {
+            v_lanes.set((track - 1).min(MAX_V_LANES));
+        }
         spawn(async move {
             let name = file_name_of(&path);
             match engine::probe(&path).await {
                 Ok((duration, _)) => {
                     push_undo("");
+                    if track > 1 + v_lanes() {
+                        v_lanes.set((track - 1).clamp(1, MAX_V_LANES));
+                    }
                     overlays.write().push(OverlayItem {
                         path: path.clone(),
                         name,
@@ -3976,6 +1713,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         speed: 1.0,
                         reverse: false,
                         blend: String::new(),
+                        track,
                         proxy: String::new(),
                         group: 0,
                         enabled: true,
@@ -3983,30 +1721,34 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     });
                     queue_proxy(path);
                     selected.set(Some(Sel::Over(overlays.read().len() - 1)));
-                    status.set(format!("Overlay at {} — V2 covers V1 while it runs.", fmt_t(at)));
+                    status.set(format!(
+                        "Overlay at {} — V{track} over V1 while it runs.",
+                        fmt_t(at)
+                    ));
                 }
                 Err(e) => status.set(format!("Could not add overlay: {e}")),
             }
         });
     };
 
-    let add_overlay = move |_: ()| {
+    let add_overlay = move |track: u8| {
+        let track = track.max(2);
         spawn(async move {
             let Some(f) = rfd::AsyncFileDialog::new()
                 .add_filter("Video & photos", &media_ext())
                 .add_filter("All files", &["*"])
-                .set_title("Add overlay (V2)")
+                .set_title(format!("Add overlay (V{track})"))
                 .pick_file()
                 .await
             else {
                 return;
             };
-            add_overlay_path(f.path().display().to_string(), playhead());
+            add_overlay_path(f.path().display().to_string(), playhead(), track);
         });
     };
 
-    // Sound under the main track from `at` onto bus `lane` (1=A1, 2=A2). A
-    // video dropped here contributes its soundtrack.
+    // Sound under the main track from `at` onto bus `lane` (1=A1, 2=A2, …).
+    // A video dropped here contributes its soundtrack.
     let add_audio_path = move |path: String, at: f64, lane: u8| {
         spawn(async move {
             let name = file_name_of(&path);
@@ -4017,7 +1759,11 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         return;
                     }
                     push_undo("");
-                    let bus = if lane >= 2 { 2 } else { 1 };
+                    let bus = lane.max(1).min(MAX_A_LANES);
+                    if bus > a_lanes() {
+                        a_lanes.set(bus);
+                    }
+                    mixer.write().ensure_lanes(bus);
                     audios.write().push(AudioItem {
                         path: path.clone(),
                         name,
@@ -4028,9 +1774,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         ..Default::default()
                     });
                     selected.set(Some(Sel::Aud(audios.read().len() - 1)));
-                    let tag = if bus >= 2 { "A2" } else { "A1" };
                     status.set(format!(
-                        "Audio on {tag} at {} — mixed under the main track.",
+                        "Audio on A{bus} at {} — mixed under the main track.",
                         fmt_t(at)
                     ));
                     // Waveform renders in the background; splits share it by path.
@@ -4045,20 +1790,49 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         if clips.read().is_empty() {
             return;
         }
-        let tag = if lane >= 2 { "A2" } else { "A1" };
+        let bus = lane.max(1).min(MAX_A_LANES);
         spawn(async move {
             let Some(f) = rfd::AsyncFileDialog::new()
                 .add_filter("Audio", engine::AUDIO_EXT)
                 .add_filter("Video (use its soundtrack)", engine::VIDEO_EXT)
                 .add_filter("All files", &["*"])
-                .set_title(format!("Add audio ({tag})"))
+                .set_title(format!("Add audio (A{bus})"))
                 .pick_file()
                 .await
             else {
                 return;
             };
-            add_audio_path(f.path().display().to_string(), playhead(), lane);
+            add_audio_path(f.path().display().to_string(), playhead(), bus);
         });
+    };
+
+    let mut add_v_track = move |_: ()| {
+        if v_lanes() >= MAX_V_LANES {
+            status.set(format!("Already at max video tracks (V{}).", 1 + MAX_V_LANES));
+            return;
+        }
+        push_undo("");
+        v_lanes.set(v_lanes() + 1);
+        status.set(format!("Added video track V{}.", 1 + v_lanes()));
+    };
+    let mut add_t_track = move |_: ()| {
+        if t_lanes() >= MAX_T_LANES {
+            status.set(format!("Already at max text tracks (T{}).", MAX_T_LANES));
+            return;
+        }
+        push_undo("");
+        t_lanes.set(t_lanes() + 1);
+        status.set(format!("Added text track T{}.", t_lanes()));
+    };
+    let mut add_a_track = move |_: ()| {
+        if a_lanes() >= MAX_A_LANES {
+            status.set(format!("Already at max audio tracks (A{}).", MAX_A_LANES));
+            return;
+        }
+        push_undo("");
+        a_lanes.set(a_lanes() + 1);
+        mixer.write().ensure_lanes(a_lanes());
+        status.set(format!("Added audio track A{}.", a_lanes()));
     };
 
     let mut add_title = move |_: ()| {
@@ -4103,7 +1877,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         status.set(format!("Added \"{name}\" at the playhead — type over it."));
     };
 
-    let gather_specs = move || -> (Vec<ClipSpec>, Vec<OverlaySpec>, Vec<TitleSpec>, Vec<AudioSpec>) {
+    let gather_specs = move || -> (Vec<ClipSpec>, Vec<OverlaySpec>, Vec<engine::AdjustSpec>, Vec<TitleSpec>, Vec<AudioSpec>) {
         // The mixer folds in once, here: V1 gain scales every clip's own audio;
         // A1/A2 gain scales (or, when muted/soloed-out, drops) each bed. Both
         // preview and export come through this function, so they stay in step.
@@ -4130,10 +1904,12 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 s
             })
             .collect();
-        let ospecs = ov
-            .iter()
-            .filter(|o| o.enabled)
-            .map(|o| {
+        // Sort by track so higher lanes composite last (on top) — matches preview.
+        let mut o_ordered: Vec<_> = ov.iter().enumerate().filter(|(_, o)| o.enabled).collect();
+        o_ordered.sort_by_key(|(i, o)| (o.track, *i));
+        let ospecs = o_ordered
+            .into_iter()
+            .map(|(_, o)| {
                 let mut effect = o.look();
                 if any_solo && !o.solo {
                     effect = join_chain(effect, "hue=s=0".into());
@@ -4151,11 +1927,16 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 }
             })
             .collect();
-        let tspecs = titles
-            .read()
+        let titles_r = titles.read();
+        let mut t_ordered: Vec<_> = titles_r
             .iter()
-            .filter(|t| t.enabled && !t.pngs.is_empty())
-            .flat_map(|t| {
+            .enumerate()
+            .filter(|(_, t)| t.enabled && !t.pngs.is_empty())
+            .collect();
+        t_ordered.sort_by_key(|(i, t)| (t.track, *i));
+        let tspecs = t_ordered
+            .into_iter()
+            .flat_map(|(_, t)| {
                 let segs = t.segments();
                 let n = segs.len().min(t.pngs.len());
                 // Only the first card slides on and only the last fades out, so
@@ -4206,7 +1987,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 })
             })
             .collect();
-        (specs, ospecs, tspecs, aspecs)
+        let adjspecs = adjustments.read().iter().map(|a| a.spec()).collect();
+        (specs, ospecs, adjspecs, tspecs, aspecs)
     };
 
     // In-app playback: a timer walks the playhead in real time and reuses the
@@ -4228,7 +2010,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         playing.set(true);
         spawn(async move {
             let wav = std::env::temp_dir().join("morreel-playmix.wav");
-            let (specs, _, _, aspecs) = gather_specs();
+            let (specs, _, _, _, aspecs) = gather_specs();
             let mut audio = match engine::render_audio_mix(&specs, &aspecs, &wav).await {
                 // Guard: paused or superseded while the mix was rendering.
                 Ok(()) if playing() && play_gen() == g => match engine::launch_audio(&wav, playhead()) {
@@ -4313,6 +2095,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     // Capture runs in a background task so the UI stays responsive.
     let mut vo_session = state.vo_session;
     let mut vo_stop = state.vo_stop;
+    let mut vo_len = state.vo_len;
     let mut stop_voiceover = move |_: ()| {
         if vo_session().is_none() {
             return;
@@ -4332,6 +2115,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         let path_s = path.display().to_string();
         let at = playhead().max(0.0);
         vo_stop.set(false);
+        vo_len.set(0.0);
         vo_session.set(Some((path_s.clone(), at)));
         status.set(format!(
             "● Recording voiceover from {} — press V or Stop when done.",
@@ -4351,10 +2135,13 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     return;
                 }
             };
+            let started = std::time::Instant::now();
             loop {
                 if vo_stop() {
                     break;
                 }
+                // Grow the A2 ghost tile in step with the take (~12 fps).
+                vo_len.set(started.elapsed().as_secs_f64());
                 match child.try_wait() {
                     Ok(None) => {}
                     Ok(Some(_)) => {
@@ -4625,7 +2412,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             // Reuses the export progress bar; also parks export/preview while busy.
             export_progress.set(Some(0.0));
             let res = {
-                let (specs, _, _, _) = gather_specs();
+                let (specs, _, _, _, _) = gather_specs();
                 let total: f64 = specs.iter().map(ClipSpec::trimmed).sum();
                 async move {
                     // V1 audio only: A1 music mixed under would pollute the
@@ -4722,10 +2509,10 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 return;
             };
             ensure_titles().await;
-            let (specs, ospecs, tspecs, aspecs) = gather_specs();
+            let (specs, ospecs, adjspecs, tspecs, aspecs) = gather_specs();
             export_progress.set(Some(0.0));
             status.set(format!("Exporting {} at {}…", opts.format.label(), engine::size_label(opts.width)));
-            let res = engine::export(&specs, &ospecs, &tspecs, &aspecs, file.path(), opts, |p| {
+            let res = engine::export(&specs, &ospecs, &adjspecs, &tspecs, &aspecs, file.path(), opts, |p| {
                 export_progress.set(Some(p))
             })
             .await;
@@ -4754,10 +2541,10 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         spawn(async move {
             let out = std::env::temp_dir().join("morreel-preview.mp4");
             ensure_titles().await;
-            let (specs, ospecs, tspecs, aspecs) = gather_specs();
+            let (specs, ospecs, adjspecs, tspecs, aspecs) = gather_specs();
             export_progress.set(Some(0.0));
             status.set("Rendering preview…".to_string());
-            let res = engine::export(&specs, &ospecs, &tspecs, &aspecs, &out, engine::ExportOpts::preview(), |p| {
+            let res = engine::export(&specs, &ospecs, &adjspecs, &tspecs, &aspecs, &out, engine::ExportOpts::preview(), |p| {
                 export_progress.set(Some(p))
             })
             .await;
@@ -4814,8 +2601,26 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 titles.write().remove(k);
                 selected.set(None);
             }
+            Some(Sel::Adjust(k)) => {
+                adjustments.write().remove(k);
+                selected.set(None);
+                seek_to(playhead()); // its look leaves the composite
+            }
             None => {}
         }
+    };
+
+    // Drop a full-frame adjustment layer at the playhead. Default span reaches
+    // the end of the reel (min 1 s), which is the usual "grade the rest of this"
+    // intent; trim it on the FX lane or move it like any other lane item.
+    let mut add_adjustment = move |_: ()| {
+        push_undo("");
+        let at = playhead();
+        let dur = (total_of() - at).max(1.0);
+        adjustments.write().push(AdjustmentItem::new(at, dur));
+        selected.set(Some(Sel::Adjust(adjustments.read().len() - 1)));
+        seek_to(at);
+        status.set("Adjustment layer added — grade or add an effect in the Style inspector.".to_string());
     };
 
     // Lift a V1 clip's soundtrack onto A1 and mute the picture — so you can
@@ -5103,7 +2908,21 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 });
                 seek_to(playhead());
             }
-            None => status.set("Select a clip, cutaway, bed or title to disable.".into()),
+            Some(Sel::Adjust(k)) => {
+                push_undo("");
+                let mut aj = adjustments.write();
+                let Some(a) = aj.get_mut(k) else { return };
+                a.enabled = !a.enabled;
+                let on = a.enabled;
+                drop(aj);
+                status.set(if on {
+                    "Adjustment layer enabled.".into()
+                } else {
+                    "Adjustment layer disabled — its look drops out.".into()
+                });
+                seek_to(playhead());
+            }
+            None => status.set("Select a clip, cutaway, bed, title or FX layer to disable.".into()),
         }
     };
 
@@ -5358,6 +3177,9 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             Some(Sel::Over(j)) => overlays.read().get(j).cloned().map(ClipboardItem::Over),
             Some(Sel::Aud(k)) => audios.read().get(k).cloned().map(ClipboardItem::Aud),
             Some(Sel::Title(k)) => titles.read().get(k).cloned().map(ClipboardItem::Title),
+            // ponytail: adjustment copy/paste not wired yet — cheap to add a
+            // ClipboardItem::Adjust variant when someone wants to duplicate one.
+            Some(Sel::Adjust(_)) => None,
             None => None,
         };
         match item {
@@ -5419,6 +3241,91 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         }
     };
 
+    // Paste just the *look* — transform, grade and effect — from the last copied
+    // clip/cutaway onto the selected one, keeping its media and timing. FCP's
+    // "Paste Attributes": the fast way to make several clips match one.
+    let mut paste_attrs = move |_: ()| {
+        let Some(item) = clipboard() else {
+            status.set("Copy a clip or cutaway first (Ctrl+C), then paste its look.".to_string());
+            return;
+        };
+        let attrs = match &item {
+            ClipboardItem::Main(c) => Some((c.transform.clone(), c.grade, c.effect.clone(), c.effect_amount)),
+            ClipboardItem::Over(o) => Some((o.transform.clone(), o.grade, o.effect.clone(), o.effect_amount)),
+            _ => None,
+        };
+        let Some((xf, gr, eff, amt)) = attrs else {
+            status.set("The clipboard holds audio or a title — copy a clip or cutaway to paste a look.".to_string());
+            return;
+        };
+        push_undo("");
+        let applied = match selected() {
+            Some(Sel::Main(i)) if i < clips.read().len() => {
+                let mut cl = clips.write();
+                cl[i].transform = xf;
+                cl[i].grade = gr;
+                cl[i].effect = eff;
+                cl[i].effect_amount = amt;
+                true
+            }
+            Some(Sel::Over(j)) if j < overlays.read().len() => {
+                let mut ov = overlays.write();
+                ov[j].transform = xf;
+                ov[j].grade = gr;
+                ov[j].effect = eff;
+                ov[j].effect_amount = amt;
+                true
+            }
+            _ => false,
+        };
+        if applied {
+            seek_to(playhead());
+            status.set("Pasted look — transform, grade and effect.".to_string());
+        } else {
+            status.set("Select a V1 clip or V2 cutaway to paste the look onto.".to_string());
+        }
+    };
+
+    // Strip the added look back to defaults — identity transform, neutral grade,
+    // no effect. FCP's "Remove Attributes". Framing, speed and volume stay: they
+    // are how the source fills the frame and plays, not styling. Works on an FX
+    // layer too (it carries grade + effect, no transform).
+    let mut reset_attrs = move |_: ()| {
+        push_undo("");
+        let applied = match selected() {
+            Some(Sel::Main(i)) if i < clips.read().len() => {
+                let mut cl = clips.write();
+                cl[i].transform = engine::AnimatedTransform::default();
+                cl[i].grade = engine::Grade::default();
+                cl[i].effect = "None".into();
+                cl[i].effect_amount = 1.0;
+                true
+            }
+            Some(Sel::Over(j)) if j < overlays.read().len() => {
+                let mut ov = overlays.write();
+                ov[j].transform = engine::AnimatedTransform::default();
+                ov[j].grade = engine::Grade::default();
+                ov[j].effect = "None".into();
+                ov[j].effect_amount = 1.0;
+                true
+            }
+            Some(Sel::Adjust(k)) if k < adjustments.read().len() => {
+                let mut aj = adjustments.write();
+                aj[k].grade = engine::Grade::default();
+                aj[k].effect = "None".into();
+                aj[k].effect_amount = 1.0;
+                true
+            }
+            _ => false,
+        };
+        if applied {
+            seek_to(playhead());
+            status.set("Reset look to default.".to_string());
+        } else {
+            status.set("Select a clip, cutaway or FX layer to reset its look.".to_string());
+        }
+    };
+
     let mut step_sel = move |d: i64| {
         let len = clips.read().len();
         if len == 0 {
@@ -5433,6 +3340,23 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
 
     let mut nudge = move |d: f64| {
         seek_to((playhead() + d).clamp(0.0, total_of()));
+    };
+
+    // Frame-nudge the selected lane item (cutaway / title / bed / FX) along the
+    // timeline — the keyboard equivalent of the audio ±1f buttons, extended to
+    // every free-position lane. V1 is magnetic (gapless concat), so it has no
+    // free position to nudge. Grouped members ride along (shift_lane).
+    let mut nudge_item = move |frames: f64| {
+        let Some(sel) = selected() else {
+            status.set("Select a cutaway, title, bed or FX layer to nudge.".to_string());
+            return;
+        };
+        if matches!(sel, Sel::Main(_)) {
+            status.set("V1 clips are magnetic — nudge a cutaway, title, bed or FX layer instead.".to_string());
+            return;
+        }
+        shift_lane(sel, frames / engine::FPS as f64);
+        seek_to(playhead());
     };
 
     // Jump the playhead to the previous/next edit point — a V1 cut, i.e. the
@@ -5594,11 +3518,24 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         }
     };
 
+    // The ease of the key sitting at the playhead for this row, if any — drives
+    // the velocity chip. Same clip-local clock as edit_sel_at.
+    let sel_key_interp = move |label: &str| -> Option<keyframe::Interp> {
+        let (start, speed, _in_s, dur) = sel_anchor()?;
+        let t = ((playhead() - start) * speed).clamp(0.0, dur);
+        match selected() {
+            Some(Sel::Main(i)) => clips.read().get(i).and_then(|c| xf_key_interp(&c.transform, label, t)),
+            Some(Sel::Over(j)) => overlays.read().get(j).and_then(|o| xf_key_interp(&o.transform, label, t)),
+            _ => None,
+        }
+    };
+
     // The selected element's grade, whichever lane it is on. Mirrors
     // selected_xf so the one grade panel drives both V1 and V2.
     let selected_grade = move || match selected() {
         Some(Sel::Main(i)) => clips.read().get(i).map(|c| c.grade),
         Some(Sel::Over(j)) => overlays.read().get(j).map(|o| o.grade),
+        Some(Sel::Adjust(k)) => adjustments.read().get(k).map(|a| a.grade),
         _ => None,
     };
     let mut set_selected_grade = move |g: engine::Grade| {
@@ -5612,6 +3549,13 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 let mut ov = overlays.write();
                 ov[j].grade = g;
                 Some((ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look()))
+            }
+            // An adjustment has no media to scrub — its look shows only on the
+            // full composite, so refresh the whole preview at the playhead.
+            Some(Sel::Adjust(k)) if k < adjustments.read().len() => {
+                adjustments.write()[k].grade = g;
+                seek_to(playhead());
+                None
             }
             _ => None,
         };
@@ -5775,6 +3719,23 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                 );
                             },
                             if sel_field_animated(label) { "◆" } else { "◇" }
+                        }
+                        // Velocity: when a key sits at the playhead, cycle its
+                        // ease (Ease → Lin → Hold). Each maps to a different
+                        // segment curve in the engine, so the tween's speed
+                        // changes in preview and export alike.
+                        if let Some(cur) = sel_key_interp(label) {
+                            button {
+                                r#type: "button",
+                                class: "mr-kf-ease",
+                                title: "Keyframe velocity — click to cycle ease in/out, linear, hold",
+                                onclick: move |_| {
+                                    push_undo("keyframe-ease");
+                                    edit_sel_at(&|at, t| xf_cycle_interp(at, label, t));
+                                    status.set("Keyframe velocity changed.".to_string());
+                                },
+                                "{interp_glyph(cur)}"
+                            }
                         }
                     }
                 }
@@ -5984,6 +3945,12 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     use_shortcut(Some("ALT+.".into()), is_main.then(|| EventHandler::new(move |()| ripple_trim(true, 1.0))));
     use_shortcut(Some("SHIFT+ALT+,".into()), is_main.then(|| EventHandler::new(move |()| ripple_trim(false, -1.0))));
     use_shortcut(Some("SHIFT+ALT+.".into()), is_main.then(|| EventHandler::new(move |()| ripple_trim(false, 1.0))));
+    // < / > (Shift+,/.) move the selected lane item one frame; add Ctrl for ten —
+    // frame-accurate sync for cutaways, captions, music and FX layers.
+    use_shortcut(Some("SHIFT+,".into()), is_main.then(|| EventHandler::new(move |()| nudge_item(-1.0))));
+    use_shortcut(Some("SHIFT+.".into()), is_main.then(|| EventHandler::new(move |()| nudge_item(1.0))));
+    use_shortcut(Some("CTRL+SHIFT+,".into()), is_main.then(|| EventHandler::new(move |()| nudge_item(-10.0))));
+    use_shortcut(Some("CTRL+SHIFT+.".into()), is_main.then(|| EventHandler::new(move |()| nudge_item(10.0))));
     // Prev/next edit point (V1 cut).
     use_shortcut(Some("ARROWUP".into()), is_main.then(|| EventHandler::new(move |()| jump_edit(-1))));
     use_shortcut(Some("ARROWDOWN".into()), is_main.then(|| EventHandler::new(move |()| jump_edit(1))));
@@ -6065,7 +4032,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             .with_window(
                 WindowBuilder::new()
                     .with_title("MorReel Monitor")
-                    .with_inner_size(LogicalSize::new(414.0, 764.0)),
+                    .with_inner_size(LogicalSize::new(414.0, 764.0))
+                    .with_window_icon(window_icon()),
             );
         let _ = dioxus::desktop::window().new_window(dom, cfg);
         monitor_out.set(true);
@@ -6091,7 +4059,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             .with_window(
                 WindowBuilder::new()
                     .with_title("MorReel Inspector")
-                    .with_inner_size(LogicalSize::new(430.0, 900.0)),
+                    .with_inner_size(LogicalSize::new(430.0, 900.0))
+                    .with_window_icon(window_icon()),
             );
         let _ = dioxus::desktop::window().new_window(dom, cfg);
         inspector_out.set(true);
@@ -6157,8 +4126,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     }
                     match lane {
                         Lane::V1 => to_v1.push(path),
-                        Lane::V2 => add_overlay_path(path, at),
-                        Lane::A1 | Lane::A2 => add_audio_path(path, at, lane_num(lane)),
+                        Lane::V(n) => add_overlay_path(path, at, n),
+                        Lane::A(n) => add_audio_path(path, at, n),
                     }
                 }
             }
@@ -6351,7 +4320,11 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                 };
                 request_preview(path, t, fr, look, engine::Over::default());
             }
-            _ => status.set("Select a V1 clip or V2 overlay to apply an effect.".to_string()),
+            Some(Sel::Adjust(k)) if k < adjustments.read().len() => {
+                adjustments.write()[k].effect = name.clone();
+                seek_to(playhead()); // full-composite look — refresh the whole frame
+            }
+            _ => status.set("Select a V1 clip, V2 overlay or FX layer to apply an effect.".to_string()),
         }
     };
 
@@ -6374,6 +4347,10 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     (ov[j].scrub_path(), ov[j].in_s, ov[j].framing.clone(), ov[j].look())
                 };
                 request_preview(path, t, fr, eff, engine::Over::default());
+            }
+            Some(Sel::Adjust(k)) if k < adjustments.read().len() => {
+                adjustments.write()[k].effect_amount = v;
+                seek_to(playhead());
             }
             _ => {}
         }
@@ -6496,7 +4473,12 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     MenuItem {
                         label: "Add overlay (V2)…".to_string(),
                         disabled: no_clips || exporting,
-                        on_action: move |_| add_overlay(()),
+                        on_action: move |_| add_overlay(2),
+                    }
+                    MenuItem {
+                        label: "Add from Giphy…".to_string(),
+                        disabled: no_clips || exporting,
+                        on_action: move |_| show_giphy.set(true),
                     }
                     MenuItem {
                         label: "Add audio (A1)…".to_string(),
@@ -6523,6 +4505,27 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         shortcut: Some("Ctrl+T".to_string()),
                         disabled: no_clips || exporting,
                         on_action: move |_| add_title(()),
+                    }
+                    MenuItem {
+                        label: "Add adjustment layer (FX)".to_string(),
+                        disabled: no_clips || exporting,
+                        on_action: move |_| add_adjustment(()),
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        label: "Add video track (V)".to_string(),
+                        disabled: v_lanes() >= MAX_V_LANES,
+                        on_action: move |_| add_v_track(()),
+                    }
+                    MenuItem {
+                        label: "Add text track (T)".to_string(),
+                        disabled: t_lanes() >= MAX_T_LANES,
+                        on_action: move |_| add_t_track(()),
+                    }
+                    MenuItem {
+                        label: "Add audio track (A)".to_string(),
+                        disabled: a_lanes() >= MAX_A_LANES,
+                        on_action: move |_| add_a_track(()),
                     }
                 }
                 // "Tools" — automated / analysis passes and plugin surfaces, the
@@ -6648,6 +4651,22 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         disabled: clipboard().is_none() || exporting,
                         on_action: move |_| paste_sel(()),
                     }
+                    MenuItem {
+                        label: "Paste look (transform + grade + effect)".to_string(),
+                        shortcut: Some("Ctrl+Shift+V".to_string()),
+                        disabled: clipboard().is_none()
+                            || !matches!(selected(), Some(Sel::Main(_)) | Some(Sel::Over(_))),
+                        on_action: move |_| paste_attrs(()),
+                    }
+                    MenuItem {
+                        label: "Reset look".to_string(),
+                        shortcut: Some("Ctrl+Shift+X".to_string()),
+                        disabled: !matches!(
+                            selected(),
+                            Some(Sel::Main(_)) | Some(Sel::Over(_)) | Some(Sel::Adjust(_))
+                        ),
+                        on_action: move |_| reset_attrs(()),
+                    }
                     MenuSeparator {}
                     MenuItem {
                         label: "Mute audio".to_string(),
@@ -6665,6 +4684,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                 Some(Sel::Over(j)) => overlays.read().get(j).map(|o| o.enabled),
                                 Some(Sel::Aud(k)) => audios.read().get(k).map(|a| a.enabled),
                                 Some(Sel::Title(k)) => titles.read().get(k).map(|t| t.enabled),
+                                Some(Sel::Adjust(k)) => adjustments.read().get(k).map(|a| a.enabled),
                                 None => None,
                             };
                             if en == Some(false) {
@@ -7000,14 +5020,16 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         if !monitor_out() {
                             div { class: "mr-stage",
                             div {
-                                class: if drop_hover() == Some(Lane::V2) { "mr-phone mr-drop" } else { "mr-phone" },
+                                class: if matches!(drop_hover(), Some(Lane::V(_))) { "mr-phone mr-drop" } else { "mr-phone" },
                                 onmounted: move |evt| phone_el.set(Some(evt.data())),
                                 oncontextmenu: move |evt| open_ctx(evt, Ctx::Monitor),
                                 // Dropping on the picture means "show me this" —
                                 // append to the end of the main track.
                                 ondragover: move |evt| {
                                     evt.prevent_default();
-                                    if drop_hover() != Some(Lane::V2) { drop_hover.set(Some(Lane::V2)); }
+                                    if !matches!(drop_hover(), Some(Lane::V(_))) {
+                                        drop_hover.set(Some(Lane::V(2)));
+                                    }
                                 },
                                 ondragleave: move |_| drop_hover.set(None),
                                 ondrop: move |evt| {
@@ -7534,7 +5556,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                             }
                             div { class: "mr-phase-actions",
                                 button { class: "mor-btn primary", disabled: exporting, onclick: move |_| import_clips(()), "＋ Add clips (V1)" }
-                                button { class: "mor-btn", disabled: exporting, onclick: move |_| add_overlay(()), "⧉ Add b-roll (V2)" }
+                                button { class: "mor-btn", disabled: exporting, onclick: move |_| add_overlay(2), "⧉ Add b-roll (V2)" }
                                 button { class: "mor-btn", onclick: move |_| add_audio(1), "♪ Add music (A1)" }
                                 button { class: "mor-btn", onclick: move |_| add_audio(2), "🎙 Add audio (A2)" }
                                 button {
@@ -7599,9 +5621,9 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                             rsx! {
                                 h4 { class: "mr-fx-cat", "Mixer" }
                                 div { class: "mr-mixer",
-                                    for i in 0..3usize {
+                                    for i in 0..mx.tracks.len() {
                                         div { key: "{i}", class: "mr-mixer-row",
-                                            span { class: "mr-mixer-tag", "{MIX_LABELS[i]}" }
+                                            span { class: "mr-mixer-tag", "{mix_label(i)}" }
                                             button {
                                                 class: if mx.tracks[i].mute { "mr-mixer-btn on m" } else { "mr-mixer-btn m" },
                                                 title: "Mute this track",
@@ -7655,7 +5677,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     }
                                 }
                                 p { class: "mor-statusbar-muted mr-export-blurb",
-                                    "V1 is every clip's own sound; A1/A2 are the beds. Solo one to audition it. Applies to preview and export alike."
+                                    "V1 is every clip's own sound; A-lanes are the beds. Solo one to audition it. Applies to preview and export alike."
                                 }
                             }
                         } else {
@@ -7949,6 +5971,19 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                             Some(Sel::Over(j)) if j < overlays.read().len() && active_phase() != Phase::Text => {
                                 let o = overlays.read()[j].clone();
                                 rsx! {
+                                    MorSelect {
+                                        label: "Track".to_string(),
+                                        value: format!("V{}", o.track.max(2)),
+                                        options: overlay_tracks(v_lanes()).into_iter().map(|n| format!("V{}", n)).collect(),
+                                        onchange: move |v: String| {
+                                            push_undo("");
+                                            let n = v.trim_start_matches('V').parse::<u8>().unwrap_or(2);
+                                            if let Some(item) = overlays.write().get_mut(j) {
+                                                item.track = n.max(2).min(1 + v_lanes());
+                                            }
+                                            seek_to(playhead());
+                                        },
+                                    }
                                     Slider {
                                         label: Some("Position on timeline"),
                                         min: 0.0,
@@ -8160,6 +6195,19 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                             rerender_title(k);
                                         },
                                     }
+                                    MorSelect {
+                                        label: "Track".to_string(),
+                                        value: format!("T{}", t.track.max(1)),
+                                        options: title_tracks(t_lanes()).into_iter().map(|n| format!("T{}", n)).collect(),
+                                        onchange: move |v: String| {
+                                            push_undo("");
+                                            let n = v.trim_start_matches('T').parse::<u8>().unwrap_or(1);
+                                            if let Some(item) = titles.write().get_mut(k) {
+                                                item.track = n.max(1).min(t_lanes());
+                                            }
+                                            seek_to(playhead());
+                                        },
+                                    }
                                     if t.kind != "Text" {
                                         for (label, value, set) in shape_knobs(&t) {
                                             Slider {
@@ -8200,7 +6248,9 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     Slider {
                                         label: Some("Duration"),
                                         min: 0.5,
-                                        max: 20.0,
+                                        // At least to the reel out point from this card's start
+                                        // (and a 20s floor for short projects / freehand holds).
+                                        max: (total - t.at).max(20.0).max(t.dur),
                                         step: 0.1,
                                         precision: 1,
                                         value: t.dur,
@@ -8518,11 +6568,12 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     h4 { class: "mr-fx-cat", "Mix & track" }
                                     MorSelect {
                                         label: "Track".to_string(),
-                                        value: a.lane_tag().to_string(),
-                                        options: vec!["A1".to_string(), "A2".to_string()],
+                                        value: a.lane_tag(),
+                                        options: audio_tracks(a_lanes()).into_iter().map(|n| format!("A{n}")).collect(),
                                         onchange: move |v: String| {
                                             push_undo("");
-                                            audios.write()[k].lane = if v == "A2" { 2 } else { 1 };
+                                            let n = v.trim_start_matches('A').parse::<u8>().unwrap_or(1);
+                                            audios.write()[k].lane = n.max(1).min(a_lanes());
                                         },
                                     }
                                     Slider {
@@ -8838,6 +6889,70 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     }
                                 }
                             }
+                            Some(Sel::Adjust(k)) if k < adjustments.read().len() => {
+                                let a = adjustments.read()[k].clone();
+                                rsx! {
+                                    p { class: "mor-statusbar-muted mr-export-blurb",
+                                        "Adjustment layer — its grade and effect apply to every clip and cutaway beneath it, only while it covers the timeline. Trim or drag it on the FX lane."
+                                    }
+                                    div { class: "mr-field-row",
+                                        span { class: "mor-statusbar-muted", "{fmt_t(a.at)} → {fmt_t(a.at + a.dur)}  ({fmt_clip_dur(a.dur)})" }
+                                    }
+                                    div { class: "mr-toolbar",
+                                        button {
+                                            class: "mor-btn",
+                                            title: "Start this adjustment at the playhead",
+                                            onclick: move |_| {
+                                                push_undo("");
+                                                adjustments.write()[k].at = playhead().max(0.0);
+                                                seek_to(playhead());
+                                            },
+                                            "⊙ Start at playhead"
+                                        }
+                                        button {
+                                            class: "mor-btn",
+                                            title: "Stretch this adjustment across the whole reel",
+                                            onclick: move |_| {
+                                                push_undo("");
+                                                let end = total_of();
+                                                {
+                                                    let mut aj = adjustments.write();
+                                                    aj[k].at = 0.0;
+                                                    aj[k].dur = end.max(0.1);
+                                                }
+                                                seek_to(playhead());
+                                            },
+                                            "⇔ Whole reel"
+                                        }
+                                    }
+                                    h4 { class: "mr-fx-cat", "Effect" }
+                                    div { class: "mr-field-row",
+                                        div { class: "mr-field-grow",
+                                            MorSelect {
+                                                label: "Effect".to_string(),
+                                                value: a.effect.clone(),
+                                                options: effect_names.clone(),
+                                                onchange: move |name: String| apply_effect(name),
+                                            }
+                                        }
+                                    }
+                                    if a.effect != "None" {
+                                        Slider {
+                                            label: Some("Strength"),
+                                            min: 0.0,
+                                            max: 1.0,
+                                            step: 0.01,
+                                            precision: 2,
+                                            value: a.effect_amount,
+                                            oninput: Some(EventHandler::new(move |v: f64| set_effect_amount(v))),
+                                        }
+                                    }
+                                    {grade_panel()}
+                                    div { class: "mr-toolbar",
+                                        button { class: "mor-btn mr-danger", onclick: move |_| delete_sel(()), "✕ Remove adjustment" }
+                                    }
+                                }
+                            }
                             _ => if active_phase() == Phase::Text {
                                 // Snapshot the T lane so the transcript can be
                                 // edited without holding a read borrow across the
@@ -9066,21 +7181,45 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                         t.dur = dur;
                                     }
                                 }
+                                // Free-span like a title — no source to trim against.
+                                Sel::Adjust(k) => {
+                                    if let Some(a) = adjustments.write().get_mut(k) {
+                                        let (at, dur) = title_edge_resize(at0, a0, left, dt);
+                                        a.at = at;
+                                        a.dur = dur;
+                                    }
+                                }
                                 Sel::Over(j) => {
                                     if let Some(o) = overlays.write().get_mut(j) {
-                                        let (at, inn, out) = media_edge_resize(
-                                            at0, a0, b0, src_dur0, speed0, left, dt, true,
-                                        );
-                                        o.at = at;
-                                        o.in_s = inn;
-                                        o.out_s = out;
+                                        if engine::is_still(&o.path) {
+                                            let (at, inn, out) =
+                                                still_edge_resize(at0, a0, b0, o.speed, left, dt);
+                                            o.at = at;
+                                            o.in_s = inn;
+                                            o.out_s = out;
+                                        } else {
+                                            let (at, inn, out) = media_edge_resize(
+                                                at0, a0, b0, src_dur0, speed0, left, dt, true,
+                                            );
+                                            o.at = at;
+                                            o.in_s = inn;
+                                            o.out_s = out;
+                                        }
                                     }
                                 }
                                 Sel::Main(i) => {
                                     let old = spans();
                                     if let Some(c) = clips.write().get_mut(i) {
+                                        // A still loops, so its Out isn't bound by a source
+                                        // length — let the right edge grow past the nominal
+                                        // 60s. (Left still trims the head, the ripple norm.)
+                                        let src = if engine::is_still(&c.path) {
+                                            f64::MAX
+                                        } else {
+                                            src_dur0
+                                        };
                                         let (_, inn, out) = media_edge_resize(
-                                            0.0, a0, b0, src_dur0, speed0, left, dt, false,
+                                            0.0, a0, b0, src, speed0, left, dt, false,
                                         );
                                         c.in_s = inn;
                                         c.out_s = out;
@@ -9316,178 +7455,280 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                             title: "Beat marker at {fmt_t(m)} — Shift+M clears all",
                                         }
                                     }
-                                    div { class: if show_titles() { "mr-lane mr-lane-t" } else { "mr-lane mr-lane-t mr-lane-off" },
-                                        span {
-                                            class: if show_titles() { "mr-lane-tag title mr-lane-toggle" } else { "mr-lane-tag title mr-lane-toggle off" },
-                                            title: if show_titles() { "Titles shown — click to hide in the monitor" } else { "Titles hidden in the monitor — click to show" },
-                                            onclick: move |evt| {
-                                                evt.stop_propagation();
-                                                let on = !show_titles();
-                                                show_titles.set(on);
-                                                seek_to(playhead());
-                                            },
-                                            if show_titles() { "T" } else { "T⃠" }
-                                        }
-                                        for (k, t) in titles().into_iter().enumerate() {
-                                            div {
-                                                key: "title-{k}",
-                                                class: item_class(
-                                                    "mr-lane-item title",
-                                                    selected() == Some(Sel::Title(k)),
-                                                    marked().contains(&Sel::Title(k)),
-                                                    !t.enabled,
-                                                    false,
-                                                ),
-                                                style: "left: {t.at * scale}px; width: {t.dur * scale}px",
-                                                onmousedown: move |evt| {
-                                                    if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
-                                                        selected.set(Some(Sel::Title(k)));
-                                                        drag.set(Some((Sel::Title(k), evt.client_coordinates().x, 0.0, 0.0)));
-                                                    }
+                                    // Text tracks top-to-bottom: highest track first (T2 over T1).
+                                    for tr in title_tracks(t_lanes()).into_iter().rev() {
+                                        {
+                                        let tag = format!("T{}", tr);
+                                        let is_top = tr == t_lanes();
+                                        rsx! {
+                                        div {
+                                            key: "t-lane-{tr}",
+                                            class: if show_titles() { "mr-lane mr-lane-t" } else { "mr-lane mr-lane-t mr-lane-off" },
+                                            span {
+                                                class: if show_titles() { "mr-lane-tag title mr-lane-toggle" } else { "mr-lane-tag title mr-lane-toggle off" },
+                                                title: if is_top {
+                                                    if show_titles() { "Titles shown — click to hide in the monitor" } else { "Titles hidden in the monitor — click to show" }
+                                                } else {
+                                                    "Text track — higher number stacks on top"
                                                 },
                                                 onclick: move |evt| {
-                                                    if drag_moved() {
-                                                        drag_moved.set(false);
-                                                        return;
+                                                    evt.stop_propagation();
+                                                    if is_top {
+                                                        let on = !show_titles();
+                                                        show_titles.set(on);
+                                                        seek_to(playhead());
                                                     }
-                                                    if evt.modifiers().ctrl() {
-                                                        toggle_mark(Sel::Title(k));
-                                                        return;
+                                                },
+                                                if show_titles() { "{tag}" } else if is_top { "{tag}⃠" } else { "{tag}" }
+                                            }
+                                            for (k, t) in titles().into_iter().enumerate().filter(|(_, t)| t.track.max(1) == tr) {
+                                                div {
+                                                    key: "title-{k}",
+                                                    class: item_class(
+                                                        "mr-lane-item title",
+                                                        selected() == Some(Sel::Title(k)),
+                                                        marked().contains(&Sel::Title(k)),
+                                                        !t.enabled,
+                                                        false,
+                                                    ),
+                                                    style: "left: {t.at * scale}px; width: {t.dur * scale}px",
+                                                    onmousedown: move |evt| {
+                                                        if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
+                                                            selected.set(Some(Sel::Title(k)));
+                                                            drag.set(Some((Sel::Title(k), evt.client_coordinates().x, 0.0, 0.0)));
+                                                        }
+                                                    },
+                                                    onclick: move |evt| {
+                                                        if drag_moved() {
+                                                            drag_moved.set(false);
+                                                            return;
+                                                        }
+                                                        if evt.modifiers().ctrl() {
+                                                            toggle_mark(Sel::Title(k));
+                                                            return;
+                                                        }
+                                                        let at = titles.read()[k].at;
+                                                        seek_to(at);
+                                                        selected.set(Some(Sel::Title(k)));
+                                                    },
+                                                    oncontextmenu: move |evt| {
+                                                        selected.set(Some(Sel::Title(k)));
+                                                        open_ctx(evt, Ctx::Title(k));
+                                                    },
+                                                    div {
+                                                        class: "mr-len-grip in",
+                                                        title: "Drag to change when the title starts",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            push_undo(&format!("tlen{k}"));
+                                                            let (at, d) = titles.read().get(k).map_or((0.0, 3.0), |t| (t.at, t.dur));
+                                                            len_drag.set(Some((Sel::Title(k), true, evt.client_coordinates().x, at, d, 0.0, 1.0, 0.0)));
+                                                        },
                                                     }
-                                                    let at = titles.read()[k].at;
-                                                    seek_to(at);
-                                                    selected.set(Some(Sel::Title(k)));
-                                                },
-                                                oncontextmenu: move |evt| {
-                                                    selected.set(Some(Sel::Title(k)));
-                                                    open_ctx(evt, Ctx::Title(k));
-                                                },
-                                                // Dual-edge grips: left keeps the right edge fixed;
-                                                // right only changes duration (Final Cut / iMovie style).
+                                                    div {
+                                                        class: "mr-len-grip out",
+                                                        title: "Drag to change how long the title shows",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            push_undo(&format!("tlen{k}"));
+                                                            let (at, d) = titles.read().get(k).map_or((0.0, 3.0), |t| (t.at, t.dur));
+                                                            len_drag.set(Some((Sel::Title(k), false, evt.client_coordinates().x, at, d, 0.0, 1.0, 0.0)));
+                                                        },
+                                                    }
+                                                    span { class: "mr-clip-dur", "{fmt_clip_dur(t.dur)}" }
+                                                    if t.group != 0 {
+                                                        span { class: "mr-group-dot", style: "background: hsl({(t.group * 67) % 360}, 70%, 60%)" }
+                                                    }
+                                                    if t.kind == "Text" { "𝐓 {t.text}" } else { "◧ {t.kind}" }
+                                                }
+                                            }
+                                        }
+                                        }
+                                        }
+                                    }
+                                    // FX lane: adjustment layers grading the picture below over
+                                    // their span. Only shown once one exists (Insert ▸ Add
+                                    // adjustment layer) so it doesn't clutter a plain reel.
+                                    if !adjustments.read().is_empty() {
+                                        div { class: "mr-lane mr-lane-fx",
+                                            span { class: "mr-lane-tag fx", title: "Adjustment layers — grade/effect over everything below", "FX" }
+                                            for (k, a) in adjustments().into_iter().enumerate() {
                                                 div {
-                                                    class: "mr-len-grip in",
-                                                    title: "Drag to change when the title starts",
+                                                    key: "adj-{k}",
+                                                    class: item_class(
+                                                        "mr-lane-item fx",
+                                                        selected() == Some(Sel::Adjust(k)),
+                                                        marked().contains(&Sel::Adjust(k)),
+                                                        !a.enabled,
+                                                        false,
+                                                    ),
+                                                    style: "left: {a.at * scale}px; width: {a.dur * scale}px",
                                                     onmousedown: move |evt| {
-                                                        evt.stop_propagation();
-                                                        push_undo(&format!("tlen{k}"));
-                                                        let (at, d) = titles.read().get(k).map_or((0.0, 3.0), |t| (t.at, t.dur));
-                                                        len_drag.set(Some((Sel::Title(k), true, evt.client_coordinates().x, at, d, 0.0, 1.0, 0.0)));
+                                                        if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
+                                                            selected.set(Some(Sel::Adjust(k)));
+                                                            drag.set(Some((Sel::Adjust(k), evt.client_coordinates().x, 0.0, 0.0)));
+                                                        }
                                                     },
-                                                }
-                                                div {
-                                                    class: "mr-len-grip out",
-                                                    title: "Drag to change how long the title shows",
-                                                    onmousedown: move |evt| {
-                                                        evt.stop_propagation();
-                                                        push_undo(&format!("tlen{k}"));
-                                                        let (at, d) = titles.read().get(k).map_or((0.0, 3.0), |t| (t.at, t.dur));
-                                                        len_drag.set(Some((Sel::Title(k), false, evt.client_coordinates().x, at, d, 0.0, 1.0, 0.0)));
+                                                    onclick: move |evt| {
+                                                        if drag_moved() {
+                                                            drag_moved.set(false);
+                                                            return;
+                                                        }
+                                                        if evt.modifiers().ctrl() {
+                                                            toggle_mark(Sel::Adjust(k));
+                                                            return;
+                                                        }
+                                                        let at = adjustments.read()[k].at;
+                                                        seek_to(at);
+                                                        selected.set(Some(Sel::Adjust(k)));
                                                     },
+                                                    div {
+                                                        class: "mr-len-grip in",
+                                                        title: "Drag to change when this adjustment starts",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            push_undo(&format!("ajlen{k}"));
+                                                            let (at, d) = adjustments.read().get(k).map_or((0.0, 3.0), |a| (a.at, a.dur));
+                                                            len_drag.set(Some((Sel::Adjust(k), true, evt.client_coordinates().x, at, d, 0.0, 1.0, 0.0)));
+                                                        },
+                                                    }
+                                                    div {
+                                                        class: "mr-len-grip out",
+                                                        title: "Drag to change how long this adjustment lasts",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            push_undo(&format!("ajlen{k}"));
+                                                            let (at, d) = adjustments.read().get(k).map_or((0.0, 3.0), |a| (a.at, a.dur));
+                                                            len_drag.set(Some((Sel::Adjust(k), false, evt.client_coordinates().x, at, d, 0.0, 1.0, 0.0)));
+                                                        },
+                                                    }
+                                                    span { class: "mr-clip-dur", "{fmt_clip_dur(a.dur)}" }
+                                                    if a.group != 0 {
+                                                        span { class: "mr-group-dot", style: "background: hsl({(a.group * 67) % 360}, 70%, 60%)" }
+                                                    }
+                                                    "◈ {a.label()}"
                                                 }
-                                                span { class: "mr-clip-dur", "{fmt_clip_dur(t.dur)}" }
-                                                if t.group != 0 {
-                                                    span { class: "mr-group-dot", style: "background: hsl({(t.group * 67) % 360}, 70%, 60%)" }
-                                                }
-                                                if t.kind == "Text" { "𝐓 {t.text}" } else { "◧ {t.kind}" }
                                             }
                                         }
                                     }
-                                    div {
-                                        class: if drop_hover() == Some(Lane::V2) { "mr-lane mr-lane-v mr-drop" } else if show_overlays() { "mr-lane mr-lane-v" } else { "mr-lane mr-lane-v mr-lane-off" },
-                                        ondragover: move |evt| {
-                                            // Dioxus's runtime already prevents the window
-                                            // default (it would navigate to the file); this is
-                                            // the per-element half of the same contract.
-                                            evt.prevent_default();
-                                            evt.stop_propagation();
-                                            if drop_hover() != Some(Lane::V2) { drop_hover.set(Some(Lane::V2)); }
-                                        },
-                                        ondragleave: move |_| {
-                                            if drop_hover() == Some(Lane::V2) { drop_hover.set(None); }
-                                        },
-                                        ondrop: move |evt| {
-                                            evt.prevent_default();
-                                            evt.stop_propagation(); // else the timeline fallback imports it twice
-                                            let (paths, t) = drop_payload(&evt);
-                                            handle_drop(paths, Lane::V2, t);
-                                        },
-                                        span {
-                                            class: if show_overlays() { "mr-lane-tag mr-lane-toggle" } else { "mr-lane-tag mr-lane-toggle off" },
-                                            title: if show_overlays() { "Cutaways shown — click to hide in the monitor" } else { "Cutaways hidden in the monitor — click to show" },
-                                            onclick: move |evt| {
-                                                evt.stop_propagation();
-                                                let on = !show_overlays();
-                                                show_overlays.set(on);
-                                                seek_to(playhead());
+                                    // Overlay tracks Vn..V2 (highest on top). Drop targets per track.
+                                    for tr in overlay_tracks(v_lanes()).into_iter().rev() {
+                                        {
+                                        let lane = Lane::V(tr);
+                                        let tag = format!("V{}", tr);
+                                        let is_bottom = tr == 2;
+                                        rsx! {
+                                        div {
+                                            key: "v-lane-{tr}",
+                                            class: if drop_hover() == Some(lane) {
+                                                "mr-lane mr-lane-v mr-drop"
+                                            } else if show_overlays() {
+                                                "mr-lane mr-lane-v"
+                                            } else {
+                                                "mr-lane mr-lane-v mr-lane-off"
                                             },
-                                            if show_overlays() { "V2" } else { "V2⃠" }
-                                        }
-                                        for (j, o) in overlays().into_iter().enumerate() {
-                                            div {
-                                                key: "{j}-{o.path}",
-                                                class: item_class(
-                                                    "mr-lane-item",
-                                                    selected() == Some(Sel::Over(j)),
-                                                    marked().contains(&Sel::Over(j)),
-                                                    !o.enabled,
-                                                    o.solo,
-                                                ),
-                                                style: "left: {o.at * scale}px; width: {o.trimmed() * scale}px",
-                                                onmousedown: move |evt| {
-                                                    if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
-                                                        selected.set(Some(Sel::Over(j)));
-                                                        drag.set(Some((Sel::Over(j), evt.client_coordinates().x, 0.0, 0.0)));
+                                            ondragover: move |evt| {
+                                                evt.prevent_default();
+                                                evt.stop_propagation();
+                                                if drop_hover() != Some(lane) { drop_hover.set(Some(lane)); }
+                                            },
+                                            ondragleave: move |_| {
+                                                if drop_hover() == Some(lane) { drop_hover.set(None); }
+                                            },
+                                            ondrop: move |evt| {
+                                                evt.prevent_default();
+                                                evt.stop_propagation();
+                                                let (paths, t) = drop_payload(&evt);
+                                                handle_drop(paths, lane, t);
+                                            },
+                                            span {
+                                                class: if show_overlays() { "mr-lane-tag mr-lane-toggle" } else { "mr-lane-tag mr-lane-toggle off" },
+                                                title: if is_bottom {
+                                                    if show_overlays() {
+                                                        "Cutaways shown — click to hide in the monitor"
+                                                    } else {
+                                                        "Cutaways hidden in the monitor — click to show"
                                                     }
+                                                } else {
+                                                    "Overlay track — higher number stacks on top of lower"
                                                 },
                                                 onclick: move |evt| {
-                                                    if drag_moved() {
-                                                        drag_moved.set(false);
-                                                        return;
+                                                    evt.stop_propagation();
+                                                    if is_bottom {
+                                                        let on = !show_overlays();
+                                                        show_overlays.set(on);
+                                                        seek_to(playhead());
                                                     }
-                                                    if evt.modifiers().ctrl() {
-                                                        toggle_mark(Sel::Over(j));
-                                                        return;
-                                                    }
-                                                    let at = overlays.read()[j].at;
-                                                    seek_to(at);
-                                                    selected.set(Some(Sel::Over(j)));
                                                 },
-                                                oncontextmenu: move |evt| {
-                                                    selected.set(Some(Sel::Over(j)));
-                                                    open_ctx(evt, Ctx::Over(j));
-                                                },
-                                                // Dual-edge trim: left slides `at` + in-point so the
-                                                // right edge stays put; right only moves the out-point.
-                                                div {
-                                                    class: "mr-len-grip in",
-                                                    title: "Drag to trim the start of this cutaway",
-                                                    onmousedown: move |evt| {
-                                                        evt.stop_propagation();
-                                                        push_undo(&format!("olen{j}"));
-                                                        let snap = overlays.read().get(j).map(|o| {
-                                                            (o.at, o.in_s, o.out_s, o.speed.max(0.01), o.duration)
-                                                        }).unwrap_or((0.0, 0.0, 1.0, 1.0, 1.0));
-                                                        len_drag.set(Some((Sel::Over(j), true, evt.client_coordinates().x, snap.0, snap.1, snap.2, snap.3, snap.4)));
-                                                    },
-                                                }
-                                                div {
-                                                    class: "mr-len-grip out",
-                                                    title: "Drag to trim the end of this cutaway",
-                                                    onmousedown: move |evt| {
-                                                        evt.stop_propagation();
-                                                        push_undo(&format!("olen{j}"));
-                                                        let snap = overlays.read().get(j).map(|o| {
-                                                            (o.at, o.in_s, o.out_s, o.speed.max(0.01), o.duration)
-                                                        }).unwrap_or((0.0, 0.0, 1.0, 1.0, 1.0));
-                                                        len_drag.set(Some((Sel::Over(j), false, evt.client_coordinates().x, snap.0, snap.1, snap.2, snap.3, snap.4)));
-                                                    },
-                                                }
-                                                span { class: "mr-clip-dur", "{fmt_clip_dur(o.trimmed())}" }
-                                                if o.group != 0 {
-                                                    span { class: "mr-group-dot", style: "background: hsl({(o.group * 67) % 360}, 70%, 60%)" }
-                                                }
-                                                "{o.name}"
+                                                if show_overlays() { "{tag}" } else if is_bottom { "{tag}⃠" } else { "{tag}" }
                                             }
+                                            for (j, o) in overlays().into_iter().enumerate().filter(|(_, o)| o.track.max(2) == tr) {
+                                                div {
+                                                    key: "{j}-{o.path}",
+                                                    class: item_class(
+                                                        "mr-lane-item",
+                                                        selected() == Some(Sel::Over(j)),
+                                                        marked().contains(&Sel::Over(j)),
+                                                        !o.enabled,
+                                                        o.solo,
+                                                    ),
+                                                    style: "left: {o.at * scale}px; width: {o.trimmed() * scale}px",
+                                                    onmousedown: move |evt| {
+                                                        if evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) && !evt.modifiers().ctrl() {
+                                                            selected.set(Some(Sel::Over(j)));
+                                                            drag.set(Some((Sel::Over(j), evt.client_coordinates().x, 0.0, 0.0)));
+                                                        }
+                                                    },
+                                                    onclick: move |evt| {
+                                                        if drag_moved() {
+                                                            drag_moved.set(false);
+                                                            return;
+                                                        }
+                                                        if evt.modifiers().ctrl() {
+                                                            toggle_mark(Sel::Over(j));
+                                                            return;
+                                                        }
+                                                        let at = overlays.read()[j].at;
+                                                        seek_to(at);
+                                                        selected.set(Some(Sel::Over(j)));
+                                                    },
+                                                    oncontextmenu: move |evt| {
+                                                        selected.set(Some(Sel::Over(j)));
+                                                        open_ctx(evt, Ctx::Over(j));
+                                                    },
+                                                    div {
+                                                        class: "mr-len-grip in",
+                                                        title: "Drag to trim the start of this cutaway",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            push_undo(&format!("olen{j}"));
+                                                            let snap = overlays.read().get(j).map(|o| {
+                                                                (o.at, o.in_s, o.out_s, o.speed.max(0.01), o.duration)
+                                                            }).unwrap_or((0.0, 0.0, 1.0, 1.0, 1.0));
+                                                            len_drag.set(Some((Sel::Over(j), true, evt.client_coordinates().x, snap.0, snap.1, snap.2, snap.3, snap.4)));
+                                                        },
+                                                    }
+                                                    div {
+                                                        class: "mr-len-grip out",
+                                                        title: "Drag to trim the end of this cutaway",
+                                                        onmousedown: move |evt| {
+                                                            evt.stop_propagation();
+                                                            push_undo(&format!("olen{j}"));
+                                                            let snap = overlays.read().get(j).map(|o| {
+                                                                (o.at, o.in_s, o.out_s, o.speed.max(0.01), o.duration)
+                                                            }).unwrap_or((0.0, 0.0, 1.0, 1.0, 1.0));
+                                                            len_drag.set(Some((Sel::Over(j), false, evt.client_coordinates().x, snap.0, snap.1, snap.2, snap.3, snap.4)));
+                                                        },
+                                                    }
+                                                    span { class: "mr-clip-dur", "{fmt_clip_dur(o.trimmed())}" }
+                                                    if o.group != 0 {
+                                                        span { class: "mr-group-dot", style: "background: hsl({(o.group * 67) % 360}, 70%, 60%)" }
+                                                    }
+                                                    "{o.name}"
+                                                }
+                                            }
+                                        }
+                                        }
                                         }
                                     }
                                     div {
@@ -9682,9 +7923,12 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                             }
                                         }
                                     }
-                                    // A1 + A2: same mix bus under V1, two editorial lanes
-                                    // so music and VO can live side by side without stacking.
-                                    for (bus, lane, tag) in [(1u8, Lane::A1, "A1"), (2u8, Lane::A2, "A2")] {
+                                    // A1..An under V1 — each bus is its own lane (music / VO / SFX…).
+                                    for bus in audio_tracks(a_lanes()) {
+                                        {
+                                        let lane = Lane::A(bus);
+                                        let tag = format!("A{}", bus);
+                                        rsx! {
                                         div {
                                             key: "{tag}",
                                             class: if drop_hover() == Some(lane) {
@@ -9707,9 +7951,20 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                                 handle_drop(paths, lane, t);
                                             },
                                             span { class: "mr-lane-tag", "{tag}" }
-                                            for (k, a) in audios().into_iter().enumerate().filter(|(_, a)| {
-                                                if bus >= 2 { a.lane >= 2 } else { a.lane < 2 }
-                                            }) {
+                                            // Live voiceover ghost: a red tile on A2 that grows
+                                            // as you record, so the take shows up in place instead
+                                            // of popping in when you stop. The real AudioItem lands
+                                            // on stop; this is display-only (no pointer events).
+                                            if bus == 2 {
+                                                if let Some((_, vo_at)) = vo_session() {
+                                                    div {
+                                                        class: "mr-lane-item audio",
+                                                        style: "left: {vo_at * scale}px; width: {(vo_len() * scale).max(2.0)}px; background: rgba(233,30,60,0.35); border-color: rgba(233,30,60,0.9); pointer-events: none;",
+                                                        span { class: "mr-clip-dur", "● {fmt_clip_dur(vo_len())}" }
+                                                    }
+                                                }
+                                            }
+                                            for (k, a) in audios().into_iter().enumerate().filter(|(_, a)| a.lane.max(1) == bus) {
                                                 div {
                                                     key: "{k}-{a.path}",
                                                     class: item_class(
@@ -9793,6 +8048,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                                     "♪ {a.name}"
                                                 }
                                             }
+                                        }
+                                        }
                                         }
                                     }
                                     div { class: "mr-playhead", style: "left: {ph * scale}px",
@@ -9952,7 +8209,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                             CtxItem {
                                 label: "Add overlay (V2)…".to_string(),
                                 disabled: no_clips || exporting,
-                                on_action: move |_| add_overlay(()),
+                                on_action: move |_| add_overlay(2),
                             }
                             CtxItem {
                                 label: "Add audio (A1)…".to_string(),
@@ -10110,15 +8367,40 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         }
                         Ctx::Over(j) => {
                             let name = overlays.read().get(j).map(|o| o.name.clone()).unwrap_or_default();
+                            let tr = overlays.read().get(j).map(|o| o.track.max(2)).unwrap_or(2);
+                            let tag = format!("V{tr}");
+                            let max_tr = 1 + v_lanes();
                             rsx! {
                                 div { class: "mr-ctx-head",
-                                    span { class: "mr-ctx-tag", "V2" }
+                                    span { class: "mr-ctx-tag", "{tag}" }
                                     span { class: "mr-ctx-name", "{name}" }
                                 }
                                 CtxItem {
                                     label: "Split at playhead".to_string(),
                                     shortcut: Some("S".to_string()),
                                     on_action: move |_| split_at_playhead(()),
+                                }
+                                CtxItem {
+                                    label: "Move track up".to_string(),
+                                    disabled: tr >= max_tr,
+                                    on_action: move |_| {
+                                        push_undo("");
+                                        if let Some(o) = overlays.write().get_mut(j) {
+                                            o.track = (o.track + 1).min(max_tr);
+                                        }
+                                        seek_to(playhead());
+                                    },
+                                }
+                                CtxItem {
+                                    label: "Move track down".to_string(),
+                                    disabled: tr <= 2,
+                                    on_action: move |_| {
+                                        push_undo("");
+                                        if let Some(o) = overlays.write().get_mut(j) {
+                                            o.track = o.track.saturating_sub(1).max(2);
+                                        }
+                                        seek_to(playhead());
+                                    },
                                 }
                                 CtxItem {
                                     label: "Copy".to_string(),
@@ -10167,8 +8449,9 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         }
                         Ctx::Aud(k) => {
                             let name = audios.read().get(k).map(|a| a.name.clone()).unwrap_or_default();
-                            let tag = audios.read().get(k).map(|a| a.lane_tag()).unwrap_or("A1");
-                            let other = if tag == "A2" { "A1" } else { "A2" };
+                            let bus = audios.read().get(k).map(|a| a.lane.max(1)).unwrap_or(1);
+                            let tag = format!("A{bus}");
+                            let max_a = a_lanes();
                             rsx! {
                                 div { class: "mr-ctx-head",
                                     span { class: "mr-ctx-tag audio", "{tag}" }
@@ -10218,11 +8501,22 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     on_action: move |_| toggle_solo_sel(()),
                                 }
                                 CtxItem {
-                                    label: format!("Move to {other}"),
+                                    label: "Move track up".to_string(),
+                                    disabled: bus >= max_a,
                                     on_action: move |_| {
                                         push_undo("");
                                         if let Some(a) = audios.write().get_mut(k) {
-                                            a.lane = if a.lane >= 2 { 1 } else { 2 };
+                                            a.lane = (a.lane + 1).min(max_a);
+                                        }
+                                    },
+                                }
+                                CtxItem {
+                                    label: "Move track down".to_string(),
+                                    disabled: bus <= 1,
+                                    on_action: move |_| {
+                                        push_undo("");
+                                        if let Some(a) = audios.write().get_mut(k) {
+                                            a.lane = a.lane.saturating_sub(1).max(1);
                                         }
                                     },
                                 }
@@ -10246,11 +8540,64 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         }
                         Ctx::Title(k) => {
                             let text = titles.read().get(k).map(|t| t.text.clone()).unwrap_or_default();
+                            let tr = titles.read().get(k).map(|t| t.track.max(1)).unwrap_or(1);
+                            let tag = format!("T{tr}");
+                            let max_t = t_lanes();
                             rsx! {
                                 div { class: "mr-ctx-head",
-                                    span { class: "mr-ctx-tag title", "T" }
+                                    span { class: "mr-ctx-tag title", "{tag}" }
                                     span { class: "mr-ctx-name", "{text}" }
                                 }
+                                CtxItem {
+                                    label: "Add another text".to_string(),
+                                    shortcut: Some("Ctrl+T".to_string()),
+                                    disabled: no_clips || exporting,
+                                    on_action: move |_| add_title(()),
+                                }
+                                CtxItem {
+                                    label: "Move track up".to_string(),
+                                    disabled: tr >= max_t,
+                                    on_action: move |_| {
+                                        push_undo("");
+                                        if let Some(t) = titles.write().get_mut(k) {
+                                            t.track = (t.track + 1).min(max_t);
+                                        }
+                                        seek_to(playhead());
+                                    },
+                                }
+                                CtxItem {
+                                    label: "Move track down".to_string(),
+                                    disabled: tr <= 1,
+                                    on_action: move |_| {
+                                        push_undo("");
+                                        if let Some(t) = titles.write().get_mut(k) {
+                                            t.track = t.track.saturating_sub(1).max(1);
+                                        }
+                                        seek_to(playhead());
+                                    },
+                                }
+                                CtxItem {
+                                    label: "Extend to end of reel".to_string(),
+                                    disabled: no_clips,
+                                    on_action: move |_| {
+                                        let Some(t) = titles.read().get(k).cloned() else { return };
+                                        let end = total_of();
+                                        let dur = title_dur_to_end(t.at, end);
+                                        if (dur - t.dur).abs() < 1e-6 {
+                                            status.set("Text already runs to the end of the reel.".to_string());
+                                            return;
+                                        }
+                                        push_undo("");
+                                        if let Some(item) = titles.write().get_mut(k) {
+                                            item.dur = dur;
+                                        }
+                                        status.set(format!(
+                                            "Text extended to end of reel ({})",
+                                            fmt_clip_dur(dur)
+                                        ));
+                                    },
+                                }
+                                MenuSeparator {}
                                 CtxItem {
                                     label: "Copy".to_string(),
                                     shortcut: Some("Ctrl+C".to_string()),
@@ -10382,11 +8729,11 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         disabled: no_clips || exporting,
                         onclick: move |_| {
                             show_add.set(false);
-                            add_overlay(());
+                            add_overlay(2);
                         },
                         span { class: "mr-add-tag", "V2" }
                         strong { "Overlay" }
-                        span { class: "mor-statusbar-muted", "B-roll cutaway over V1" }
+                        span { class: "mor-statusbar-muted", "B-roll / PiP over V1 (add V3+ for stacks)" }
                     }
                     button {
                         class: "mr-add-card",
@@ -10862,6 +9209,62 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             }
         }
         Modal {
+            open: show_giphy,
+            title: "Add from Giphy".to_string(),
+            div { class: "mr-hub",
+                p { class: "mor-statusbar-muted mr-export-blurb",
+                    "Search GIPHY, then click a result to drop it on V2 at the playhead. "
+                    "Stickers come in with transparency; GIFs fill the frame. Needs a free "
+                    "GIPHY_API_KEY (developers.giphy.com)."
+                }
+                div { class: "mr-toolbar",
+                    input {
+                        class: "mor-input",
+                        r#type: "text",
+                        placeholder: "Search GIFs…",
+                        value: "{giphy_query}",
+                        oninput: move |e| giphy_query.set(e.value()),
+                        onkeydown: move |e| if e.key() == Key::Enter { run_giphy_search(()); },
+                    }
+                    button {
+                        class: if giphy_stickers() { "mor-btn primary" } else { "mor-btn" },
+                        onclick: move |_| giphy_stickers.set(!giphy_stickers()),
+                        "Stickers"
+                    }
+                    button {
+                        class: "mor-btn primary",
+                        disabled: giphy_busy(),
+                        onclick: move |_| run_giphy_search(()),
+                        if giphy_busy() { "Searching…" } else { "Search" }
+                    }
+                }
+                div { class: "mr-giphy-grid",
+                    for g in giphy_results() {
+                        img {
+                            key: "{g.id}",
+                            class: "mr-giphy-thumb",
+                            src: "{g.preview}",
+                            title: "{g.title}",
+                            onclick: move |_| {
+                                let g = g.clone();
+                                let at = playhead();
+                                spawn(async move {
+                                    status.set(format!("Fetching “{}”…", g.title));
+                                    match giphy::download(&g).await {
+                                        Ok(path) => add_overlay_path(path.display().to_string(), at, 2),
+                                        Err(e) => status.set(format!("GIPHY download: {e}")),
+                                    }
+                                });
+                            },
+                        }
+                    }
+                }
+                div { class: "mr-toolbar",
+                    button { class: "mor-btn", onclick: move |_| show_giphy.set(false), "Done" }
+                }
+            }
+        }
+        Modal {
             open: show_shortcuts,
             title: "Keyboard shortcuts".to_string(),
             table { class: "mr-shortcut-table",
@@ -10873,6 +9276,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     ("Ctrl+P", "Full preview with audio in mpv/ffplay"),
                     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
                     ("Ctrl+C / Ctrl+V", "Copy / paste timeline item at the playhead"),
+                    ("Ctrl+Shift+V", "Paste look (transform + grade + effect) onto the selection"),
+                    ("Ctrl+Shift+X", "Reset look to default"),
                     ("I / O", "Set in / out point at playhead"),
                     ("S", "Split at playhead"),
                     ("F", "Add freeze frame at the playhead"),
@@ -10884,6 +9289,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     ("Delete / Backspace", "Ripple delete selection"),
                     ("← / →", "Nudge playhead 0.1s (Shift = 1s)"),
                     (", / .", "Step playhead one frame (1/30 s)"),
+                    ("< / >", "Nudge selected cutaway/title/bed/FX one frame (Ctrl = 10)"),
                     ("↑ / ↓", "Jump to previous / next edit point"),
                     ("[ / ]", "Select previous / next clip"),
                     ("Drag", "Move items; snaps to cuts and the playhead, V1 clips reorder"),
@@ -11129,1366 +9535,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
     }
 }
 
-const APP_CSS: &str = r#"
-/* --- Aero glass token layer -------------------------------------------------
-   Supplements the theme.rs :root tokens. These are the Windows-Aero pillar the
-   base palette lacked: translucent panel tints that let a backdrop blur read
-   through, chiseled inset/highlight framing, and a soft focus glow. Applied
-   only to overlay surfaces (float panel, modals, context menu, deck, sticky
-   heads) — the surfaces with live app content behind them for the blur to
-   sample. Docked panels stay opaque; there's nothing behind them to frost. */
-:root {
-  --mor-glass:        color-mix(in srgb, var(--mor-panel) 72%, transparent);
-  --mor-glass-strong: color-mix(in srgb, var(--mor-panel) 86%, transparent);
-  --mor-glass-blur:        16px;
-  --mor-glass-blur-strong: 26px;
-  --mor-inset:     inset 0 1px 2px rgba(0, 0, 0, 0.45), inset 0 -1px 0 color-mix(in srgb, white 5%, transparent);
-  --mor-highlight: inset 0 1px 0 color-mix(in srgb, white 10%, transparent);
-  --mor-focus-glow: 0 0 0 2px color-mix(in srgb, var(--mor-accent-hover) 55%, transparent),
-                    0 0 12px color-mix(in srgb, var(--mor-accent) 40%, transparent);
-}
-
-/* Fluid + a light retro MMO HUD: brass frames, soft glows, inventory-slot
-   clips. Motion is deliberate; labels stay plain English in the app itself. */
-.mr-root {
-  display: flex; flex-direction: column; gap: 12px; height: 100%; min-height: 0;
-  padding: 12px; box-sizing: border-box;
-  background:
-    radial-gradient(ellipse 90% 55% at 50% -8%, color-mix(in srgb, var(--mor-accent) 9%, transparent), transparent 58%),
-    radial-gradient(ellipse 50% 40% at 100% 100%, color-mix(in srgb, var(--mor-success) 5%, transparent), transparent 50%),
-    var(--mor-bg);
-}
-.mr-work { display: flex; gap: 16px; flex: 1; min-height: 0; }
-.mr-preview-col { display: flex; flex-direction: column; gap: 10px; align-items: center; min-height: 0; padding-top: 4px; flex: 0 0 auto; width: clamp(180px, 34vw, 560px); }
-/* The phone fills whatever height is left after the scrub controls; a definite
-   column width keeps the height-driven phone from overflowing (the old WebKit
-   intrinsic-width bug). 9:16 is tall, so height is the binding constraint. */
-.mr-stage { flex: 1; min-height: 0; width: 100%; display: flex; align-items: center; justify-content: center; }
-
-/* Buttons inside the editor: longer ease, slight lift, brass-rim primary. */
-.mr-root .mor-btn {
-  transition: background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.15s ease, color 0.15s ease;
-}
-.mr-root .mor-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.35), 0 0 0 1px color-mix(in srgb, var(--mor-border-light) 60%, transparent);
-}
-.mr-root .mor-btn:active:not(:disabled) {
-  transform: translateY(0);
-  box-shadow: var(--mor-inset);
-  filter: brightness(0.94);
-}
-.mr-root .mor-btn.primary {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-accent-hover) 92%, white), var(--mor-accent));
-  border-color: color-mix(in srgb, var(--mor-accent) 70%, #2e2160);
-  color: #160f2b;
-  font-weight: 600;
-  text-shadow: 0 1px 0 color-mix(in srgb, white 25%, transparent);
-}
-.mr-root .mor-btn.primary:hover:not(:disabled) {
-  background: linear-gradient(180deg, var(--mor-accent-hover), color-mix(in srgb, var(--mor-accent) 85%, black));
-  box-shadow: 0 4px 14px color-mix(in srgb, var(--mor-accent) 35%, transparent);
-}
-
-/* Signature: phone as a framed artifact — dual rim + soft brass bloom.
-   Width-driven: aspect-ratio height doesn't feed the flex column's intrinsic
-   width in WebKit, so a flex-sized phone overflows. 400px ≈ vertical chrome. */
-.mr-phone {
-  position: relative; flex: none;
-  height: 100%; width: auto; max-width: 100%; min-width: 0;
-  aspect-ratio: 9 / 16; background: #000;
-  border: 5px solid #06060a;
-  border-radius: 24px; overflow: hidden;
-  display: flex; align-items: center; justify-content: center;
-  color: var(--mor-text-muted); font-size: 13px;
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--mor-accent) 45%, var(--mor-border-light)),
-    0 0 0 3px #0a0a10,
-    0 16px 44px rgba(0, 0, 0, 0.6),
-    0 0 48px color-mix(in srgb, var(--mor-accent) 14%, transparent);
-  transition: box-shadow 0.35s ease, transform 0.25s ease;
-}
-.mr-phone:hover {
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--mor-accent) 65%, var(--mor-border-light)),
-    0 0 0 3px #0a0a10,
-    0 18px 48px rgba(0, 0, 0, 0.62),
-    0 0 64px color-mix(in srgb, var(--mor-accent) 22%, transparent);
-}
-.mr-phone > span { text-align: center; padding: 0 16px; }
-.mr-phone img { width: 100%; height: 100%; object-fit: cover; display: block; }
-/* Punch-hole speaker slit: the bezel reads as a phone at a glance. */
-.mr-phone::after {
-  content: ""; position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
-  width: 22%; height: 5px; border-radius: 3px; background: #06060a;
-  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.06), 0 0 6px color-mix(in srgb, var(--mor-accent) 20%, transparent);
-  z-index: 2; pointer-events: none;
-}
-
-/* Drop target: pulse the brass rim without reflowing lane geometry. */
-.mr-drop {
-  box-shadow:
-    inset 0 0 0 2px var(--mor-accent),
-    0 0 18px color-mix(in srgb, var(--mor-accent) 38%, transparent) !important;
-  background-color: color-mix(in srgb, var(--mor-accent) 12%, transparent);
-  animation: mr-drop-pulse 1.1s ease-in-out infinite;
-}
-.mr-timeline.mr-drop { border-radius: var(--mor-radius); }
-@keyframes mr-drop-pulse {
-  0%, 100% { box-shadow: inset 0 0 0 2px var(--mor-accent), 0 0 12px color-mix(in srgb, var(--mor-accent) 28%, transparent); }
-  50% { box-shadow: inset 0 0 0 2px var(--mor-accent-hover), 0 0 22px color-mix(in srgb, var(--mor-accent) 48%, transparent); }
-}
-
-/* Transform handles: gem-square corners, gold dashed frame. */
-.mr-xf { position: absolute; inset: 0; z-index: 4; }
-.mr-xf-box {
-  position: absolute; box-sizing: border-box;
-  border: 1px dashed var(--mor-accent);
-  background: color-mix(in srgb, var(--mor-accent) 7%, transparent);
-  pointer-events: auto; cursor: move;
-  box-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 18%, transparent);
-}
-.mr-xf-h {
-  position: absolute; width: 13px; height: 13px; margin: -7px 0 0 -7px; box-sizing: border-box;
-  background: linear-gradient(145deg, var(--mor-accent-hover), var(--mor-accent));
-  border: 1px solid #0f0f12; border-radius: 2px;
-  pointer-events: auto; cursor: nwse-resize;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.6), 0 0 6px color-mix(in srgb, var(--mor-accent) 40%, transparent);
-  transition: transform 0.12s ease;
-}
-.mr-xf-h:hover { transform: scale(1.15); }
-.mr-xf-e { position: absolute; box-sizing: border-box; background: var(--mor-accent); border: 1px solid #0f0f12; border-radius: 2px; pointer-events: auto; box-shadow: 0 1px 3px rgba(0,0,0,0.6); }
-.mr-xf-e.wide { width: 9px; height: 17px; margin: -9px 0 0 -5px; cursor: ew-resize; }
-.mr-xf-e.tall { width: 17px; height: 9px; margin: -5px 0 0 -9px; cursor: ns-resize; }
-.mr-xf-rot {
-  position: absolute; width: 13px; height: 13px; margin: -22px 0 0 -7px; box-sizing: border-box;
-  background: radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--mor-warning) 35%, white), var(--mor-warning) 55%, color-mix(in srgb, var(--mor-warning) 55%, black));
-  border: 1px solid #0f0f12; border-radius: 50%;
-  pointer-events: auto; cursor: grab;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.6), 0 0 8px color-mix(in srgb, var(--mor-warning) 45%, transparent);
-}
-.mr-xf-rot::after {
-  content: ""; position: absolute; left: 50%; top: 100%; width: 1px; height: 14px;
-  background: var(--mor-warning); opacity: 0.75;
-}
-
-/* Safe-area guides (phone app chrome). Non-interactive. */
-.mr-safe { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
-.mr-safe-zone {
-  position: absolute;
-  background: color-mix(in srgb, var(--mor-destructive) 15%, transparent);
-  border: 1px dashed color-mix(in srgb, var(--mor-destructive) 55%, transparent);
-  box-sizing: border-box;
-}
-.mr-safe-zone span {
-  position: absolute; bottom: 2px; right: 4px; font-size: 8px; letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: color-mix(in srgb, var(--mor-destructive) 85%, white);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9); white-space: nowrap;
-}
-.mr-safe-top { top: 0; left: 0; right: 0; height: 8%; border-width: 0 0 1px 0; }
-.mr-safe-bottom { bottom: 0; left: 0; right: 0; height: 24%; border-width: 1px 0 0 0; }
-.mr-safe-bottom span { bottom: auto; top: 2px; }
-.mr-safe-rail { top: 8%; bottom: 24%; right: 0; width: 18%; border-width: 0 0 0 1px; }
-
-.mr-monitor {
-  height: 100vh; display: flex; align-items: center; justify-content: center;
-  padding: 14px; box-sizing: border-box;
-  background:
-    radial-gradient(ellipse 70% 60% at 50% 40%, color-mix(in srgb, var(--mor-accent) 8%, transparent), transparent 65%),
-    var(--mor-bg);
-}
-.mr-monitor .mr-phone { width: auto; height: 100%; max-width: 100%; min-width: 0; }
-
-.mr-scrub { width: 100%; flex: none; }
-/* Deck: HUD readout — brass inset frame, amber at rest, record-red rolling. */
-.mr-deck {
-  display: flex; justify-content: center; align-items: baseline; gap: 7px;
-  margin-bottom: 4px; padding: 5px 14px 6px;
-  background: linear-gradient(180deg, #12121a, #08080c);
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 35%, var(--mor-border));
-  border-radius: 8px;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 18%, transparent),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.45),
-    0 0 16px color-mix(in srgb, var(--mor-accent) 12%, transparent);
-  font-size: 21px; color: var(--mor-accent); letter-spacing: 0.06em;
-  text-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 45%, transparent);
-  transition: color 0.25s ease, text-shadow 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
-}
-.mr-deck.playing {
-  color: var(--mor-destructive);
-  border-color: color-mix(in srgb, var(--mor-destructive) 45%, var(--mor-border));
-  text-shadow: 0 0 14px color-mix(in srgb, var(--mor-destructive) 50%, transparent);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--mor-destructive) 20%, transparent),
-    0 0 18px color-mix(in srgb, var(--mor-destructive) 18%, transparent);
-  animation: mr-deck-pulse 1.4s ease-in-out infinite;
-}
-@keyframes mr-deck-pulse {
-  0%, 100% { text-shadow: 0 0 10px color-mix(in srgb, var(--mor-destructive) 40%, transparent); }
-  50% { text-shadow: 0 0 18px color-mix(in srgb, var(--mor-destructive) 65%, transparent); }
-}
-.mr-deck-total { font-size: 12px; color: var(--mor-text-muted); text-shadow: none; letter-spacing: 0.03em; }
-.mr-play-row { display: flex; gap: 8px; justify-content: center; margin-top: 8px; }
-
-/* Inspector: framed panel like a classic side window. */
-.mr-inspector {
-  flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 12px;
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 92%, white), var(--mor-panel));
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border));
-  border-radius: var(--mor-radius);
-  padding: 0 14px 14px; overflow-y: auto;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 12%, transparent),
-    0 8px 28px rgba(0, 0, 0, 0.35),
-    0 0 0 1px rgba(0, 0, 0, 0.35);
-}
-/* Popped-out inspector: it IS the window — fill it, drop the card chrome, and
-   breathe a little wider than the docked panel. */
-.mr-inspector.mr-inspector-solo {
-  flex: 1; min-width: 0; width: 100%; height: 100%;
-  border: none; border-radius: 0; box-shadow: none;
-  padding: 0 18px 18px; gap: 14px;
-  background:
-    radial-gradient(120% 42% at 50% 0%, color-mix(in srgb, var(--mor-accent) 7%, transparent), transparent 62%),
-    linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 96%, white), var(--mor-panel));
-}
-/* Window identity: names what you're editing, in that element's colour (--kind).
-   The signature — a top accent rail + a glowing kind badge — is the one bold
-   mark; every control below it stays the app's quiet violet/glass. */
-.mr-solo-head {
-  position: sticky; top: 0; z-index: 6;
-  margin: 0 -18px 4px; padding: 18px 20px 15px;
-  border-bottom: 1px solid color-mix(in srgb, var(--kind) 26%, var(--mor-border));
-  background: linear-gradient(180deg,
-    color-mix(in srgb, var(--kind) 14%, var(--mor-panel)),
-    color-mix(in srgb, var(--kind) 4%, var(--mor-panel)));
-  box-shadow: inset 0 3px 0 var(--kind);
-}
-.mr-solo-eyebrow {
-  display: block; font-size: 10px; font-weight: 700;
-  letter-spacing: 0.2em; text-transform: uppercase;
-  color: color-mix(in srgb, var(--kind) 62%, var(--mor-text-muted));
-}
-.mr-solo-title-row { display: flex; align-items: center; gap: 13px; margin-top: 9px; }
-.mr-solo-badge {
-  flex: none; display: grid; place-items: center;
-  width: 36px; height: 36px; border-radius: 10px;
-  font-size: 18px; font-weight: 700; color: var(--kind);
-  background: color-mix(in srgb, var(--kind) 15%, transparent);
-  border: 1px solid color-mix(in srgb, var(--kind) 42%, transparent);
-  box-shadow: 0 0 18px color-mix(in srgb, var(--kind) 20%, transparent);
-}
-.mr-solo-title {
-  font-size: 27px; font-weight: 700; letter-spacing: -0.015em; line-height: 1;
-  color: var(--mor-text);
-}
-/* Floated inspector: movable + resizable sheet (geometry set inline). */
-.mr-inspector.mr-float-panel {
-  position: fixed; z-index: 320; flex: none;
-  box-sizing: border-box;
-  min-width: 280px; min-height: 220px;
-  max-width: calc(100vw - 16px); max-height: calc(100vh - 16px);
-  padding-bottom: 14px;
-  overflow-x: hidden; overflow-y: auto;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-glass-strong) 90%, white), var(--mor-glass-strong));
-  backdrop-filter: blur(var(--mor-glass-blur-strong)) saturate(1.35);
-  -webkit-backdrop-filter: blur(var(--mor-glass-blur-strong)) saturate(1.35);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 14%, transparent),
-    0 18px 48px rgba(0, 0, 0, 0.55),
-    0 0 0 1px color-mix(in srgb, var(--mor-accent) 30%, transparent),
-    0 0 36px color-mix(in srgb, var(--mor-accent) 12%, transparent);
-  animation: mr-float-in 0.18s ease-out;
-}
-@keyframes mr-float-in {
-  from { opacity: 0; transform: translateY(8px) scale(0.98); }
-  to { opacity: 1; transform: none; }
-}
-.mr-panel-head {
-  display: flex; align-items: center; gap: 8px;
-  position: sticky; top: 0; z-index: 2;
-  margin: 0 -14px 4px; padding: 9px 12px 8px;
-  background: linear-gradient(180deg,
-    color-mix(in srgb, var(--mor-header) 82%, transparent),
-    color-mix(in srgb, var(--mor-header) 74%, transparent));
-  backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.2);
-  -webkit-backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.2);
-  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border));
-  border-radius: var(--mor-radius) var(--mor-radius) 0 0;
-  user-select: none;
-}
-.mr-float-panel .mr-panel-head { cursor: grab; }
-.mr-float-panel .mr-panel-head:active { cursor: grabbing; }
-
-/* Float resize grips — thin hit targets on edges, gem squares on corners. */
-.mr-float-grip {
-  position: absolute; z-index: 5;
-  background: transparent;
-}
-.mr-float-grip-n { top: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
-.mr-float-grip-s { bottom: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
-.mr-float-grip-e { top: 10px; right: 0; bottom: 10px; width: 6px; cursor: ew-resize; }
-.mr-float-grip-w { top: 10px; left: 0; bottom: 10px; width: 6px; cursor: ew-resize; }
-.mr-float-grip-ne, .mr-float-grip-nw, .mr-float-grip-se, .mr-float-grip-sw {
-  width: 12px; height: 12px;
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 55%, #0f0f12);
-  background: linear-gradient(145deg, var(--mor-accent-hover), var(--mor-accent));
-  border-radius: 2px;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.5), 0 0 6px color-mix(in srgb, var(--mor-accent) 35%, transparent);
-  opacity: 0.85;
-  transition: opacity 0.12s ease, transform 0.12s ease;
-}
-.mr-float-grip-ne:hover, .mr-float-grip-nw:hover, .mr-float-grip-se:hover, .mr-float-grip-sw:hover {
-  opacity: 1; transform: scale(1.12);
-}
-.mr-float-grip-ne { top: -1px; right: -1px; cursor: nesw-resize; }
-.mr-float-grip-nw { top: -1px; left: -1px; cursor: nwse-resize; }
-.mr-float-grip-se { bottom: -1px; right: -1px; cursor: nwse-resize; }
-.mr-float-grip-sw { bottom: -1px; left: -1px; cursor: nesw-resize; }
-/* Visible SE affordance so resize is discoverable without hunting. */
-.mr-float-grip-se::after {
-  content: ""; position: absolute; right: 2px; bottom: 2px;
-  width: 7px; height: 7px;
-  background:
-    linear-gradient(135deg, transparent 45%, color-mix(in srgb, #160f2b 70%, transparent) 46%, color-mix(in srgb, #160f2b 70%, transparent) 54%, transparent 55%),
-    linear-gradient(135deg, transparent 60%, color-mix(in srgb, #160f2b 55%, transparent) 61%, color-mix(in srgb, #160f2b 55%, transparent) 69%, transparent 70%);
-  pointer-events: none;
-}
-.mr-panel-title {
-  flex: 1; min-width: 0;
-  font-size: 12px; font-weight: 650; letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: color-mix(in srgb, var(--mor-text) 88%, var(--mor-accent));
-}
-.mr-panel-tools { display: flex; gap: 2px; flex: none; }
-.mr-panel-btn {
-  width: 28px; height: 24px; padding: 0;
-  border: 1px solid transparent; border-radius: 5px;
-  background: transparent; color: var(--mor-text-muted);
-  font-size: 13px; line-height: 1; cursor: pointer;
-  transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
-}
-.mr-panel-btn:hover {
-  color: var(--mor-accent-hover);
-  background: color-mix(in srgb, var(--mor-accent) 12%, transparent);
-  border-color: color-mix(in srgb, var(--mor-accent) 28%, transparent);
-}
-.mr-insp-reopen {
-  flex: none; align-self: stretch;
-  writing-mode: vertical-rl; text-orientation: mixed;
-  letter-spacing: 0.08em; text-transform: uppercase;
-  font-size: 11px; font-weight: 650;
-  padding: 12px 8px; cursor: pointer;
-  color: color-mix(in srgb, var(--mor-text) 80%, var(--mor-accent));
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 90%, white), var(--mor-panel));
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 28%, var(--mor-border));
-  border-radius: var(--mor-radius);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 10%, transparent);
-  transition: color 0.15s ease, border-color 0.15s ease, box-shadow 0.18s ease;
-}
-.mr-insp-reopen:hover {
-  color: var(--mor-accent-hover);
-  border-color: var(--mor-accent);
-  box-shadow: 0 0 14px color-mix(in srgb, var(--mor-accent) 28%, transparent);
-}
-/* The title text field is a textarea; inherit the input look, allow wrapping
-   and a vertical drag to grow, and keep the editor font rather than monospace. */
-.mr-text-area {
-  min-height: 3.4em;
-  resize: vertical;
-  font-family: inherit;
-  line-height: 1.35;
-  white-space: pre-wrap;
-}
-.mr-status-click { cursor: pointer; }
-.mr-status-click:hover { filter: brightness(1.1); }
-.mr-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
-.mr-toolbar .mr-export {
-  margin-left: auto; color: var(--mor-warning);
-  border-color: color-mix(in srgb, var(--mor-warning) 50%, transparent);
-  background: color-mix(in srgb, var(--mor-warning) 8%, var(--mor-btn));
-}
-.mr-toolbar .mr-export:hover:not(:disabled) {
-  border-color: var(--mor-warning);
-  box-shadow: 0 0 12px color-mix(in srgb, var(--mor-warning) 30%, transparent);
-  color: color-mix(in srgb, var(--mor-warning) 25%, white);
-}
-.mr-field-row {
-  display: flex; align-items: flex-end; gap: 8px;
-}
-.mr-field-grow { flex: 1; min-width: 0; }
-.mr-field-side {
-  flex: none; margin-bottom: 1px; font-size: 12px;
-  white-space: nowrap;
-}
-.mr-danger { color: var(--mor-destructive); }
-.mr-reset { align-self: flex-start; font-size: 11px; }
-.mr-keys { margin-top: auto; font-size: 11px; }
-
-/* Add-to-reel dialog cards. */
-.mr-add-dialog { display: flex; flex-direction: column; gap: 12px; }
-.mr-add-grid {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-}
-.mr-add-card {
-  display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
-  text-align: left; padding: 12px 12px 14px; cursor: pointer;
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border));
-  border-radius: 9px;
-  background: linear-gradient(165deg, color-mix(in srgb, var(--mor-btn) 92%, white), var(--mor-btn));
-  color: var(--mor-text);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 7%, transparent);
-  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.14s ease, filter 0.14s ease;
-}
-.mr-add-card:hover:not(:disabled) {
-  border-color: var(--mor-accent);
-  transform: translateY(-2px);
-  filter: brightness(1.05);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35), 0 0 14px color-mix(in srgb, var(--mor-accent) 22%, transparent);
-}
-.mr-add-card:disabled { opacity: 0.45; cursor: not-allowed; }
-.mr-add-card strong { font-size: 14px; font-weight: 650; }
-.mr-add-card .mor-statusbar-muted { font-size: 11px; line-height: 1.35; }
-.mr-add-tag {
-  font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px;
-  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
-  color: #141417;
-}
-.mr-add-tag.audio { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
-.mr-add-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
-.mr-add-extra { justify-content: flex-start; }
-.mr-fx-dialog { display: flex; flex-direction: column; gap: 8px; }
-
-/* Dialog chrome polish (export / effects / add / about) + browser resize grip. */
-.mor-modal {
-  display: flex !important;
-  flex-direction: column;
-  resize: both;
-  overflow: hidden !important;
-  min-width: 320px !important;
-  min-height: 180px;
-  max-width: min(96vw, 920px) !important;
-  max-height: 90vh;
-  width: min(520px, 92vw);
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 28%, var(--mor-border-light)) !important;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-glass-strong) 92%, white), var(--mor-glass-strong)) !important;
-  backdrop-filter: blur(var(--mor-glass-blur-strong)) saturate(1.35);
-  -webkit-backdrop-filter: blur(var(--mor-glass-blur-strong)) saturate(1.35);
-  box-shadow:
-    0 22px 56px rgba(0, 0, 0, 0.62),
-    0 0 0 1px rgba(0, 0, 0, 0.35),
-    var(--mor-highlight),
-    0 0 40px color-mix(in srgb, var(--mor-accent) 10%, transparent) !important;
-}
-.mor-modal-header {
-  flex: none;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-header) 90%, var(--mor-accent)), var(--mor-header)) !important;
-  border-bottom-color: color-mix(in srgb, var(--mor-accent) 22%, var(--mor-border-light)) !important;
-  letter-spacing: 0.03em;
-}
-.mor-modal-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  max-height: none !important;
-  overflow-y: auto;
-}
-.mor-modal-backdrop {
-  background:
-    radial-gradient(ellipse 70% 50% at 50% 40%, color-mix(in srgb, var(--mor-accent) 8%, transparent), transparent 60%),
-    rgba(0, 0, 0, 0.55) !important;
-  backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.1);
-  -webkit-backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.1);
-}
-
-.mr-progress {
-  height: 7px; background: var(--mor-border); border-radius: 4px; overflow: hidden;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
-}
-.mr-progress > div {
-  height: 100%;
-  background: linear-gradient(90deg, var(--mor-accent), var(--mor-accent-hover), var(--mor-warning));
-  background-size: 200% 100%;
-  transition: width 0.3s ease;
-  animation: mr-progress-sheen 2.2s linear infinite;
-  box-shadow: 0 0 8px color-mix(in srgb, var(--mor-accent) 40%, transparent);
-}
-@keyframes mr-progress-sheen {
-  0% { background-position: 100% 0; }
-  100% { background-position: -100% 0; }
-}
-
-/* Timeline: darkest bench, brass outer rim. */
-.mr-timeline {
-  position: relative;
-  /* Both bars always shown: horizontal is the time axis, vertical spans the
-     lane stack — keep them present so the scrollable extent is always obvious. */
-  display: flex; overflow-x: scroll; overflow-y: scroll; padding: 12px 10px 8px;
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--mor-header) 88%, var(--mor-accent)), var(--mor-header));
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
-  border-radius: var(--mor-radius);
-  min-height: 280px; max-height: 42vh;
-  align-items: flex-start; flex: none;
-  user-select: none; -webkit-user-select: none;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--mor-accent) 10%, transparent),
-    0 6px 22px rgba(0, 0, 0, 0.4);
-}
-.mr-timeline-hint { align-self: center; margin: auto; }
-
-/* Phase emphasis on the timeline: dim the lanes the active phase doesn't touch,
-   spotlighting the ones it does. V1 is .mr-clips, V2 .mr-lane-v, T .mr-lane-t,
-   A1/A2 .mr-lane-a1. Add/Export set no phase class, so nothing dims. */
-.mr-lane, .mr-clips { transition: opacity 0.2s ease, filter 0.2s ease; }
-.mr-phase-text .mr-lane-v,
-.mr-phase-text .mr-clips,
-.mr-phase-text .mr-lane-a1,
-.mr-phase-audio .mr-lane-t,
-.mr-phase-audio .mr-lane-v,
-.mr-phase-audio .mr-clips,
-.mr-phase-cut .mr-lane-t,
-.mr-phase-cut .mr-lane-a1,
-.mr-phase-style .mr-lane-t,
-.mr-phase-style .mr-lane-a1 {
-  opacity: 0.38; filter: saturate(0.55);
-}
-
-/* Phase-driven inspector: stacked action buttons for Add/Export. */
-.mr-phase-actions { display: flex; flex-direction: column; gap: 8px; }
-.mr-phase-actions .mor-btn { width: 100%; }
-
-/* Text workspace: browse the T lane as a pick-to-edit list. */
-.mr-text-nav { margin: 2px 0 6px; }
-.mr-text-nav .mor-btn { flex: 1; font-size: 12px; }
-.mr-text-empty { margin-top: 12px; opacity: 0.8; }
-.mr-text-list { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
-.mr-text-row {
-  display: flex; align-items: center; gap: 8px; width: 100%;
-  padding: 8px 10px; text-align: left; cursor: pointer;
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
-  border-radius: 8px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-btn) 92%, white), var(--mor-btn));
-  color: var(--mor-text);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
-  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.14s ease, filter 0.14s ease;
-}
-.mr-text-row { cursor: default; }
-.mr-text-row:hover {
-  border-color: var(--mor-accent);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3), 0 0 12px color-mix(in srgb, var(--mor-accent) 22%, transparent);
-}
-.mr-text-row-label {
-  flex: 1; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px;
-}
-/* Inline transcript editor: the words are editable in place. */
-.mr-text-row-edit {
-  flex: 1; min-width: 0; font-size: 12px; padding: 5px 8px; margin: 0;
-}
-.mr-text-jump {
-  flex: none; cursor: pointer; border: none; background: none;
-  padding: 0 2px; font-size: 13px; line-height: 1;
-}
-.mr-text-del {
-  flex: none; cursor: pointer; border: none; background: none;
-  color: var(--mor-text-muted); font-size: 13px; line-height: 1; padding: 0 2px;
-}
-.mr-text-del:hover { color: var(--mor-danger, #e5484d); }
-.mr-text-row-time {
-  flex: none; font-size: 11px; color: var(--mor-text-muted); cursor: pointer;
-  font-variant-numeric: tabular-nums;
-}
-/* Style sub-tabs sit above the panel's controls with a little room. */
-.mr-inspector .mor-tabs { margin: 4px 0 12px; }
-/* Band presets + background swatches. */
-.mr-preset-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 12px; }
-.mr-preset-row .mor-btn { flex: 1; min-width: 68px; }
-.mr-bg-swatches { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-.mr-bg-swatch {
-  flex: 1; min-width: 66px; height: 58px; padding: 5px;
-  border: 2px solid var(--mor-border); border-radius: 8px; cursor: pointer;
-  display: flex; align-items: flex-end; justify-content: center;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-.mr-bg-swatch:hover { border-color: color-mix(in srgb, var(--mor-accent) 60%, transparent); }
-.mr-bg-swatch.active {
-  border-color: var(--mor-accent);
-  box-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 45%, transparent);
-}
-.mr-bg-name {
-  font-size: 10px; background: rgba(0, 0, 0, 0.55); color: #fff;
-  padding: 1px 6px; border-radius: 4px;
-}
-
-/* Workflow spine: the reel-building phases as a bottom bar. */
-.mr-workflow {
-  display: flex; justify-content: center; gap: 4px; flex: none;
-  padding: 5px 8px; margin-top: 6px;
-  background: rgba(127, 127, 127, 0.05);
-  border: 1px solid var(--mor-border);
-  border-radius: var(--mor-radius);
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.2);
-}
-.mr-wf {
-  position: relative;
-  display: flex; flex-direction: column; align-items: center; gap: 3px;
-  min-width: 76px; padding: 5px 12px;
-  background: transparent; border: 1px solid transparent; border-radius: 7px;
-  color: var(--mor-text-muted); cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-}
-.mr-wf:hover:not(:disabled) { background: rgba(127, 127, 127, 0.09); color: var(--mor-text); }
-.mr-wf:disabled { opacity: 0.4; cursor: not-allowed; }
-.mr-wf.active {
-  color: var(--mor-text);
-  border-color: color-mix(in srgb, var(--mor-accent) 50%, transparent);
-  background: color-mix(in srgb, var(--mor-accent) 15%, transparent);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 10%, transparent);
-}
-.mr-wf-export {
-  color: color-mix(in srgb, var(--mor-accent) 85%, white);
-  border-color: color-mix(in srgb, var(--mor-accent) 40%, transparent);
-}
-.mr-wf-icon { font-size: 16px; line-height: 1; }
-.mr-wf-label { font-size: 11px; letter-spacing: 0.03em; }
-.mr-wf-tick {
-  position: absolute; top: 2px; right: 7px;
-  font-size: 9px; color: var(--mor-success);
-  text-shadow: 0 0 6px color-mix(in srgb, var(--mor-success) 50%, transparent);
-}
-.mr-track { position: relative; flex: none; min-width: 100%; }
-
-.mr-tick, .mr-clip-dur, .mr-key, .mr-ph-badge, .mr-deck {
-  font-family: ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', monospace;
-  font-variant-numeric: tabular-nums;
-}
-
-.mr-ruler {
-  position: relative; height: 22px; margin-bottom: 6px;
-  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 25%, var(--mor-border-light));
-  cursor: ew-resize;
-}
-.mr-tick {
-  position: absolute; bottom: 0; height: 5px;
-  border-left: 1px solid var(--mor-border);
-  font-size: 9px; color: var(--mor-text-muted);
-  pointer-events: none; white-space: nowrap;
-}
-.mr-tick.major {
-  height: 15px;
-  border-left-color: color-mix(in srgb, var(--mor-accent) 40%, var(--mor-border-light));
-  padding-left: 3px; color: color-mix(in srgb, var(--mor-text-muted) 80%, var(--mor-accent));
-}
-
-.mr-lane {
-  position: relative; height: 30px; margin-bottom: 6px;
-  background: rgba(127, 127, 127, 0.06);
-  border-radius: 5px;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
-}
-.mr-lane-tag {
-  position: absolute; top: 4px; left: 4px; z-index: 2;
-  font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px;
-  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
-  color: #141417; pointer-events: none;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
-}
-.mr-lane-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
-/* An eye-toggle tag opts back into clicks (the base tag is inert) and dims when
-   its lane is hidden from the monitor. */
-.mr-lane-toggle { pointer-events: auto; cursor: pointer; transition: opacity 0.15s ease, filter 0.15s ease; }
-.mr-lane-toggle:hover { filter: brightness(1.12); }
-.mr-lane-tag.off { opacity: 0.4; filter: grayscale(0.7); }
-.mr-lane-off .mr-lane-item { opacity: 0.32; filter: grayscale(0.5); }
-.mr-lane-a1 .mr-lane-tag { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
-/* Taller audio lanes so the waveform envelope has room to read and is an easier
-   drag/trim target. */
-.mr-lane-a1 {
-  height: 76px;
-  /* Empty bed reads as a drop target, like iMovie's music track. */
-  border: 1px dashed color-mix(in srgb, var(--mor-success) 28%, transparent);
-  border-radius: 6px;
-  background: color-mix(in srgb, #0e1418 70%, transparent);
-}
-.mr-audio-fx {
-  position: absolute; top: 2px; right: 4px; z-index: 2;
-  font-size: 9px; color: var(--mor-accent-hover);
-  text-shadow: 0 0 6px color-mix(in srgb, var(--mor-accent) 50%, transparent);
-  pointer-events: none;
-}
-
-/* On-lane audio handles: fade wedges, corner grips, a volume line. */
-.mr-fade-in, .mr-fade-out {
-  position: absolute; top: 0; bottom: 0; z-index: 2; pointer-events: none;
-}
-.mr-fade-in { left: 0; background: linear-gradient(to right, rgba(0,0,0,0.6), transparent); }
-.mr-fade-out { right: 0; background: linear-gradient(to left, rgba(0,0,0,0.6), transparent); }
-.mr-fade-grip {
-  position: absolute; top: 0; bottom: 0; width: 9px; z-index: 4;
-  cursor: ew-resize; opacity: 0; transition: opacity 0.15s ease;
-  background: color-mix(in srgb, var(--mor-success) 70%, white);
-  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-success) 60%, transparent);
-}
-.mr-fade-grip.in { left: 0; border-radius: 5px 0 0 5px; }
-.mr-fade-grip.out { right: 0; border-radius: 0 5px 5px 0; }
-.mr-lane-item.audio:hover .mr-fade-grip { opacity: 0.55; }
-.mr-fade-grip:hover { opacity: 0.95 !important; }
-/* Dual-edge resize grips — left + right, same hit size as audio fade grips.
-   Titles tint gold; cutaways and V1 clips pick up the lane colour via parent. */
-.mr-len-grip {
-  position: absolute; top: 0; bottom: 0; width: 9px; z-index: 4;
-  cursor: ew-resize; opacity: 0; transition: opacity 0.15s ease;
-  background: color-mix(in srgb, var(--mor-title, gold) 75%, white);
-  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-title, gold) 60%, transparent);
-}
-.mr-len-grip.in { left: 0; border-radius: 5px 0 0 5px; }
-.mr-len-grip.out { right: 0; border-radius: 0 5px 5px 0; }
-.mr-lane-item:hover .mr-len-grip,
-.mr-clip:hover .mr-len-grip { opacity: 0.55; }
-.mr-lane-item.selected .mr-len-grip,
-.mr-clip.selected .mr-len-grip { opacity: 0.7; }
-.mr-len-grip:hover { opacity: 0.95 !important; }
-.mr-clip .mr-len-grip,
-.mr-lane-item:not(.title) .mr-len-grip {
-  background: color-mix(in srgb, var(--mor-accent, #6af) 75%, white);
-  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-accent, #6af) 60%, transparent);
-}
-.mr-vol-line {
-  position: absolute; left: 0; right: 0; height: 3px; z-index: 3;
-  margin-bottom: -1.5px; cursor: ns-resize;
-  background: color-mix(in srgb, var(--mor-warning) 85%, white);
-  box-shadow: 0 0 5px color-mix(in srgb, var(--mor-warning) 70%, transparent);
-  opacity: 0.35; transition: opacity 0.15s ease;
-}
-.mr-lane-item.audio:hover .mr-vol-line { opacity: 0.85; }
-.mr-vol-line:hover { opacity: 1; height: 4px; }
-
-/* Track mixer strip in the Audio inspector. */
-.mr-mixer { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
-.mr-mixer-row { display: flex; align-items: center; gap: 8px; }
-.mr-mixer-tag {
-  flex: none; width: 26px; font-size: 10px; font-weight: 600; letter-spacing: 0.5px;
-  color: var(--mor-text-muted); text-align: center;
-}
-.mr-mixer-fader { flex: 1; min-width: 0; }
-.mr-mixer-btn {
-  flex: none; width: 22px; height: 20px; border-radius: 4px; font-size: 10px;
-  font-weight: 700; cursor: pointer; line-height: 1;
-  border: 1px solid var(--mor-border-light);
-  background: color-mix(in srgb, var(--mor-panel) 88%, white);
-  color: var(--mor-text-muted);
-}
-.mr-mixer-btn.on.m {
-  background: var(--mor-danger); border-color: var(--mor-danger); color: #140b0b;
-}
-.mr-mixer-btn.on.s {
-  background: var(--mor-warning); border-color: var(--mor-warning); color: #141002;
-}
-.mr-mixer-val { flex: none; width: 34px; font-size: 10px; text-align: right; color: var(--mor-text-muted); }
-
-/* Inspector waveform: whole source, kept window bright, trims/fades shaded. */
-.mr-insp-wave {
-  position: relative; height: 46px; width: 100%; margin: 6px 0 2px;
-  border-radius: 5px; background-repeat: no-repeat; background-size: 100% 100%;
-  background-color: color-mix(in srgb, #061412 75%, var(--mor-success));
-  box-shadow:
-    inset 0 0 0 1px color-mix(in srgb, var(--mor-success) 35%, transparent),
-    inset 0 -6px 10px color-mix(in srgb, var(--mor-success) 18%, transparent);
-}
-.mr-insp-trim { position: absolute; top: 0; bottom: 0; background: rgba(0,0,0,0.58); }
-.mr-insp-fadein { position: absolute; top: 0; bottom: 0; background: linear-gradient(to right, rgba(0,0,0,0.5), transparent); }
-.mr-insp-fadeout { position: absolute; top: 0; bottom: 0; background: linear-gradient(to left, rgba(0,0,0,0.5), transparent); }
-
-/* Lane items: embossed inventory-slot feel. */
-.mr-lane-item {
-  position: absolute; top: 2px; bottom: 2px; box-sizing: border-box;
-  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
-  font-size: 10px; line-height: 22px; padding: 0 6px 0 30px;
-  border-radius: 5px;
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 50%, transparent);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--mor-accent) 32%, transparent), color-mix(in srgb, var(--mor-accent) 16%, transparent));
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 12%, transparent), 0 1px 2px rgba(0, 0, 0, 0.3);
-  cursor: grab;
-  transition: border-color 0.15s ease, box-shadow 0.18s ease, filter 0.15s ease;
-}
-.mr-lane-item:hover { filter: brightness(1.08); }
-.mr-lane-item.audio {
-  border-color: color-mix(in srgb, var(--mor-success) 55%, transparent);
-  /* Dark bed so the teal wave stands out; image sits on top via wave_css. */
-  background-color: color-mix(in srgb, #061412 88%, var(--mor-success));
-  background-image: linear-gradient(180deg, color-mix(in srgb, var(--mor-success) 22%, transparent), color-mix(in srgb, var(--mor-success) 8%, transparent));
-  line-height: 74px;
-  padding-left: 32px;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, white 10%, transparent),
-    inset 0 -10px 18px color-mix(in srgb, var(--mor-success) 12%, transparent),
-    0 1px 2px rgba(0, 0, 0, 0.3);
-}
-.mr-lane-item.title {
-  border-color: color-mix(in srgb, var(--mor-warning) 55%, transparent);
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 34%, transparent), color-mix(in srgb, var(--mor-warning) 16%, transparent));
-}
-.mr-lane-item.selected {
-  border-color: var(--mor-accent);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, var(--mor-accent) 40%, transparent);
-}
-.mr-lane-item.audio.selected {
-  border-color: var(--mor-success);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, var(--mor-success) 40%, transparent);
-}
-.mr-lane-item.title.selected {
-  border-color: var(--mor-warning);
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 15%, transparent), 0 0 12px color-mix(in srgb, var(--mor-warning) 40%, transparent);
-}
-
-.mr-lane-item.marked, .mr-clip.marked {
-  outline: 2px dashed var(--mor-accent-hover); outline-offset: 1px;
-}
-/* FCP-style Disable: dimmed on the timeline, still occupies its span. */
-.mr-clip.disabled, .mr-lane-item.disabled {
-  opacity: 0.38;
-  filter: grayscale(0.9);
-}
-.mr-clip.disabled.selected {
-  border-color: #8a8690;
-  box-shadow: 0 0 0 1px color-mix(in srgb, #8a8690 40%, transparent);
-}
-/* FCP-style Solo: yellow outline on soloed items; non-soloed go B&W when any solo is on. */
-.mr-clip.solo, .mr-lane-item.solo {
-  outline: 2px solid #f0c419;
-  outline-offset: 0;
-  z-index: 3;
-}
-.mr-timeline.soloing .mr-clip:not(.solo):not(.disabled),
-.mr-timeline.soloing .mr-lane-item:not(.solo):not(.disabled) {
-  filter: grayscale(1);
-  opacity: 0.72;
-}
-.mr-group-dot {
-  position: absolute; right: 5px; top: 6px; z-index: 3;
-  width: 7px; height: 7px; border-radius: 50%;
-  box-shadow: 0 0 4px rgba(0, 0, 0, 0.7), 0 0 6px color-mix(in srgb, currentColor 40%, transparent);
-  pointer-events: none;
-}
-
-/* V1 story lane: filmstrip clips (iMovie) on a quiet bed. */
-.mr-clips {
-  position: relative; display: flex; margin-bottom: 6px;
-  min-height: 40px;
-  align-items: stretch;
-  background: color-mix(in srgb, #1a1a22 80%, transparent);
-  border-radius: 6px;
-  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.28);
-}
-.mr-clip {
-  position: relative; flex: none; box-sizing: border-box; overflow: hidden;
-  cursor: grab; border: 2px solid transparent; border-radius: 5px;
-  /* No padding — the film fills edge-to-edge like iMovie. */
-  background: #0c0c10;
-  display: flex; flex-direction: column;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
-  transition: border-color 0.14s ease, box-shadow 0.18s ease, filter 0.15s ease;
-}
-.mr-clip:hover {
-  border-color: color-mix(in srgb, #f0c419 55%, transparent);
-  filter: brightness(1.04);
-}
-/* iMovie yellow selection ring — the filmstrip's strongest cue. */
-.mr-clip.selected {
-  border-color: #f0c419;
-  z-index: 2;
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, #f0c419 40%, transparent),
-    0 0 12px color-mix(in srgb, #f0c419 35%, transparent);
-}
-/* Poster tiled across the span = filmstrip of frames. Height set inline
-   from Clip Appearance (film/wave modes + clip height slider). */
-.mr-clip-film {
-  position: relative; width: 100%; height: 72px; flex: 1 1 auto;
-  min-height: 0;
-  background-color: #000;
-  /* Vertical hairlines between tiles when the poster repeats. */
-  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.55);
-}
-.mr-clip-film.mr-clip-labels {
-  background: linear-gradient(180deg, #1c1c26, #12121a);
-  display: flex; align-items: center;
-}
-.mr-clip-film.mr-clip-labels .mr-clip-name {
-  position: static; background: none; padding: 0 6px;
-  width: 100%;
-}
-.mr-clip-film.mr-thumb-missing {
-  background:
-    repeating-linear-gradient(
-      90deg,
-      #121218 0 54px,
-      #0a0a0e 54px 56px
-    );
-}
-.mr-clip img { display: none; } /* legacy; film uses background-image */
-/* Clip's own audio under the picture — blue strip, drag to set gain.
-   Height set inline from Clip Appearance. */
-.mr-clip-wave {
-  position: relative; height: 22px; flex: none;
-  cursor: ns-resize;
-  /* Waveform URI is painted via inline style; this is the iMovie blue bed. */
-  background-color: #1a3a5c;
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #7ec8ff 25%, transparent),
-    inset 0 0 0 1px color-mix(in srgb, #2a6a9a 55%, transparent);
-}
-.mr-clip-wave .mr-clip-name {
-  z-index: 2;
-}
-.mr-clip-name-solo {
-  position: absolute; inset: 0; z-index: 2;
-  display: flex; align-items: center; padding: 0 6px;
-  background: linear-gradient(transparent, rgba(0,0,0,0.55));
-}
-/* Diagonal hatch sits above the wave image so the strip always reads as volume. */
-.mr-clip-wave::after {
-  content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 1;
-  background: repeating-linear-gradient(
-    -45deg,
-    transparent,
-    transparent 3px,
-    color-mix(in srgb, #4a9fe0 22%, transparent) 3px,
-    color-mix(in srgb, #4a9fe0 22%, transparent) 6px
-  );
-}
-.mr-clip-wave:hover {
-  filter: brightness(1.08);
-}
-.mr-clip-wave .mr-vol-line {
-  z-index: 2;
-  opacity: 0.55;
-  background: #e8f4ff;
-  box-shadow: 0 0 4px color-mix(in srgb, #7ec8ff 70%, transparent);
-}
-.mr-clip-wave:hover .mr-vol-line { opacity: 0.95; }
-.mr-xtrans {
-  position: absolute; top: 4px; right: 4px; z-index: 3;
-  font-size: 8px; line-height: 12px; padding: 0 4px; border-radius: 3px;
-  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
-  color: #141417; letter-spacing: -1px; pointer-events: none;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
-}
-/* Name sits on the film as a bottom fade label. */
-.mr-clip-name {
-  position: absolute; left: 0; right: 0; bottom: 0; z-index: 1;
-  padding: 10px 5px 2px;
-  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  font-size: 10px; color: #f2f0ea;
-  background: linear-gradient(transparent, rgba(0, 0, 0, 0.72));
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
-  pointer-events: none;
-}
-/* Duration pill — top-left on the film, iMovie "1.5h" / "4.0s".
-   On T/V2 lane cards it sits inside the left padding so the name still reads. */
-.mr-clip-dur {
-  position: absolute; top: 5px; left: 5px; transform: none;
-  z-index: 3; pointer-events: none;
-  font-size: 10px; font-weight: 700; letter-spacing: 0.02em;
-  color: #fff; padding: 1px 6px; border-radius: 4px;
-  background: rgba(0, 0, 0, 0.62);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
-  white-space: nowrap;
-}
-.mr-lane-item .mr-clip-dur {
-  top: 2px; left: 11px; font-size: 9px; padding: 0 4px; line-height: 16px;
-}
-.mr-clip.selected .mr-clip-dur,
-.mr-lane-item.selected .mr-clip-dur {
-  background: color-mix(in srgb, #f0c419 88%, #8a6a00);
-  color: #1a1400;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
-}
-.mr-lane-item.title.selected .mr-clip-dur {
-  background: color-mix(in srgb, var(--mor-warning) 88%, #8a6a00);
-}
-
-.mr-marker {
-  position: absolute; top: 18px; bottom: 0; width: 1px;
-  background: color-mix(in srgb, var(--mor-warning) 70%, transparent);
-  pointer-events: none; z-index: 1;
-}
-.mr-marker::before {
-  content: ""; position: absolute; top: -6px; left: -3px;
-  border: 3px solid transparent; border-top: 5px solid var(--mor-warning);
-  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--mor-warning) 50%, transparent));
-}
-
-.mr-playhead {
-  position: absolute; top: 0; bottom: 0; width: 2px;
-  background: var(--mor-destructive);
-  box-shadow: 0 0 8px color-mix(in srgb, var(--mor-destructive) 65%, transparent);
-  pointer-events: none;
-}
-/* Diamond cap — a tiny retro-UI gem on the playhead. */
-.mr-playhead::before {
-  content: ""; position: absolute; top: 1px; left: -4px;
-  width: 10px; height: 10px;
-  background: linear-gradient(145deg, #ff8a8e, var(--mor-destructive) 50%, #9a2024);
-  border: 1px solid color-mix(in srgb, white 25%, var(--mor-destructive));
-  border-radius: 1px;
-  transform: rotate(45deg);
-  box-shadow: 0 0 6px color-mix(in srgb, var(--mor-destructive) 55%, transparent);
-}
-.mr-ph-badge {
-  position: absolute; top: 0; left: 10px; padding: 0 5px; border-radius: 3px;
-  background: linear-gradient(180deg, #f06a6e, var(--mor-destructive));
-  color: #fff; font-size: 9px; line-height: 14px; white-space: nowrap;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
-}
-
-.mr-ctx-backdrop { position: fixed; inset: 0; z-index: 400; }
-.mr-ctx {
-  display: block; position: fixed; margin: 0; width: 228px; z-index: 401;
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 28%, var(--mor-border)) !important;
-  background: var(--mor-glass) !important;
-  backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.3);
-  -webkit-backdrop-filter: blur(var(--mor-glass-blur)) saturate(1.3);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5), var(--mor-highlight), 0 0 0 1px rgba(0, 0, 0, 0.3) !important;
-}
-.mr-ctx-head {
-  display: flex; align-items: center; gap: 6px;
-  padding: 4px 10px 7px;
-  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 20%, var(--mor-border-light));
-  margin-bottom: 4px;
-}
-.mr-ctx-tag {
-  flex: none; font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px;
-  background: linear-gradient(180deg, var(--mor-accent-hover), var(--mor-accent));
-  color: #141417;
-}
-.mr-ctx-tag.audio { background: linear-gradient(180deg, #5ee8dc, var(--mor-success)); }
-.mr-ctx-tag.title { background: linear-gradient(180deg, color-mix(in srgb, var(--mor-warning) 72%, white), var(--mor-warning)); }
-.mr-ctx-name {
-  font-size: 11px; color: var(--mor-text-muted);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.mr-ctx .mor-menu-action.mr-danger { color: var(--mor-destructive); }
-.mr-ctx .mor-menu-action.mr-danger:hover:not(:disabled) {
-  background-color: var(--mor-destructive); color: #fff;
-}
-
-.mr-zoom { display: inline-flex; gap: 4px; align-items: center; }
-.mr-zoom button {
-  background: none; border: none; color: var(--mor-text-muted);
-  font-size: 14px; line-height: 1; padding: 0 2px; cursor: pointer;
-  transition: color 0.15s ease, transform 0.12s ease;
-}
-.mr-zoom button:hover { color: var(--mor-accent-hover); transform: scale(1.12); }
-.mr-zoom-slider { width: 90px; accent-color: var(--mor-accent); }
-.mr-appear-btn.on { color: var(--mor-accent); }
-
-/* FCP-style Clip Appearance popover over the timeline. */
-.mr-appear-pop {
-  position: absolute; top: 8px; right: 12px; z-index: 40;
-  width: 280px; padding: 12px 12px 10px;
-  background: color-mix(in srgb, #1a1a22 96%, black);
-  border: 1px solid color-mix(in srgb, white 12%, transparent);
-  border-radius: 10px;
-  box-shadow: 0 12px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(0,0,0,0.3);
-  display: flex; flex-direction: column; gap: 10px;
-}
-.mr-appear-row {
-  display: flex; align-items: center; gap: 8px;
-}
-.mr-appear-label { font-size: 13px; opacity: 0.85; width: 1.4em; text-align: center; }
-.mr-appear-zoom { flex: 1; accent-color: var(--mor-accent); min-width: 0; }
-.mr-appear-icon-btn {
-  background: none; border: none; color: var(--mor-text-muted); cursor: pointer;
-  font-size: 14px; padding: 2px 4px;
-}
-.mr-appear-icon-btn:hover { color: var(--mor-accent); }
-.mr-appear-modes {
-  display: flex; gap: 4px; justify-content: space-between;
-}
-.mr-appear-mode {
-  flex: 1; min-width: 0; height: 36px; padding: 0 2px;
-  border: 1px solid color-mix(in srgb, white 12%, transparent);
-  border-radius: 6px; background: #121218; color: #c8c4ce;
-  font-size: 11px; letter-spacing: -0.5px; cursor: pointer;
-  font-family: ui-monospace, monospace;
-}
-.mr-appear-mode:hover { border-color: var(--mor-accent); color: #fff; }
-.mr-appear-mode.on {
-  border-color: var(--mor-accent);
-  background: color-mix(in srgb, var(--mor-accent) 22%, #121218);
-  color: #fff;
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mor-accent) 40%, transparent);
-}
-.mr-appear-check {
-  display: flex; align-items: center; gap: 8px;
-  font-size: 12px; color: var(--mor-text-muted); cursor: pointer; user-select: none;
-}
-.mr-appear-check input { accent-color: var(--mor-accent); }
-.mr-appear-close {
-  align-self: flex-end; margin-top: 2px;
-  background: color-mix(in srgb, var(--mor-accent) 25%, transparent);
-  border: 1px solid color-mix(in srgb, var(--mor-accent) 50%, transparent);
-  color: #fff; border-radius: 6px; padding: 4px 12px; font-size: 12px; cursor: pointer;
-}
-.mr-appear-close:hover { background: color-mix(in srgb, var(--mor-accent) 40%, transparent); }
-
-.mr-tabs {
-  display: flex; gap: 2px;
-  border-bottom: 1px solid color-mix(in srgb, var(--mor-accent) 18%, var(--mor-border));
-}
-.mr-tab {
-  background: none; border: none; border-bottom: 2px solid transparent;
-  color: var(--mor-text-muted); font-size: 12px; padding: 5px 14px; cursor: pointer;
-  transition: color 0.15s ease, border-color 0.18s ease, text-shadow 0.18s ease;
-}
-.mr-tab:hover { color: var(--mor-text); }
-.mr-tab.active {
-  color: var(--mor-accent-hover);
-  border-bottom-color: var(--mor-accent);
-  text-shadow: 0 0 10px color-mix(in srgb, var(--mor-accent) 35%, transparent);
-}
-
-.mr-fx-cat {
-  margin: 4px 0 0; font-size: 10px; font-weight: 700;
-  letter-spacing: 0.1em; text-transform: uppercase;
-  color: color-mix(in srgb, var(--mor-text-muted) 85%, var(--mor-accent));
-}
-.mr-fx-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 8px; }
-.mr-fx-tile {
-  padding: 3px; border: 2px solid transparent; border-radius: 7px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-btn) 90%, white), var(--mor-btn));
-  cursor: pointer; display: flex; flex-direction: column; gap: 2px; align-items: center;
-  color: var(--mor-text); font-size: 10px;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
-  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.15s ease, filter 0.15s ease;
-}
-.mr-fx-tile:hover {
-  border-color: var(--mor-border-light);
-  transform: translateY(-2px);
-  filter: brightness(1.06);
-}
-.mr-fx-tile.active {
-  border-color: var(--mor-accent);
-  box-shadow: 0 0 12px color-mix(in srgb, var(--mor-accent) 35%, transparent);
-}
-.mr-fx-tile img, .mr-fx-ph {
-  width: 100%; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 4px;
-  background: #000; display: block;
-}
-.mr-fx-tile span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-/* iMovie-inspired title style browser — mock look on black tiles. */
-.mr-title-gallery {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
-  gap: 8px; margin: 6px 0 12px;
-}
-.mr-title-tile {
-  padding: 3px; border: 2px solid transparent; border-radius: 7px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-btn) 90%, white), var(--mor-btn));
-  cursor: pointer; display: flex; flex-direction: column; gap: 3px; align-items: stretch;
-  color: var(--mor-text); font-size: 10px;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
-  transition: border-color 0.15s ease, box-shadow 0.18s ease, transform 0.15s ease, filter 0.15s ease;
-}
-.mr-title-tile:hover:not(:disabled) {
-  border-color: var(--mor-border-light);
-  transform: translateY(-2px);
-  filter: brightness(1.06);
-}
-.mr-title-tile:disabled { opacity: 0.45; cursor: not-allowed; }
-.mr-title-preview {
-  aspect-ratio: 16 / 10; border-radius: 4px; background: #0a0a0c;
-  display: flex; align-items: var(--mr-ts-seat, center); justify-content: center;
-  padding: 6px 4px; box-sizing: border-box; overflow: hidden;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
-}
-.mr-title-preview span {
-  color: var(--mr-ts-color, #fff);
-  background: var(--mr-ts-bg, transparent);
-  text-shadow: var(--mr-ts-shadow, none);
-  font-size: var(--mr-ts-size, 12px);
-  font-weight: 700; letter-spacing: 0.04em; text-align: center;
-  line-height: 1.15; padding: 2px 4px; border-radius: 2px;
-  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.mr-title-tile-name {
-  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  text-align: center; color: var(--mor-text-muted);
-}
-
-/* Format bar under the phone — the knobs you hit while looking at the words. */
-.mr-format-bar {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
-  margin: 6px 0 4px; padding: 6px 8px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--mor-panel) 92%, white), var(--mor-panel));
-  border: 1px solid var(--mor-border);
-  border-radius: 8px;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, white 6%, transparent);
-}
-.mr-format-select {
-  max-width: 110px; min-width: 72px;
-  background: var(--mor-btn); color: var(--mor-text);
-  border: 1px solid var(--mor-border); border-radius: 5px;
-  padding: 3px 6px; font-size: 11px;
-}
-.mr-format-step { min-width: 28px; padding: 2px 6px !important; font-size: 12px !important; }
-.mr-format-size {
-  min-width: 28px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums;
-  color: var(--mor-text-muted);
-}
-.mr-format-sep {
-  width: 1px; align-self: stretch; margin: 2px 3px;
-  background: color-mix(in srgb, var(--mor-border) 80%, transparent);
-}
-.mr-format-swatch {
-  width: 18px; height: 18px; border-radius: 50%; border: 2px solid transparent;
-  padding: 0; cursor: pointer;
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
-}
-.mr-format-swatch.active {
-  border-color: var(--mor-accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mor-accent) 50%, transparent);
-}
-.mr-format-pos { font-size: 10px !important; padding: 2px 6px !important; }
-.mr-format-reset { margin-left: auto; font-size: 11px !important; }
-
-/* On-monitor title seat — drag the words like iMovie. */
-.mr-title-handle-layer {
-  position: absolute; inset: 0; z-index: 4;
-}
-/* iMovie-style text selection box on the monitor — light rim + corner ticks. */
-.mr-title-box {
-  position: absolute; left: 6%; right: 6%;
-  border: 1.5px solid rgba(255, 255, 255, 0.92);
-  border-radius: 2px;
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.35),
-    0 0 10px rgba(0, 0, 0, 0.25);
-  cursor: grab;
-  pointer-events: auto;
-  box-sizing: border-box;
-  display: flex; align-items: center; justify-content: center;
-  min-height: 18px;
-  background: color-mix(in srgb, white 6%, transparent);
-  transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
-}
-.mr-title-box::before,
-.mr-title-box::after {
-  content: ""; position: absolute; width: 8px; height: 8px;
-  border: 2px solid #fff;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
-  pointer-events: none;
-}
-.mr-title-box::before { top: -2px; left: -2px; border-right: none; border-bottom: none; }
-.mr-title-box::after { bottom: -2px; right: -2px; border-left: none; border-top: none; }
-.mr-title-box:hover {
-  background: color-mix(in srgb, white 12%, transparent);
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.4),
-    0 0 14px rgba(255, 255, 255, 0.18);
-}
-.mr-title-box.dragging {
-  cursor: grabbing;
-  border-color: #fff;
-  background: color-mix(in srgb, white 14%, transparent);
-}
-.mr-title-ghost {
-  font-size: 11px; font-weight: 700; letter-spacing: 0.03em;
-  text-align: center; max-width: 100%;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  text-shadow: 0 1px 2px rgba(0,0,0,0.85);
-  padding: 0 4px; pointer-events: none;
-}
-
-.mr-export-dialog { display: flex; flex-direction: column; gap: 10px; min-width: 320px; }
-.mr-export-blurb { margin: -4px 0 2px; font-size: 12px; }
-
-/* Keyframe diamond sits at the right end of an animatable Transform row. */
-.mr-xf-row { display: flex; align-items: center; gap: 6px; }
-.mr-xf-row .mor-slider-shell { flex: 1; min-width: 0; }
-.mr-kf-diamond {
-  flex: 0 0 auto; margin-top: 14px; width: 20px; height: 20px; padding: 0;
-  border: none; background: none; cursor: pointer; line-height: 1;
-  font-size: 13px; color: var(--mor-text-muted);
-  transition: color 0.15s ease, transform 0.15s ease, text-shadow 0.18s ease;
-}
-.mr-kf-diamond:hover { color: var(--mor-accent); transform: scale(1.15); }
-.mr-kf-diamond.on {
-  color: var(--mor-accent);
-  text-shadow: 0 0 7px color-mix(in srgb, var(--mor-accent) 55%, transparent);
-}
-.mr-export-dialog .mr-toolbar { justify-content: flex-end; margin-top: 4px; }
-.mr-settings-dialog { display: flex; flex-direction: column; gap: 12px; min-width: 360px; }
-.mr-settings-note { margin: -4px 0 2px; font-size: 12px; }
-.mr-settings-dialog .mr-toolbar { justify-content: flex-end; margin-top: 4px; }
-.mr-keys-dialog { display: flex; flex-direction: column; gap: 8px; min-width: 340px; }
-.mr-keys-opt { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.mr-keys-name { font-weight: 600; }
-.mr-keys-dialog .mr-toolbar { justify-content: flex-end; margin-top: 6px; }
-
-.mr-hub { display: flex; flex-direction: column; gap: 10px; min-width: 460px; max-width: 560px; }
-.mr-hub-row { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--mor-border, #333); border-radius: 8px; }
-.mr-hub-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.mr-hub-name { font-weight: 600; }
-.mr-hub-kind { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; padding: 1px 6px; border-radius: 6px; background: var(--mor-surface-2, #2a2a33); }
-.mr-hub-kind-mcp { color: var(--mor-accent, #b98cff); }
-.mr-hub-kind-agent { color: #f0a860; }
-.mr-hub-kind-bundle { color: #5fd0c0; }
-.mr-hub-desc { margin: 0; }
-.mr-hub-repo { font-family: monospace; font-size: 11px; opacity: 0.7; }
-.mr-hub-actions { display: flex; gap: 8px; margin-top: 4px; }
-.mr-hub .mr-toolbar { justify-content: flex-end; margin-top: 6px; }
-
-.mr-shortcut-table { border-collapse: collapse; width: 100%; font-size: 13px; }
-.mr-shortcut-table td { padding: 4px 10px 4px 0; }
-.mr-key { color: var(--mor-accent-hover); white-space: nowrap; }
-
-@media (max-width: 700px) {
-  .mr-work { flex-direction: column; }
-  .mr-phone { flex: none; width: auto; height: 45vh; }
-  .mr-inspector { min-width: 0; }
-  .mr-inspector.mr-float-panel {
-    max-width: calc(100vw - 16px);
-    max-height: min(60vh, 520px);
-  }
-  .mr-add-grid { grid-template-columns: 1fr; }
-  .mr-insp-reopen {
-    writing-mode: horizontal-tb; align-self: stretch;
-    padding: 8px 12px;
-  }
-}
-
-.mr-root button:focus-visible,
-.mr-root input:focus-visible,
-.mr-fx-tile:focus-visible,
-.mr-tab:focus-visible,
-.mr-panel-btn:focus-visible,
-.mr-add-card:focus-visible,
-.mr-insp-reopen:focus-visible {
-  outline: 1px solid color-mix(in srgb, var(--mor-accent-hover) 70%, transparent);
-  outline-offset: 2px;
-  box-shadow: var(--mor-focus-glow);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .mr-clip, .mr-lane-item, .mr-fx-tile, .mr-root .mor-btn, .mr-add-card,
-  .mr-progress > div, .mr-deck, .mr-tab, .mr-phone, .mr-xf-h, .mr-panel-btn,
-  .mr-float-grip-ne, .mr-float-grip-nw, .mr-float-grip-se, .mr-float-grip-sw {
-    transition: none !important; animation: none !important;
-  }
-  .mr-drop, .mr-deck.playing, .mr-progress > div, .mr-float-panel { animation: none !important; }
-  .mr-text-row { transition: none !important; }
-  .mr-root .mor-btn:hover:not(:disabled),
-  .mr-fx-tile:hover, .mr-add-card:hover:not(:disabled),
-  .mr-text-row:hover { transform: none; }
-}
-"#;
+const APP_CSS: &str = include_str!("app.css");
 
 #[cfg(test)]
 mod tests {
@@ -12688,6 +9735,76 @@ mod tests {
     }
 
     #[test]
+    fn title_dur_to_end_reaches_reel_out_point() {
+        // Starts mid-reel → duration fills to the out point.
+        assert_eq!(title_dur_to_end(2.0, 10.0), 8.0);
+        // Whole reel from zero.
+        assert_eq!(title_dur_to_end(0.0, 12.5), 12.5);
+        // Past the end still gets the minimum hold (same floor as edge resize).
+        assert_eq!(title_dur_to_end(15.0, 10.0), 0.3);
+    }
+
+    #[test]
+    fn multi_track_ranges_and_drop_routing() {
+        assert_eq!(overlay_tracks(2), vec![2, 3]);
+        assert_eq!(title_tracks(3), vec![1, 2, 3]);
+        assert_eq!(audio_tracks(4), vec![1, 2, 3, 4]);
+        // Drop routing accepts any V/A lane; photos never go to audio.
+        assert_eq!(route_drop(Kind::Video, Lane::V(3)), Ok((Lane::V(3), None)));
+        assert_eq!(route_drop(Kind::Still, Lane::V(4)), Ok((Lane::V(4), None)));
+        assert_eq!(route_drop(Kind::Audio, Lane::A(3)), Ok((Lane::A(3), None)));
+        assert_eq!(
+            route_drop(Kind::Audio, Lane::V(3)),
+            Ok((Lane::A(1), Some("audio goes to A1")))
+        );
+        assert!(route_drop(Kind::Still, Lane::A(3)).is_err());
+    }
+
+    #[test]
+    fn normalize_lanes_grows_counts_from_items() {
+        let mut s = Snapshot {
+            overlays: vec![OverlayItem {
+                path: "x.mp4".into(),
+                name: "x".into(),
+                duration: 1.0,
+                in_s: 0.0,
+                out_s: 1.0,
+                at: 0.0,
+                effect: "None".into(),
+                effect_amount: 1.0,
+                framing: "Crop".into(),
+                transform: Default::default(),
+                grade: Default::default(),
+                speed: 1.0,
+                reverse: false,
+                blend: String::new(),
+                track: 5, // V5 → need 4 overlay lanes (V2..V5)
+                proxy: String::new(),
+                group: 0,
+                enabled: true,
+                solo: false,
+            }],
+            titles: vec![TitleItem {
+                track: 3,
+                ..base_title()
+            }],
+            audios: vec![AudioItem {
+                lane: 4,
+                ..Default::default()
+            }],
+            v_lanes: 1,
+            t_lanes: 1,
+            a_lanes: 1,
+            ..Default::default()
+        };
+        normalize_lanes(&mut s);
+        assert_eq!(s.v_lanes, 4); // tracks 2..=5
+        assert_eq!(s.t_lanes, 3);
+        assert_eq!(s.a_lanes, 4);
+        assert!(s.mixer.tracks.len() >= 5); // V1 + A1..A4
+    }
+
+    #[test]
     fn media_edge_resize_free_and_sequential() {
         // Free-positioned (overlay): left keeps the right edge on the timeline.
         let (at, inn, out) = media_edge_resize(5.0, 1.0, 5.0, 10.0, 1.0, true, 1.0, true);
@@ -12702,6 +9819,21 @@ mod tests {
         let (_, inn, out) = media_edge_resize(0.0, 0.0, 4.0, 20.0, 2.0, false, 1.0, false);
         assert!((inn - 0.0).abs() < 1e-9);
         assert!((out - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn still_edge_resize_stretches_either_side() {
+        // A still (in=0, held 5s) on V2. Right edge grows the hold, uncapped —
+        // no 60s source ceiling, unlike media_edge_resize.
+        let (at, inn, out) = still_edge_resize(5.0, 0.0, 5.0, 1.0, false, 100.0);
+        assert_eq!((at, inn, out), (5.0, 0.0, 105.0));
+        // Left edge extends leftward: `at` moves earlier, right edge stays at 10,
+        // in stays 0 (the old media path walled here because in couldn't go < 0).
+        let (at, inn, out) = still_edge_resize(5.0, 0.0, 5.0, 1.0, true, -3.0);
+        assert_eq!((at, inn, out), (2.0, 0.0, 8.0));
+        // Speed scales the span: out is in source seconds (2× → 8s span = 16s out).
+        let (_, inn, out) = still_edge_resize(0.0, 0.0, 10.0, 2.0, false, 3.0);
+        assert_eq!((inn, out), (0.0, 16.0));
     }
 
     #[test]
@@ -12897,6 +10029,26 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_velocity_cycles_and_reports() {
+        use keyframe::Interp::*;
+        let mut at = engine::AnimatedTransform::default();
+        // Arm a scale curve with two keys, the second (at t=1) defaulting to Smooth.
+        xf_toggle_key(&mut at, "Scale", 0.0); // first diamond → Curve
+        xf_write(&mut at, "Scale", 1.5, 1.0); // animated now → keys t=1 at Smooth
+        assert_eq!(xf_key_interp(&at, "Scale", 1.0), Some(Smooth));
+        xf_cycle_interp(&mut at, "Scale", 1.0);
+        assert_eq!(xf_key_interp(&at, "Scale", 1.0), Some(Linear));
+        xf_cycle_interp(&mut at, "Scale", 1.0);
+        assert_eq!(xf_key_interp(&at, "Scale", 1.0), Some(Hold));
+        xf_cycle_interp(&mut at, "Scale", 1.0);
+        assert_eq!(xf_key_interp(&at, "Scale", 1.0), Some(Smooth)); // wraps
+        // Cycling changes only the ease, not the value.
+        assert!((at.scale.sample(1.0) - 1.5).abs() < 1e-9);
+        // No key at this time → nothing to report or cycle.
+        assert_eq!(xf_key_interp(&at, "Scale", 0.5), None);
+    }
+
+    #[test]
     fn speed_retimes_the_timeline() {
         let mut c = clip(0.0, 4.0);
         assert_eq!(c.trimmed(), 4.0);
@@ -13013,26 +10165,26 @@ mod tests {
         // Dropped where it belongs: no lane change, nothing to explain.
         assert_eq!(route_drop(Kind::Video, Lane::V1), Ok((Lane::V1, None)));
         assert_eq!(route_drop(Kind::Still, Lane::V1), Ok((Lane::V1, None)));
-        assert_eq!(route_drop(Kind::Video, Lane::V2), Ok((Lane::V2, None)));
-        assert_eq!(route_drop(Kind::Audio, Lane::A1), Ok((Lane::A1, None)));
-        assert_eq!(route_drop(Kind::Audio, Lane::A2), Ok((Lane::A2, None)));
+        assert_eq!(route_drop(Kind::Video, Lane::V(2)), Ok((Lane::V(2), None)));
+        assert_eq!(route_drop(Kind::Audio, Lane::A(1)), Ok((Lane::A(1), None)));
+        assert_eq!(route_drop(Kind::Audio, Lane::A(2)), Ok((Lane::A(2), None)));
 
         // Sound aimed at a video lane still goes to A1, and says so.
-        assert_eq!(route_drop(Kind::Audio, Lane::V1), Ok((Lane::A1, Some("audio goes to A1"))));
-        assert_eq!(route_drop(Kind::Audio, Lane::V2), Ok((Lane::A1, Some("audio goes to A1"))));
+        assert_eq!(route_drop(Kind::Audio, Lane::V1), Ok((Lane::A(1), Some("audio goes to A1"))));
+        assert_eq!(route_drop(Kind::Audio, Lane::V(2)), Ok((Lane::A(1), Some("audio goes to A1"))));
 
         // A video on an audio lane contributes its soundtrack rather than being refused.
         assert_eq!(
-            route_drop(Kind::Video, Lane::A1),
-            Ok((Lane::A1, Some("using its soundtrack")))
+            route_drop(Kind::Video, Lane::A(1)),
+            Ok((Lane::A(1), Some("using its soundtrack")))
         );
         assert_eq!(
-            route_drop(Kind::Video, Lane::A2),
-            Ok((Lane::A2, Some("using its soundtrack")))
+            route_drop(Kind::Video, Lane::A(2)),
+            Ok((Lane::A(2), Some("using its soundtrack")))
         );
         // A photo genuinely has nothing to give an audio track.
-        assert!(route_drop(Kind::Still, Lane::A1).is_err());
-        assert!(route_drop(Kind::Still, Lane::A2).is_err());
+        assert!(route_drop(Kind::Still, Lane::A(1)).is_err());
+        assert!(route_drop(Kind::Still, Lane::A(2)).is_err());
     }
 
     #[test]
@@ -13106,7 +10258,7 @@ mod tests {
 
     #[test]
     fn dirty_tracks_disk_state_not_runtime_fields() {
-        let empty = Snapshot { clips: vec![], overlays: vec![], audios: vec![], titles: vec![], markers: vec![], mixer: Mixer::default() };
+        let empty = Snapshot::default();
         // Never saved: empty is clean, any content is unsaved.
         assert!(!timeline_dirty(&empty, None));
         let mut one = empty.clone();
@@ -13157,11 +10309,8 @@ mod tests {
         title.dur = 2.0;
         let snap = Snapshot {
             clips: vec![c],
-            overlays: vec![],
-            audios: vec![],
             titles: vec![title],
-            markers: vec![],
-            mixer: Mixer::default(),
+            ..Default::default()
         };
 
         let doc: serde_json::Value = serde_json::from_str(&snapshot_to_otio(&snap, "reel", 30.0)).unwrap();
@@ -13219,7 +10368,7 @@ mod tests {
         c.volume = 0.25;
         c.thumb = "data:image/jpeg;base64,AAAA".to_string(); // derived, must not persist
         c.proxy = "/cache/proxy.mp4".to_string();
-        let snap = Snapshot { clips: vec![c], overlays: vec![], audios: vec![], titles: vec![], markers: vec![2.5], mixer: Mixer::default() };
+        let snap = Snapshot { clips: vec![c], markers: vec![2.5], ..Default::default() };
 
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("base64"), "thumbnail leaked into the project file");

@@ -29,3 +29,39 @@ path = "src/bin/cli.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# --- Packaging (.deb via cargo-deb, .rpm via cargo-generate-rpm) ---
+# ffmpeg/ffprobe are shelled out at runtime; webkit2gtk is the desktop webview.
+# The generic `mcp` bin is renamed to `morreel-mcp` so it doesn't own /usr/bin/mcp.
+[package.metadata.deb]
+maintainer = "MoribundMurdoch <moribundenglish@gmail.com>"
+section = "video"
+priority = "optional"
+depends = "ffmpeg, libwebkit2gtk-4.1-0"
+extended-description = "Portrait-only (9:16) video editor for phone reels — Dioxus UI over an ffmpeg engine."
+assets = [
+    ["target/release/morreel-studio", "usr/bin/", "755"],
+    ["target/release/morreel", "usr/bin/", "755"],
+    ["target/release/mcp", "usr/bin/morreel-mcp", "755"],
+    ["packaging/morreel-studio.desktop", "usr/share/applications/", "644"],
+    ["assets/icons/morreel-studio-48.png", "usr/share/icons/hicolor/48x48/apps/morreel-studio.png", "644"],
+    ["assets/icons/morreel-studio-128.png", "usr/share/icons/hicolor/128x128/apps/morreel-studio.png", "644"],
+    ["assets/icons/morreel-studio-256.png", "usr/share/icons/hicolor/256x256/apps/morreel-studio.png", "644"],
+    ["assets/icons/morreel-studio-512.png", "usr/share/icons/hicolor/512x512/apps/morreel-studio.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/morreel-studio", dest = "/usr/bin/morreel-studio", mode = "755" },
+    { source = "target/release/morreel", dest = "/usr/bin/morreel", mode = "755" },
+    { source = "target/release/mcp", dest = "/usr/bin/morreel-mcp", mode = "755" },
+    { source = "packaging/morreel-studio.desktop", dest = "/usr/share/applications/morreel-studio.desktop", mode = "644" },
+    { source = "assets/icons/morreel-studio-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/morreel-studio.png", mode = "644" },
+    { source = "assets/icons/morreel-studio-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/morreel-studio.png", mode = "644" },
+    { source = "assets/icons/morreel-studio-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/morreel-studio.png", mode = "644" },
+    { source = "assets/icons/morreel-studio-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/morreel-studio.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+ffmpeg = "*"
+"webkit2gtk4.1" = "*"

@@ -166,6 +166,18 @@ fn tool_specs() -> Value {
                 "at": {"type":"number"}
             })), "required": ["lane","index"] },
         },
+        {
+            "name": "render_manim",
+            "description": "Render a Manim scene to video and drop it onto the timeline as a V2 overlay. Runs your locally-installed `manim` CLI (Manim Community) on a .py scene file, then appends the rendered clip to the .morreel project. `scene` is the Scene subclass name. `quality` is manim's l/m/h/k (default m = 720p). `at` = start time in seconds (default 0). `track` = overlay track, 2=V2 (default). Requires `manim` and `ffprobe` on PATH; edits the file, so open/reload the project in the editor to see it.",
+            "inputSchema": { "type": "object", "properties": {
+                "project": { "type": "string", "description": "Path to the .morreel project file." },
+                "scene_file": { "type": "string", "description": "Path to the Manim .py scene file." },
+                "scene": { "type": "string", "description": "Scene subclass to render." },
+                "quality": { "type": "string", "enum": ["l","m","h","k"], "description": "Manim quality (default m)." },
+                "at": { "type": "number", "description": "Start time on the timeline, seconds (default 0)." },
+                "track": { "type": "integer", "description": "Overlay track: 2=V2 (default), 3=V3, …" }
+            }, "required": ["project","scene_file","scene"] },
+        },
     ])
 }
 
@@ -205,6 +217,12 @@ fn handle_call(id: Option<Value>, params: Option<&Value>) -> Value {
 // --- tool bodies (load → mutate → save) ----------------------------------------
 
 fn apply(name: &str, args: &Value) -> Result<String, String> {
+    // render_manim always edits the project file (it needs a place to write the
+    // rendered clip), so it runs before the live route — the editor picks the new
+    // overlay up on reload, same as the other offline tools.
+    if name == "render_manim" {
+        return render_manim(args);
+    }
     // Live mode: drive the running editor over its localhost control port instead
     // of editing a file. `project` isn't needed — the app already has one loaded.
     if let Some(port) = live_port() {
@@ -371,6 +389,97 @@ fn call_live(port: u16, tool: &str, args: &Value) -> Result<String, String> {
     }
 }
 
+// --- render_manim: user's manim CLI → V2 overlay -------------------------------
+
+/// Render a Manim scene and append it to the project as an overlay. Shells out to
+/// the locally-installed `manim` (not bundled — Manim drags in Python + cairo +
+/// LaTeX, so it stays the user's dependency) and to `ffprobe` for the duration,
+/// then writes a full OverlayItem so the editor loads it like any imported clip.
+fn render_manim(args: &Value) -> Result<String, String> {
+    let project = args.get("project").and_then(Value::as_str).ok_or("missing 'project' path")?;
+    let scene_file = args.get("scene_file").and_then(Value::as_str).ok_or("missing 'scene_file'")?;
+    let scene = args.get("scene").and_then(Value::as_str).ok_or("missing 'scene'")?;
+    let quality = args.get("quality").and_then(Value::as_str).unwrap_or("m");
+    let at = args.get("at").and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
+    let track = args.get("track").and_then(Value::as_u64).unwrap_or(2).max(2);
+
+    let mp4 = run_manim(scene_file, scene, quality)?;
+    let dur = probe_duration(&mp4)?;
+    let name = std::path::Path::new(&mp4).file_name().and_then(|n| n.to_str()).unwrap_or(scene).to_string();
+
+    let mut doc = load(project)?;
+    let overlay = json!({
+        "path": mp4, "name": name, "duration": dur,
+        "in_s": 0.0, "out_s": dur, "at": at,
+        "effect": "None", "effect_amount": 1.0, "framing": "Crop",
+        "track": track, "group": 0,
+    });
+    doc.get_mut("overlays")
+        .and_then(Value::as_array_mut)
+        .ok_or("no overlays array in project")?
+        .push(overlay);
+    save(project, &doc)?;
+    Ok(format!("rendered {scene} → V{track} at {at:.1}s ({dur:.1}s clip: {name}) — reload the project to see it"))
+}
+
+/// Run `manim render` and return the rendered file's path. `-q<quality>` and
+/// `--format mp4` pin the output container; the path comes from manim's own
+/// "File ready at '…'" line. ponytail: parse that line rather than reconstruct
+/// manim's media_dir layout — if a future manim changes the wording, widen the
+/// match here (one place).
+fn run_manim(scene_file: &str, scene: &str, quality: &str) -> Result<String, String> {
+    let cwd = std::path::Path::new(scene_file).parent().filter(|p| !p.as_os_str().is_empty());
+    let mut cmd = std::process::Command::new("manim");
+    cmd.args(["render", &format!("-q{quality}"), "--format", "mp4", scene_file, scene]);
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("could not run `manim` ({e}); install Manim Community and put it on PATH"))?;
+    let log = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let path = manim_output_path(&log).ok_or_else(|| {
+        let tail: String = log.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        format!("manim did not report an output file. Last output:\n{tail}")
+    })?;
+    // Relative paths from manim resolve against the dir it ran in.
+    let abs = if std::path::Path::new(&path).is_absolute() {
+        path
+    } else {
+        cwd.unwrap_or_else(|| std::path::Path::new(".")).join(&path).display().to_string()
+    };
+    Ok(abs)
+}
+
+/// Pull the last `File ready at '…'` path out of manim's console output.
+fn manim_output_path(log: &str) -> Option<String> {
+    log.match_indices("File ready at")
+        .last()
+        .map(|(i, _)| &log[i..])
+        .and_then(|rest| {
+            let rest = rest.splitn(2, "File ready at").nth(1)?;
+            // The path is quoted (single or double); take what's between the quotes.
+            let start = rest.find(['\'', '"'])?;
+            let quote = rest.as_bytes()[start] as char;
+            let after = &rest[start + 1..];
+            let end = after.find(quote)?;
+            Some(after[..end].to_string())
+        })
+}
+
+fn probe_duration(path: &str) -> Result<f64, String> {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path])
+        .output()
+        .map_err(|e| format!("could not run `ffprobe` ({e})"))?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|d| *d > 0.0)
+        .ok_or_else(|| format!("no usable duration in rendered file {path}"))
+}
+
 fn load(path: &str) -> Result<Value, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("can't read {path}: {e}"))?;
     serde_json::from_str(&text).map_err(|e| format!("{path} is not valid JSON: {e}"))
@@ -416,6 +525,16 @@ mod tests {
         // And it round-trips straight back into the shared Animated type.
         let back: Animated<f64> = serde_json::from_value(v).unwrap();
         assert!(back.is_animated());
+    }
+
+    #[test]
+    fn manim_output_path_takes_the_last_quoted_file() {
+        let log = "Rendering...\nFile ready at './media/videos/scene/720p30/Intro.mp4'\ndone\n";
+        assert_eq!(manim_output_path(log).as_deref(), Some("./media/videos/scene/720p30/Intro.mp4"));
+        // Double quotes and multiple lines: take the last one.
+        let log2 = "File ready at \"/a/first.mp4\"\nFile ready at \"/a/last.mp4\"\n";
+        assert_eq!(manim_output_path(log2).as_deref(), Some("/a/last.mp4"));
+        assert_eq!(manim_output_path("no such line"), None);
     }
 
     #[test]
