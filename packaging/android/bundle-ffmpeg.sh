@@ -16,6 +16,12 @@
 #             --disable-{doc,ffplay,avdevice,vulkan,iconv,xlib,libxcb}
 # (GPL, same license as this app.)
 #
+# Optional hardware encode: add --enable-jni --enable-mediacodec and drop
+# -static (libmediandk.so only exists on-device, so the binary must link
+# dynamically; bionic + libmediandk are guaranteed present). engine.rs probes
+# `ffmpeg -encoders` for h264_mediacodec at runtime and uses it automatically,
+# falling back to libx264 per-export if the device's codec balks.
+#
 # Usage: packaging/android/bundle-ffmpeg.sh <in.apk> <out.apk>
 set -euo pipefail
 

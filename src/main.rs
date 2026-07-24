@@ -84,8 +84,8 @@ mod rfd {
             None
         }
         // ponytail: no save dialog — exports and projects land in the app's
-        // USB-visible external files dir under the suggested name; the status
-        // bar shows the full path.
+        // USB-visible external files dir under the suggested name; finished
+        // video exports get mirrored into the gallery (droid::publish_to_gallery).
         pub async fn save_file(self) -> Option<FileHandle> {
             let name = self.file_name.unwrap_or_else(|| "untitled".into());
             Some(FileHandle(crate::droid::save_dir().join(name)))
@@ -2676,7 +2676,18 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
             .await;
             export_progress.set(None);
             match res {
-                Ok(()) => status.set(format!("Exported {}", file.path().display())),
+                Ok(()) => {
+                    // On a phone the app dir is invisible — mirror the export
+                    // into the gallery (LibreCuts-style MediaStore insert).
+                    #[cfg(target_os = "android")]
+                    let published = crate::droid::publish_to_gallery(file.path());
+                    #[cfg(not(target_os = "android"))]
+                    let published: Option<String> = None;
+                    status.set(match published {
+                        Some(rel) => format!("Exported to {rel}"),
+                        None => format!("Exported {}", file.path().display()),
+                    });
+                }
                 Err(e) if e == "cancelled" => {
                     // A killed ffmpeg leaves a truncated file behind — sweep it.
                     let _ = std::fs::remove_file(file.path());

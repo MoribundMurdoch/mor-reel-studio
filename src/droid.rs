@@ -299,6 +299,69 @@ pub fn request_media_permissions() {
     });
 }
 
+/// Copy a finished export into the public gallery via MediaStore — the
+/// LibreCuts save pattern (insert ContentValues with RELATIVE_PATH, stream the
+/// bytes through the resolver). No permission needed to write your own media.
+/// Returns the gallery-relative "Movies/MorReel/name.mp4" on success; None
+/// (e.g. pre-API-29, insert refused) leaves the caller's app-dir copy as is.
+pub fn publish_to_gallery(src: &Path) -> Option<String> {
+    let name = src.file_name()?.to_str()?.to_string();
+    let ext = src.extension()?.to_str()?.to_lowercase();
+    let (mime, collection, rel) = match ext.as_str() {
+        "mp4" => ("video/mp4", "android/provider/MediaStore$Video$Media", "Movies/MorReel"),
+        "webm" => ("video/webm", "android/provider/MediaStore$Video$Media", "Movies/MorReel"),
+        "gif" => ("image/gif", "android/provider/MediaStore$Images$Media", "Pictures/MorReel"),
+        _ => return None,
+    };
+    let mut file = std::fs::File::open(src).ok()?;
+    with_env(|env, act| {
+        let values = env.new_object("android/content/ContentValues", "()V", &[])?;
+        for (k, v) in [("_display_name", name.as_str()), ("mime_type", mime), ("relative_path", rel)] {
+            let (k, v) = (env.new_string(k)?, env.new_string(v)?);
+            env.call_method(
+                &values,
+                "put",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[JValue::Object(&k), JValue::Object(&v)],
+            )?;
+        }
+        let coll = env.get_static_field(collection, "EXTERNAL_CONTENT_URI", "Landroid/net/Uri;")?.l()?;
+        let resolver = env
+            .call_method(act, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
+            .l()?;
+        let uri = env
+            .call_method(
+                &resolver,
+                "insert",
+                "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
+                &[JValue::Object(&coll), JValue::Object(&values)],
+            )?
+            .l()?;
+        if uri.is_null() {
+            return Ok(None);
+        }
+        let out = env
+            .call_method(&resolver, "openOutputStream", "(Landroid/net/Uri;)Ljava/io/OutputStream;", &[JValue::Object(&uri)])?
+            .l()?;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            use std::io::Read;
+            let n = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => return Ok(None),
+            };
+            let arr = env.byte_array_from_slice(&buf[..n])?;
+            env.call_method(&out, "write", "([B)V", &[JValue::Object(&arr)])?;
+            // One local ref per chunk would overflow JNI's table on a big reel.
+            env.delete_local_ref(arr)?;
+        }
+        env.call_method(&out, "close", "()V", &[])?;
+        Ok(Some(format!("{rel}/{name}")))
+    })
+    .flatten()
+}
+
 /// Writable, USB-visible directory for exports and saved projects
 /// (…/Android/data/<pkg>/files) — needs no permission at all.
 pub fn save_dir() -> PathBuf {

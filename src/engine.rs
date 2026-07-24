@@ -3290,6 +3290,21 @@ pub async fn transcribe(
 
 /// Render to `out` with the chosen container, quality and size.
 /// `on_progress` gets 0.0..=1.0 as ffmpeg reports out_time.
+/// Does the bundled ffmpeg carry Android's hardware H.264 encoder? True only
+/// in an APK whose ffmpeg was built with --enable-mediacodec (see
+/// packaging/android/bundle-ffmpeg.sh); desktop builds and the current
+/// prebuilt probe false and change nothing.
+fn has_hw_h264() -> bool {
+    static HW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HW.get_or_init(|| {
+        std::process::Command::new(ffmpeg_bin())
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_mediacodec"))
+            .unwrap_or(false)
+    })
+}
+
 pub async fn export(
     clips: &[ClipSpec],
     overlays: &[OverlaySpec],
@@ -3299,6 +3314,29 @@ pub async fn export(
     out: &Path,
     opts: ExportOpts,
     mut on_progress: impl FnMut(f64),
+) -> Result<(), String> {
+    let hw = opts.format == Format::Mp4 && has_hw_h264();
+    match export_pass(clips, overlays, adjustments, titles, audio, out, opts, hw, &mut on_progress).await {
+        // LibreCuts-style fallback: mediacodec init fails per-device/per-size —
+        // rerun the whole export in software rather than surface the error.
+        Err(e) if hw && e != "cancelled" => {
+            export_pass(clips, overlays, adjustments, titles, audio, out, opts, false, &mut on_progress).await
+        }
+        r => r,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn export_pass(
+    clips: &[ClipSpec],
+    overlays: &[OverlaySpec],
+    adjustments: &[AdjustSpec],
+    titles: &[TitleSpec],
+    audio: &[AudioSpec],
+    out: &Path,
+    opts: ExportOpts,
+    hw: bool,
+    on_progress: &mut impl FnMut(f64),
 ) -> Result<(), String> {
     if clips.is_empty() {
         return Err("nothing to export".into());
@@ -3333,8 +3371,15 @@ pub async fn export(
     }
     match opts.format {
         Format::Mp4 => {
-            cmd.args(["-c:v", "libx264", "-preset", speed, "-crf", &crf, "-pix_fmt", "yuv420p"])
-                .args(["-c:a", "aac", "-b:a", "192k"])
+            if hw {
+                // mediacodec has no CRF — bitrate by short edge, LibreCuts's
+                // table; Quality still steers the software fallback.
+                let br = if opts.width >= 1080 { "8M" } else if opts.width >= 720 { "5M" } else { "2M" };
+                cmd.args(["-c:v", "h264_mediacodec", "-b:v", br, "-pix_fmt", "nv12"])
+            } else {
+                cmd.args(["-c:v", "libx264", "-preset", speed, "-crf", &crf, "-pix_fmt", "yuv420p"])
+            }
+            .args(["-c:a", "aac", "-b:a", "192k"])
                 // faststart puts the index first so it plays before it finishes
                 // downloading — the difference between a reel that starts and
                 // one that spins.
