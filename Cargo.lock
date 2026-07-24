@@ -2821,10 +2821,13 @@ dependencies = [
 name = "morreel-studio"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "dioxus",
  "futures-util",
  "image",
+ "jni 0.21.1",
  "mor_rust_dioxus_ui_kit",
+ "ndk-context",
  "rfd 0.15.4",
  "serde",
  "serde_json",

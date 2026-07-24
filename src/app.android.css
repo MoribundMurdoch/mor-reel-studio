@@ -1,0 +1,247 @@
+/* --- Android (CapCut-grammar) chrome ----------------------------------------
+   Loaded after app.css on Android only. MorReel's existing identity — Aero
+   glass over a dark purple HUD, accent-lit "inventory slots" — translated to
+   phone ergonomics: preview dominant, timeline under it, and the phase spine
+   as a frosted glass dock along the bottom (where CapCut puts its toolbar).
+   Every colour derives from the theme tokens so all themes hold. */
+
+.mr-root {
+  padding: 8px 8px calc(128px + env(safe-area-inset-bottom));
+  gap: 8px;
+}
+/* Natural heights + a scrolling page: nothing gets flex-crushed offscreen. */
+.mr-root { overflow-y: auto; }
+.mr-work { gap: 8px; flex: none; }
+.mr-preview-col { width: 100%; }
+/* Definite heights: the stage may not flex-crush what sits under it (scrub
+   controls, format bar, inspector). */
+.mr-stage { flex: none; height: 40vh; }
+.mr-phone { height: 100%; }
+.mr-inspector { min-height: 24vh; max-height: 34vh; overflow-y: auto; }
+
+/* --- The dock: two flanks fuse into one glass slab, 4 slots per half. ----- */
+.mr-stage > .mr-wf-flank {
+  position: fixed;
+  bottom: 0;
+  z-index: 8000;
+  margin: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 4px;
+  padding: 8px 6px calc(10px + env(safe-area-inset-bottom));
+  background: var(--mor-glass-strong, rgba(22, 20, 42, 0.93));
+  -webkit-backdrop-filter: blur(var(--mor-glass-blur, 16px));
+  backdrop-filter: blur(var(--mor-glass-blur, 16px));
+  border-top: 1px solid color-mix(in srgb, white 9%, transparent);
+}
+.mr-stage > .mr-wf-flank:first-of-type { left: 0; width: 50vw; padding-right: 2px; }
+.mr-stage > .mr-wf-flank:last-of-type { left: 50vw; width: 50vw; padding-left: 2px; }
+
+.mr-wf {
+  position: relative;
+  flex: 1;
+  min-height: 56px;
+  padding: 7px 2px;
+  border-radius: 12px;
+  transition: background-color 0.18s ease, box-shadow 0.18s ease, color 0.15s ease;
+}
+.mr-wf-icon { font-size: 20px; }
+.mr-wf-label { font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+/* The active phase is a lit slot: accent fill, ring, soft glow. */
+.mr-wf.active {
+  background: color-mix(in srgb, var(--mor-accent) 20%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--mor-accent) 55%, transparent),
+    0 0 14px color-mix(in srgb, var(--mor-accent) 28%, transparent);
+}
+/* Done-ticks sit as small gems on the slot corner. */
+.mr-wf-tick {
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  font-size: 9px;
+  color: var(--mor-success, #69d2a0);
+}
+
+/* --- Status strip: one quiet glass line riding the dock. ------------------ */
+.mor-statusbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(76px + env(safe-area-inset-bottom));
+  z-index: 7999;
+  font-size: 11px;
+  background: var(--mor-glass, rgba(22, 20, 42, 0.78));
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* --- Menu FAB: glass squircle above the dock. ----------------------------- */
+.mor-menu-fab {
+  bottom: calc(126px + env(safe-area-inset-bottom)) !important;
+  right: 10px;
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--mor-accent, #7b6cff) 82%, black);
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 color-mix(in srgb, white 18%, transparent);
+  opacity: 0.95;
+}
+
+/* --- The in-app file picker (AndroidPicker in droid.rs). ------------------ */
+.mr-picker-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 9999;
+  display: flex;
+  align-items: flex-end;
+}
+.mr-picker-sheet {
+  background: var(--mor-glass-strong, rgba(22, 20, 42, 0.94));
+  -webkit-backdrop-filter: blur(var(--mor-glass-blur-strong, 26px));
+  backdrop-filter: blur(var(--mor-glass-blur-strong, 26px));
+  color: var(--mor-text, #e8e6f8);
+  width: 100%;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px 16px 0 0;
+  border-top: 1px solid color-mix(in srgb, white 10%, transparent);
+  animation: mr-sheet-up 0.22s cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+.mr-picker-title { padding: 14px 16px 2px; font-weight: 600; font-size: 15px; }
+.mr-picker-path {
+  padding: 0 16px 8px;
+  font-size: 12px;
+  opacity: 0.65;
+  word-break: break-all;
+}
+.mr-picker-list { overflow-y: auto; flex: 1; min-height: 120px; }
+.mr-picker-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  min-height: 48px;
+  padding: 12px 16px;
+  border-bottom: 1px solid color-mix(in srgb, white 6%, transparent);
+}
+.mr-picker-row.sel {
+  background: color-mix(in srgb, var(--mor-accent, #7b6cff) 24%, transparent);
+  box-shadow: inset 2px 0 0 var(--mor-accent, #7b6cff);
+}
+.mr-picker-actions {
+  display: flex;
+  gap: 10px;
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+}
+.mr-picker-btn {
+  flex: 1;
+  min-height: 44px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, white 22%, transparent);
+  background: none;
+  color: inherit;
+  font: inherit;
+}
+.mr-picker-btn.primary {
+  border-color: var(--mor-accent, #7b6cff);
+  color: var(--mor-accent-hover, #b9aeff);
+  font-weight: 600;
+}
+.mr-picker-perm { padding: 0 16px 10px; }
+
+@keyframes mr-sheet-up {
+  from { transform: translateY(24px); opacity: 0.6; }
+  to { transform: none; opacity: 1; }
+}
+
+/* --- TikTok-style carousels ------------------------------------------------
+   Effect looks and title styles become one horizontally swipeable, snapping
+   row — the next tile peeks in from the edge to invite the swipe. */
+.mr-fx-grid, .mr-title-gallery {
+  /* As a flex item in the inspector column: a scroll container may shrink to
+     0 (min-height:auto no longer floors it) — keep content height. */
+  flex: none;
+  grid-auto-flow: column;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  gap: 10px;
+  padding-bottom: 6px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.mr-fx-grid { grid-template-columns: none; grid-auto-columns: 88px; }
+.mr-title-gallery { grid-template-columns: none; grid-auto-columns: 42vw; }
+.mr-fx-grid::-webkit-scrollbar, .mr-title-gallery::-webkit-scrollbar { display: none; }
+.mr-fx-tile, .mr-title-tile { scroll-snap-align: start; }
+
+/* --- Fullscreen monitor (the phone's stand-in for the pop-out) ------------ */
+.mr-phone.mr-mon-full {
+  position: fixed;
+  inset: 0;
+  z-index: 9500;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  margin: 0;
+  border-radius: 0;
+  border: none;
+  background: #000;
+}
+.mr-phone.mr-mon-full img { object-fit: contain; }
+.mr-mon-exit {
+  position: fixed;
+  top: calc(10px + env(safe-area-inset-top));
+  right: 12px;
+  z-index: 9501;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  border: none;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 20px;
+}
+
+/* --- Timeline, phone-sized -------------------------------------------------
+   Desktop shows every lane at full height; on a phone the empty ones eat the
+   screen. Lanes without items collapse to slim strips (they grow back the
+   moment something lands on them), and the ruler gets a finger-sized band. */
+.mr-lane:not(:has(.mr-lane-item)) {
+  height: 14px;
+  opacity: 0.55;
+}
+.mr-lane:not(:has(.mr-lane-item)) .mr-lane-tag {
+  transform: scale(0.78);
+  transform-origin: left center;
+}
+.mr-ruler { height: 28px; }
+
+/* --- Touch-target and desktop-ism cleanups. ------------------------------- */
+.mr-clip, .mr-lane-item { min-height: 44px; }
+.mr-insp-reopen { display: none; }
+/* Keyboard-shortcut legends mean nothing on touch. */
+.mr-keys { display: none; }
+/* A vertical page-scroll must never grab a slider in passing — horizontal
+   drags still adjust it. Without this, scrolling the inspector retrims clips.
+   And a 6px-tall track is untouchable: give every slider a fat hit box. */
+input[type="range"] {
+  touch-action: pan-y;
+  height: 30px;
+  min-height: 30px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mr-wf, .mor-menu-fab, .mr-picker-sheet { transition: none !important; animation: none !important; }
+}

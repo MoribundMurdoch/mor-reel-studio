@@ -27,16 +27,16 @@ pub const EFFECTS: &[(&str, &str, &str)] = &[
     ("Color", "Negative", "negate"),
     ("Color", "X-Ray", "negate,hue=s=0,eq=contrast=1.3"),
     ("Color", "Matrix", "colorchannelmixer=0.3:0.6:0.1:0:0.25:0.7:0.05:0:0.2:0.5:0.1,eq=contrast=1.2"),
-    ("Look", "Dreamy", "gblur=sigma=2,eq=brightness=0.04:saturation=1.15"),
-    ("Look", "Vignette", "vignette"),
-    ("Look", "Vintage", "curves=preset=vintage"),
-    ("Look", "Cross process", "curves=preset=cross_process"),
-    ("Look", "Faded", "curves=preset=lighter,eq=saturation=0.82"),
-    ("Look", "Golden hour", "colortemperature=3800,eq=saturation=1.2:brightness=0.02"),
-    ("Look", "Blockbuster", "colorbalance=rs=.12:gs=.02:bs=-.12:rh=-.06:bh=.12,eq=saturation=1.15"),
-    ("Look", "Bleach bypass", "eq=saturation=0.35:contrast=1.35:brightness=0.02"),
-    ("Look", "Film grain", "noise=alls=18:allf=t"),
-    ("Look", "Ink", "edgedetect=mode=colormix:high=0"),
+    ("Stylize", "Dreamy", "gblur=sigma=2,eq=brightness=0.04:saturation=1.15"),
+    ("Stylize", "Vignette", "vignette"),
+    ("Stylize", "Vintage", "curves=preset=vintage"),
+    ("Stylize", "Cross process", "curves=preset=cross_process"),
+    ("Stylize", "Faded", "curves=preset=lighter,eq=saturation=0.82"),
+    ("Stylize", "Golden hour", "colortemperature=3800,eq=saturation=1.2:brightness=0.02"),
+    ("Stylize", "Blockbuster", "colorbalance=rs=.12:gs=.02:bs=-.12:rh=-.06:bh=.12,eq=saturation=1.15"),
+    ("Stylize", "Bleach bypass", "eq=saturation=0.35:contrast=1.35:brightness=0.02"),
+    ("Stylize", "Film grain", "noise=alls=18:allf=t"),
+    ("Stylize", "Ink", "edgedetect=mode=colormix:high=0"),
     // Keyed on input time, not on zoompan's own `zoom` accumulator. With d=1
     // (one output frame per input frame) that accumulator resets every frame
     // instead of compounding, so `min(zoom+0.0006,1.25)` pinned this at a flat
@@ -736,7 +736,11 @@ pub fn xf_apply(
     if rw < 1.0 || rh < 1.0 {
         return start;
     }
-    let (cx, cy) = (rl + rw / 2.0, rt + rh / 2.0);
+    // Everything pivots on the BOX's centre on screen, not the frame's —
+    // scaling or rotating a sticker parked in a corner must measure from the
+    // sticker, or the ratios (and the whole drag) feel unhinged.
+    let (cx, cy) = (rl + (0.5 + start.x) * rw, rt + (0.5 + start.y) * rh);
+    let (sin, cos) = start.rotation.to_radians().sin_cos();
     let mut t = start;
     match grab {
         XfGrab::Move => {
@@ -744,24 +748,27 @@ pub fn xf_apply(
             t.y = start.y + (to.1 - from.1) / rh;
         }
         XfGrab::Scale => {
-            // Ratio of distances from the centre, so grabbing any corner (or a
-            // corner clamped back into view) scales the same way.
+            // Ratio of distances from the box centre, so grabbing any corner
+            // (or a corner clamped back into view) scales the same way.
             let d0 = ((from.0 - cx).powi(2) + (from.1 - cy).powi(2)).sqrt();
             let d1 = ((to.0 - cx).powi(2) + (to.1 - cy).powi(2)).sqrt();
             if d0 > 2.0 {
                 t.scale = (start.scale * d1 / d0).clamp(0.1, 4.0);
             }
         }
-        // A side handle stretches one axis, measured along that axis alone —
-        // radial distance would make dragging sideways change the height too.
+        // A side handle stretches one axis, measured along the box's own
+        // (rotated) axis — radial distance would make dragging sideways change
+        // the height too, and screen-axis distance breaks on a tilted box.
         XfGrab::StretchX => {
-            let (d0, d1) = ((from.0 - cx).abs(), (to.0 - cx).abs());
+            let d0 = ((from.0 - cx) * cos + (from.1 - cy) * sin).abs();
+            let d1 = ((to.0 - cx) * cos + (to.1 - cy) * sin).abs();
             if d0 > 2.0 {
                 t.scale_x = (start.scale_x * d1 / d0).clamp(0.1, 4.0);
             }
         }
         XfGrab::StretchY => {
-            let (d0, d1) = ((from.1 - cy).abs(), (to.1 - cy).abs());
+            let d0 = ((from.1 - cy) * cos - (from.0 - cx) * sin).abs();
+            let d1 = ((to.1 - cy) * cos - (to.0 - cx) * sin).abs();
             if d0 > 2.0 {
                 t.scale_y = (start.scale_y * d1 / d0).clamp(0.1, 4.0);
             }
@@ -2160,6 +2167,16 @@ pub fn locate(clips: &[Clip], t: f64) -> Option<(usize, f64)> {
 pub fn fmt_t(s: f64) -> String {
     let s = s.max(0.0); // squash negatives and -0.0 → "0:00.0"
     format!("{}:{:04.1}", (s / 60.0) as u32, s % 60.0)
+}
+
+/// Human file size for the share dialog's info strip. Estimates only ever
+/// reach MB/GB territory, but small stays honest as KB.
+pub fn fmt_bytes(b: u64) -> String {
+    match b {
+        0..=999_999 => format!("{:.0} KB", b as f64 / 1e3),
+        1_000_000..=999_999_999 => format!("{:.1} MB", b as f64 / 1e6),
+        _ => format!("{:.2} GB", b as f64 / 1e9),
+    }
 }
 
 /// Short clip length for the filmstrip badge — iMovie-style "4.0s" under a

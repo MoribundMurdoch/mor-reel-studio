@@ -1,0 +1,6 @@
+# Android manifest permissions (see src/droid.rs for the runtime request).
+[android.permissions]
+"android.permission.READ_MEDIA_VIDEO" = { description = "Load your videos onto the timeline" }
+"android.permission.READ_MEDIA_IMAGES" = { description = "Load your photos onto the timeline" }
+"android.permission.READ_MEDIA_AUDIO" = { description = "Add music from your library" }
+"android.permission.READ_EXTERNAL_STORAGE" = { description = "Read media on Android 12 and lower" }
