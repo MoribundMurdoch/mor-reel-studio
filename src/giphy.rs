@@ -112,6 +112,7 @@ fn safe(id: &str) -> String {
     id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
 }
 
+#[cfg(not(target_os = "android"))]
 async fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     let out = tokio::process::Command::new("curl")
         .args(args)
@@ -123,6 +124,19 @@ async fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
+}
+
+/// No curl on Android — same call shape, served by the webview's fetch().
+/// Honors the two shapes the callers use: body-return, and `-o dest` download.
+#[cfg(target_os = "android")]
+async fn curl(args: &[&str]) -> Result<Vec<u8>, String> {
+    let url = args.iter().rev().find(|a| a.starts_with("http")).ok_or("no url in curl args")?;
+    let bytes = crate::droid::web_fetch(url).await?;
+    if let Some(i) = args.iter().position(|a| *a == "-o") {
+        std::fs::write(args[i + 1], &bytes).map_err(|e| e.to_string())?;
+        return Ok(Vec::new());
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

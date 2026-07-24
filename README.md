@@ -47,7 +47,9 @@ export all run through the same ffmpeg filter chains at 1080×1920, 30 fps.
 - **Export options**: MP4 (H.264), WebM (VP9) or animated GIF; Draft /
   Balanced / High quality; 1080×1920, 720×1280 or 540×960. The edit is always
   composed at 1080×1920 and scaled once at the end of the graph, so a smaller
-  export is a smaller file, not a different render.
+  export is a smaller file, not a different render. **Export frame as PNG**
+  (`Ctrl+Shift+E`) writes the composed monitor at the playhead — V1, overlays,
+  FX and titles — so a still grab matches what you scrub.
 - **OpenTimelineIO export**: hand the timeline off to Final Cut, Resolve or
   Premiere as a `.otio` file (clips by path, cuts and caption timing intact).
   Written straight as OTIO's JSON schema, no extra dependency. One-way: the

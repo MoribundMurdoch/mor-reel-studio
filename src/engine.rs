@@ -424,10 +424,19 @@ fn transform_chain_rot(t: &Transform, w: u32, h: u32, alpha: bool, rot_expr: Opt
     let ax = (t.anchor_x * w as f64).round() as i64;
     let ay = (t.anchor_y * h as f64).round() as i64;
     let (bw, bh) = (sw + 2 * ax.unsigned_abs() as u32, sh + 2 * ay.unsigned_abs() as u32);
+    // A rotation opens out to its full bounding box (the hypot ow/oh on the
+    // rotate below), so the pads after it need room for the diagonal.
+    let rotating = rot_expr.is_some() || t.rotation.abs() > 1e-6;
+    let (need_w, need_h) = if rotating {
+        let diag = (bw as f64).hypot(bh as f64) + 2.0;
+        (diag, diag)
+    } else {
+        (bw as f64, bh as f64)
+    };
     // Pad out to whatever the offset crop needs, so the picture can be moved
     // clean off the edge of the frame instead of jamming against it.
-    let pw = even((bw as f64).max(w as f64 + 2.0 * dx.abs() as f64)).max(bw).max(w);
-    let ph = even((bh as f64).max(h as f64 + 2.0 * dy.abs() as f64)).max(bh).max(h);
+    let pw = even(need_w.max(w as f64 + 2.0 * dx.abs() as f64)).max(bw).max(w);
+    let ph = even(need_h.max(h as f64 + 2.0 * dy.abs() as f64)).max(bh).max(h);
     // A composited layer (V2) pads transparent; V1 pads with the chosen colour,
     // which is what shows behind a banded or shrunk clip.
     let fill = if alpha { "black@0" } else { t.bg.color() };
@@ -459,13 +468,19 @@ fn transform_chain_rot(t: &Transform, w: u32, h: u32, alpha: bool, rot_expr: Opt
         let pad_t = ay.unsigned_abs() as i64 - ay;
         c += &format!(",pad={bw}:{bh}:{pad_l}:{pad_t}:color={fill}");
     }
-    // rotate keeps the input size, so the corners it opens up take the fill.
+    // The hypot output box keeps the turned picture's corners — clipping to the
+    // input size would show an upright window of rotated content, visibly out of
+    // line with the rotated box the on-screen transform handles draw.
     match rot_expr {
-        Some(e) => c += &format!(",rotate=a='{e}':c={fill}"),
-        None if t.rotation.abs() > 1e-6 => c += &format!(",rotate={:.5}:c={fill}", t.rotation.to_radians()),
+        Some(e) => c += &format!(",rotate=a='{e}':ow='hypot(iw,ih)':oh=ow:c={fill}"),
+        None if t.rotation.abs() > 1e-6 => {
+            c += &format!(",rotate={:.5}:ow='hypot(iw,ih)':oh=ow:c={fill}", t.rotation.to_radians())
+        }
         None => {}
     }
-    c += &format!(",pad={pw}:{ph}:{}:{}:color={fill}", (pw - bw) / 2, (ph - bh) / 2);
+    // Offsets as expressions, not numbers: after a rotate the input here is the
+    // hypot box, not bw×bh, and centring must follow whatever arrived.
+    c += &format!(",pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color={fill}");
     // Positive x moves the picture right, so the window it is seen through
     // moves left by the same amount.
     c += &format!(
@@ -689,6 +704,21 @@ fn font_is_unusable(family: &str) -> bool {
 /// Enumerated once: fonts do not appear mid-session and spawning `fc-list` per
 /// render would be silly.
 pub fn font_families() -> &'static [String] {
+    #[cfg(target_os = "android")]
+    {
+        static FONTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        return FONTS.get_or_init(|| {
+            let mut out = vec!["Sans".to_string(), "Serif".to_string(), "Mono".to_string()];
+            let mut fams: Vec<String> =
+                android_fonts().iter().map(|(fam, _)| fam.clone()).collect();
+            fams.sort_by_key(|f| f.to_ascii_lowercase());
+            fams.dedup();
+            out.extend(fams);
+            out
+        });
+    }
+    #[cfg(not(target_os = "android"))]
+    {
     static FONTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     FONTS.get_or_init(|| {
         let mut out = vec!["Sans".to_string(), "Serif".to_string(), "Mono".to_string()];
@@ -707,6 +737,96 @@ pub fn font_families() -> &'static [String] {
         out.dedup();
         out
     })
+    }
+}
+
+/// Android: no fontconfig — the system fonts are files in /system/fonts, and
+/// the family shown in the UI is derived from the file name (CamelCase split
+/// into words), which is also the name libass resolves when handed
+/// `fontsdir=/system/fonts`. Returns (family, path), one entry per family,
+/// preferring the -Regular face.
+#[cfg(target_os = "android")]
+fn android_fonts() -> &'static Vec<(String, String)> {
+    static FONTS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut best: std::collections::BTreeMap<String, (i32, String)> = Default::default();
+        let Ok(rd) = std::fs::read_dir("/system/fonts") else { return Vec::new() };
+        for e in rd.flatten() {
+            let path = e.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let Some(stem) = name.strip_suffix(".ttf").or_else(|| name.strip_suffix(".otf"))
+            else {
+                continue;
+            };
+            // "NotoSerif[wght]" → "NotoSerif"; "Roboto-Regular" → base + face.
+            let stem = stem.split('[').next().unwrap_or(stem);
+            let (base, face) = match stem.split_once('-') {
+                Some((b, f)) => (b, f),
+                None => (stem, "Regular"),
+            };
+            if base.is_empty() || font_is_unusable(base) {
+                continue;
+            }
+            // Prefer Regular, then unadorned variable files, then anything.
+            let rank = match face {
+                "Regular" => 0,
+                _ if face.eq_ignore_ascii_case("VF") => 1,
+                _ => 2,
+            };
+            let family = camel_words(base);
+            let path = path.display().to_string();
+            match best.get(&family) {
+                Some((r, _)) if *r <= rank => {}
+                _ => {
+                    best.insert(family, (rank, path));
+                }
+            }
+        }
+        best.into_iter().map(|(fam, (_, p))| (fam, p)).collect()
+    })
+}
+
+/// "DancingScript" → "Dancing Script", "CarroisGothicSC" → "Carrois Gothic SC".
+#[cfg(target_os = "android")]
+fn camel_words(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        if i > 0
+            && c.is_ascii_uppercase()
+            && (chars[i - 1].is_ascii_lowercase()
+                || (chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase())
+                    && chars[i - 1].is_ascii_uppercase()))
+        {
+            out.push(' ');
+        }
+        out.push(*c);
+    }
+    out
+}
+
+/// The generic families every project can name, resolved to what this phone
+/// actually ships; anything else looked up as-is.
+#[cfg(target_os = "android")]
+fn android_family(family: &str) -> &str {
+    match family {
+        "" | "Sans" => "Roboto",
+        "Serif" => "Noto Serif",
+        "Mono" => "Cutive Mono",
+        other => other,
+    }
+}
+
+/// The font file for a family — drawtext takes `fontfile=` because there is
+/// no fontconfig to resolve `font=` names. Falls back to Roboto.
+#[cfg(target_os = "android")]
+fn android_font_file(family: &str) -> String {
+    let want = android_family(family);
+    android_fonts()
+        .iter()
+        .find(|(fam, _)| fam == want)
+        .map(|(_, p)| p.clone())
+        .unwrap_or_else(|| "/system/fonts/Roboto-Regular.ttf".to_string())
 }
 
 /// What a T-lane card actually is. Shapes ride the title lane because they
@@ -1030,6 +1150,42 @@ impl ExportOpts {
         (self.width, self.height) = (w, h);
         self
     }
+
+    /// Rough output-size guess for the share dialog's info strip — bitrate
+    /// heuristics per format/quality, labelled "est." in the UI.
+    /// ponytail: CRF output swings ±2× with content; a guess beats silence.
+    pub fn est_bytes(&self, secs: f64) -> u64 {
+        let px_per_s = self.width as f64 * self.height as f64 * FPS as f64;
+        // Bits per pixel per frame. GIF ignores quality (palette, no CRF) and
+        // is honestly huge at full fps — the estimate is the warning.
+        let bpp = match (self.format, self.quality) {
+            (Format::Gif, _) => 1.6,
+            (Format::WebM, Quality::Draft) => 0.035,
+            (Format::WebM, Quality::Balanced) => 0.07,
+            (Format::WebM, Quality::High) => 0.14,
+            (_, Quality::Draft) => 0.05,
+            (_, Quality::Balanced) => 0.10,
+            (_, Quality::High) => 0.20,
+        };
+        let audio_bps = match self.format {
+            Format::Mp4 => 192_000.0,
+            Format::WebM => 128_000.0,
+            Format::Gif => 0.0,
+        };
+        ((px_per_s * bpp + audio_bps) / 8.0 * secs.max(0.0)) as u64
+    }
+}
+
+/// Cooperative cancel for the long renders (export / preview / transcribe).
+/// The UI's Cancel button sets it; each job clears it when it starts.
+static RENDER_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn cancel_render() {
+    RENDER_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn render_cancelled() -> bool {
+    RENDER_CANCEL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// V2: full-frame cutaway laid over the main track at global time `at`.
@@ -1086,6 +1242,11 @@ pub const AUDIO_TREATS: &[&str] = &[
     "Bright",
     "Bass cut",
     "Podcast",
+    "Chipmunk",
+    "Deep voice",
+    "Robot",
+    "Megaphone",
+    "Echo",
 ];
 
 /// ffmpeg filter chain for a treatment label (no leading/trailing commas).
@@ -1103,6 +1264,18 @@ pub fn audio_treat_chain(name: &str) -> &'static str {
             "highpass=f=80,equalizer=f=2500:t=q:w=1:g=2,\
              acompressor=threshold=-20dB:ratio=3:attack=8:release=80:makeup=2"
         }
+        // Voice-changer pair: relabel the rate to shift pitch, then atempo the
+        // duration back so the item still lines up on the timeline. The leading
+        // aresample pins the rate the asetrate math assumes.
+        "Chipmunk" => "aresample=48000,asetrate=72000,aresample=48000,atempo=0.66667",
+        "Deep voice" => "aresample=48000,asetrate=36000,aresample=48000,atempo=1.33333",
+        // Frequency shift breaks the harmonic series — metallic, robotic ring.
+        "Robot" => "afreqshift=shift=250",
+        "Megaphone" => {
+            "highpass=f=500,lowpass=f=2200,\
+             acompressor=threshold=-18dB:ratio=8:attack=2:release=60:makeup=6"
+        }
+        "Echo" => "aecho=0.8:0.7:120:0.35",
         _ => "",
     }
 }
@@ -1528,7 +1701,7 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
     // A shape needs none of the type machinery below it.
     let shape = s.kind != "Text" && !s.kind.is_empty();
     if shape {
-        let out = Command::new("ffmpeg")
+        let out = Command::new(ffmpeg_bin())
             .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
             .arg(format!("color=c=black@0.0:s={W}x{H},format=rgba"))
             .args(["-vf", &shape_chain(s, W, H), "-frames:v", "1", "-pix_fmt", "rgba"])
@@ -1571,7 +1744,11 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
     } else {
         String::new()
     };
+    #[cfg(not(target_os = "android"))]
     let fontp = if s.font.is_empty() { String::new() } else { format!(":font='{}'", s.font) };
+    // No fontconfig on Android: drawtext must be handed the file itself.
+    #[cfg(target_os = "android")]
+    let fontp = format!(":fontfile={}", android_font_file(&s.font));
     let vf = format!(
         "drawtext=textfile={}{fontp}:fontsize={fs}:fontcolor={}:text_align={}\
          :x=(w-text_w)/2:y=(h-text_h)*{:.3}{shadow}{boxp}{border}",
@@ -1580,7 +1757,7 @@ pub async fn render_title(s: &TitleStyle) -> Result<String, String> {
         align_flag(&s.align),
         s.y_frac
     );
-    let out = Command::new("ffmpeg")
+    let out = Command::new(ffmpeg_bin())
         // format=rgba has to be part of the *input* chain. Left to itself the
         // lavfi color source negotiates an opaque pixel format, the @0.0 alpha
         // is thrown away, and a later format=rgba refills alpha at 255 — which
@@ -1791,16 +1968,26 @@ pub async fn render_karaoke(s: &TitleStyle, active: usize, hi_color: &str) -> Re
          [Events]\n\
          Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
          Dialogue: 0,0:00:00.00,0:00:10.00,D,,0,0,0,,{{\\an{an}\\pos({x:.0},{top:.0})}}{body}\n",
-        font = if s.font.is_empty() { "Sans" } else { &s.font },
+        font = {
+            let f = if s.font.is_empty() { "Sans" } else { &s.font };
+            #[cfg(target_os = "android")]
+            let f = android_family(f);
+            f
+        },
         size = s.font_size,
     );
     let assp = png.with_extension("ass");
     std::fs::write(&assp, ass).map_err(|e| e.to_string())?;
-    let out = Command::new("ffmpeg")
+    let out = Command::new(ffmpeg_bin())
         .args(["-y", "-v", "error", "-f", "lavfi", "-i"])
         .arg(format!("color=c=black@0.0:s={W}x{H},format=rgba"))
         .arg("-vf")
-        .arg(format!("ass=filename={}:original_size={W}x{H}:alpha=1", assp.display()))
+        .arg(format!(
+            "ass=filename={}:original_size={W}x{H}:alpha=1{}",
+            assp.display(),
+            // libass has no fontconfig on Android; point it at the system fonts.
+            if cfg!(target_os = "android") { ":fontsdir=/system/fonts" } else { "" }
+        ))
         .args(["-frames:v", "1", "-pix_fmt", "rgba"])
         .arg(&png)
         .stdin(Stdio::null())
@@ -1814,15 +2001,55 @@ pub async fn render_karaoke(s: &TitleStyle, active: usize, hi_color: &str) -> Re
     Ok(png.display().to_string())
 }
 
+/// Resolve a media tool to something spawnable. Desktop: the PATH name,
+/// unchanged. Android: the APK ships each tool as `lib<name>.so` in the native
+/// library dir — the one place Android still allows exec — so resolve there.
+pub fn ffmpeg_bin() -> String {
+    tool_bin("ffmpeg")
+}
+
+#[cfg(not(target_os = "android"))]
+fn tool_bin(name: &str) -> String {
+    name.to_string()
+}
+
+// ponytail: find the native lib dir from any of our own loaded .so mappings in
+// /proc/self/maps — one file read, no jni dependency. Swap to a JNI
+// nativeLibraryDir lookup if a device ever breaks the assumption.
+#[cfg(target_os = "android")]
+fn tool_bin(name: &str) -> String {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return name.to_string();
+    };
+    for line in maps.lines() {
+        let Some(i) = line.find('/') else { continue };
+        let p = &line[i..];
+        if p.ends_with(".so") && p.contains("/lib/") {
+            if let Some(dir) = Path::new(p).parent() {
+                let cand = dir.join(format!("lib{name}.so"));
+                if cand.exists() {
+                    return cand.display().to_string();
+                }
+            }
+        }
+    }
+    name.to_string()
+}
+
 async fn capture(bin: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(bin)
+    let bin = tool_bin(bin);
+    let out = Command::new(&bin)
         .args(args)
         .stdin(Stdio::null())
         .output()
         .await
         .map_err(|e| format!("failed to run {bin}: {e}"))?;
     if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // Surfaces in logcat on Android (RustStdoutStderr) where the status
+        // bar truncates; harmless noise on a desktop terminal.
+        eprintln!("capture {bin} failed ({}): {err}", out.status);
+        return Err(err);
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -1928,6 +2155,50 @@ pub async fn frame_data_uri_fill(
     over: Over,
     fill: &str,
 ) -> Result<String, String> {
+    let bytes = render_frame_bytes(path, t, w, h, framing, effect, over, fill, "mjpeg").await?;
+    Ok(format!("data:image/jpeg;base64,{}", b64(&bytes)))
+}
+
+/// Write one composed timeline frame (same stack as the monitor) to `out` as PNG.
+/// Size is the export canvas (`w`×`h`); overlays, titles, FX and transitions are
+/// baked in, so what you scrub is what the file holds.
+#[allow(clippy::too_many_arguments)]
+pub async fn export_frame_png(
+    path: &str,
+    t: f64,
+    w: u32,
+    h: u32,
+    framing: &str,
+    effect: &str,
+    over: Over,
+    fill: &str,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    // Atomic write: a killed extract must not leave a half PNG at the final path.
+    let tmp = out.with_extension("part.png");
+    let bytes = render_frame_bytes(path, t, w, h, framing, effect, over, fill, "png").await?;
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, out).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
+    Ok(())
+}
+
+/// One composed frame as raw image bytes. `codec` is the ffmpeg image codec
+/// (`mjpeg` for the scrub data-URI, `png` for Export frame).
+#[allow(clippy::too_many_arguments)]
+async fn render_frame_bytes(
+    path: &str,
+    t: f64,
+    w: u32,
+    h: u32,
+    framing: &str,
+    effect: &str,
+    over: Over,
+    fill: &str,
+    codec: &str,
+) -> Result<Vec<u8>, String> {
     let mut chain = frame_chain_fill(framing, w, h, "m", fill);
     if !effect.is_empty() {
         // Seeking restarts the filter clock at 0, which would freeze every
@@ -1942,7 +2213,7 @@ pub async fn frame_data_uri_fill(
         // playhead position no matter what the clock says.
         chain = format!("{chain},setpts=PTS+{t:.3}/TB,{effect},setpts=PTS-{t:.3}/TB");
     }
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_bin());
     cmd.args(["-v", "error"]);
     if is_still(path) {
         cmd.args(["-loop", "1"]); // a lone frame has nothing to seek to
@@ -2023,7 +2294,7 @@ pub async fn frame_data_uri_fill(
         cmd.args(["-filter_complex", &graph, "-map", "[out]"]);
     }
     let out = cmd
-        .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "mjpeg", "-"])
+        .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", codec, "-"])
         .stdin(Stdio::null())
         .output()
         .await
@@ -2031,7 +2302,7 @@ pub async fn frame_data_uri_fill(
     if !out.status.success() || out.stdout.is_empty() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    Ok(format!("data:image/jpeg;base64,{}", b64(&out.stdout)))
+    Ok(out.stdout)
 }
 
 /// Where a user's own settings live, as opposed to things that can be
@@ -2080,7 +2351,7 @@ pub async fn extract_still(path: &str, t: f64) -> Result<String, String> {
     // Write to a temp name then rename so a killed extract never leaves a
     // half-written PNG that would poison the next cache hit.
     let tmp = dir.join(format!("{:016x}.part.png", h.finish()));
-    let out = Command::new("ffmpeg")
+    let out = Command::new(ffmpeg_bin())
         .args(["-y", "-v", "error"])
         .args(["-ss", &format!("{t:.3}"), "-i", path])
         .args(["-frames:v", "1", "-update", "1"])
@@ -2129,7 +2400,7 @@ pub async fn ensure_proxy(src: &str) -> Result<String, String> {
     // Build to a temp name then rename, so a killed build never leaves a
     // truncated proxy that would poison the cache.
     let tmp = dst.with_extension("part.mp4");
-    let out = Command::new("ffmpeg")
+    let out = Command::new(ffmpeg_bin())
         .args(["-y", "-v", "error", "-i", src])
         .args(["-vf", "scale=-2:480", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28"])
         .args(["-g", "30", "-an", "-movflags", "+faststart"])
@@ -2496,7 +2767,7 @@ pub async fn render_audio_mix(
     if clips.is_empty() {
         return Err("nothing to play".into());
     }
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_bin());
     cmd.args(["-y", "-v", "error"]);
     for path in clips.iter().map(|c| &c.path).chain(audio.iter().map(|a| &a.path)) {
         cmd.args(["-i", path]);
@@ -2520,7 +2791,7 @@ pub async fn measure_loudness(path: &str, in_s: f64, out_s: f64) -> Result<f64, 
     let span = (out_s - in_s).max(0.05);
     let ss = format!("{:.3}", in_s.max(0.0));
     let t = format!("{span:.3}");
-    let out = Command::new("ffmpeg")
+    let out = Command::new(ffmpeg_bin())
         .args(["-hide_banner", "-nostats", "-ss", &ss, "-i", path, "-t", &t])
         .args(["-af", "loudnorm=print_format=json", "-f", "null", "-"])
         .stdin(Stdio::null())
@@ -2559,6 +2830,28 @@ pub fn voiceover_out_path() -> std::path::PathBuf {
     dir.join(format!("vo-{stamp}.wav"))
 }
 
+/// Speak `text` into a wav under the cache dir (TikTok-style text-to-speech on
+/// a text card). Shells to `espeak-ng` — same shell-over-engine stance as
+/// ffmpeg/curl. Returns the wav path for the caller to probe and insert.
+pub async fn tts(text: &str) -> Result<std::path::PathBuf, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("This card has no text to read.".to_string());
+    }
+    let dir = cache_dir("tts");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out = dir.join(format!("tts-{stamp}.wav"));
+    // ponytail: one fixed voice; add a voice picker if anyone asks.
+    capture("espeak-ng", &["-v", "en+f3", "-s", "165", "-w", &out.display().to_string(), text])
+        .await
+        .map_err(|e| format!("Text-to-speech needs espeak-ng on PATH ({e})"))?;
+    Ok(out)
+}
+
 /// Start capturing the default microphone into `path` (WAV, mono 48 kHz).
 /// Tries PulseAudio first, then ALSA. The child stays running until
 /// [`stop_mic_record`] writes `q` to its stdin (graceful so the WAV header is
@@ -2571,7 +2864,7 @@ pub async fn start_mic_record(path: &Path) -> Result<tokio::process::Child, Stri
     let backends: [(&str, &str); 2] = [("pulse", "default"), ("alsa", "default")];
     let mut last_err = String::from("no microphone backend responded");
     for (fmt, dev) in backends {
-        let mut child = match Command::new("ffmpeg")
+        let mut child = match Command::new(ffmpeg_bin())
             .args(["-y", "-hide_banner", "-nostats", "-loglevel", "error"])
             .args(["-f", fmt, "-i", dev])
             // Mono is enough for VO and halves file size; 48 kHz matches the mix.
@@ -2673,7 +2966,7 @@ pub async fn detect_silence(
     let noise = noise_db.min(-1.0); // always treat as "below N dB"
     let min_dur = min_dur.max(0.05);
     let af = format!("silencedetect=noise={noise:.1}dB:d={min_dur:.3}");
-    let out = Command::new("ffmpeg")
+    let out = Command::new(ffmpeg_bin())
         .args(["-hide_banner", "-nostats", "-i", path, "-af", &af, "-f", "null", "-"])
         .stdin(Stdio::null())
         .output()
@@ -2867,7 +3160,7 @@ pub async fn detect_beats(path: &str, in_s: f64, out_s: f64) -> Result<(f64, Vec
     let span = (out_s - in_s).max(0.5);
     let ss = format!("{:.3}", in_s.max(0.0));
     let t = format!("{span:.3}");
-    let out = Command::new("ffmpeg")
+    let out = Command::new(ffmpeg_bin())
         .args(["-hide_banner", "-nostats", "-ss", &ss, "-i", path, "-t", &t])
         .args(["-ac", "1", "-ar", &SR.to_string(), "-f", "f32le", "-"])
         .stdin(Stdio::null())
@@ -2910,7 +3203,7 @@ pub async fn detect_beats(path: &str, in_s: f64, out_s: f64) -> Result<(f64, Vec
 /// `scale=sqrt` + a mild pre-gain lifts quiet speech so the strip reads as a
 /// real envelope rather than a thin mid-line; `draw=full` fills to the peaks.
 pub async fn waveform_data_uri(path: &str) -> Result<String, String> {
-    let out = Command::new("ffmpeg")
+    let out = Command::new(ffmpeg_bin())
         .args(["-v", "error", "-i", path])
         .args([
             "-filter_complex",
@@ -2984,6 +3277,7 @@ pub async fn transcribe(
     total_s: f64,
     mut on_progress: impl FnMut(f64),
 ) -> Result<Vec<(f64, f64, String)>, String> {
+    RENDER_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     let dir = wav.parent().unwrap_or_else(|| Path::new("."));
     // ctranslate2 first: it has VAD filtering (skips music/silence stretches
     // that derail decoding) and is faster on CPU at the same model size.
@@ -3014,6 +3308,10 @@ pub async fn transcribe(
         // decode; the end stamp against the mix duration is the progress.
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            if render_cancelled() {
+                let _ = child.kill().await;
+                return Err("cancelled".into());
+            }
             if let Some(end) = seg_end_s(&line) {
                 if total_s > 0.0 {
                     on_progress((end / total_s).min(1.0));
@@ -3036,6 +3334,21 @@ pub async fn transcribe(
 
 /// Render to `out` with the chosen container, quality and size.
 /// `on_progress` gets 0.0..=1.0 as ffmpeg reports out_time.
+/// Does the bundled ffmpeg carry Android's hardware H.264 encoder? True only
+/// in an APK whose ffmpeg was built with --enable-mediacodec (see
+/// packaging/android/bundle-ffmpeg.sh); desktop builds and the current
+/// prebuilt probe false and change nothing.
+fn has_hw_h264() -> bool {
+    static HW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HW.get_or_init(|| {
+        std::process::Command::new(ffmpeg_bin())
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_mediacodec"))
+            .unwrap_or(false)
+    })
+}
+
 pub async fn export(
     clips: &[ClipSpec],
     overlays: &[OverlaySpec],
@@ -3046,11 +3359,35 @@ pub async fn export(
     opts: ExportOpts,
     mut on_progress: impl FnMut(f64),
 ) -> Result<(), String> {
+    let hw = opts.format == Format::Mp4 && has_hw_h264();
+    match export_pass(clips, overlays, adjustments, titles, audio, out, opts, hw, &mut on_progress).await {
+        // LibreCuts-style fallback: mediacodec init fails per-device/per-size —
+        // rerun the whole export in software rather than surface the error.
+        Err(e) if hw && e != "cancelled" => {
+            export_pass(clips, overlays, adjustments, titles, audio, out, opts, false, &mut on_progress).await
+        }
+        r => r,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn export_pass(
+    clips: &[ClipSpec],
+    overlays: &[OverlaySpec],
+    adjustments: &[AdjustSpec],
+    titles: &[TitleSpec],
+    audio: &[AudioSpec],
+    out: &Path,
+    opts: ExportOpts,
+    hw: bool,
+    on_progress: &mut impl FnMut(f64),
+) -> Result<(), String> {
     if clips.is_empty() {
         return Err("nothing to export".into());
     }
+    RENDER_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     let total = timeline_len(clips);
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_bin());
     cmd.args(["-y", "-v", "error"]);
     for path in clips.iter().map(|c| &c.path).chain(overlays.iter().map(|o| &o.path)) {
         // Same trick the titles use below: -loop 1 turns a still into a stream
@@ -3078,8 +3415,15 @@ pub async fn export(
     }
     match opts.format {
         Format::Mp4 => {
-            cmd.args(["-c:v", "libx264", "-preset", speed, "-crf", &crf, "-pix_fmt", "yuv420p"])
-                .args(["-c:a", "aac", "-b:a", "192k"])
+            if hw {
+                // mediacodec has no CRF — bitrate by short edge, LibreCuts's
+                // table; Quality still steers the software fallback.
+                let br = if opts.width >= 1080 { "8M" } else if opts.width >= 720 { "5M" } else { "2M" };
+                cmd.args(["-c:v", "h264_mediacodec", "-b:v", br, "-pix_fmt", "nv12"])
+            } else {
+                cmd.args(["-c:v", "libx264", "-preset", speed, "-crf", &crf, "-pix_fmt", "yuv420p"])
+            }
+            .args(["-c:a", "aac", "-b:a", "192k"])
                 // faststart puts the index first so it plays before it finishes
                 // downloading — the difference between a reel that starts and
                 // one that spins.
@@ -3110,6 +3454,10 @@ pub async fn export(
 
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if render_cancelled() {
+            let _ = child.kill().await;
+            return Err("cancelled".into());
+        }
         // out_time_us on modern ffmpeg; out_time_ms is also microseconds (historical quirk).
         let us = line
             .strip_prefix("out_time_us=")
@@ -3228,6 +3576,23 @@ mod tests {
         // Same-millisecond calls can collide; distinct paths are preferred but
         // not required for correctness of a single take.
         let _ = b;
+    }
+
+    /// Smoke: TTS lands a real wav with audio in it. Skips when espeak-ng
+    /// isn't installed (CI / headless).
+    #[tokio::test]
+    async fn tts_speaks_a_wav() {
+        assert!(tts("   ").await.is_err(), "blank text must not shell out");
+        let p = match tts("Hello from the timeline.").await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skip tts smoke (no espeak-ng): {e}");
+                return;
+            }
+        };
+        let (d, has_audio) = probe(&p.display().to_string()).await.unwrap();
+        assert!(has_audio && d > 0.3, "spoken wav should have audible length, got {d}");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// Smoke: open the default mic briefly and land a valid WAV. Skips when
@@ -4912,6 +5277,53 @@ noise
         let wav = dir.join("mix.wav");
         render_audio_mix(&clips, &[], &wav).await.unwrap();
         assert!(std::fs::metadata(&wav).unwrap().len() > 0);
+    }
+
+    // Export-frame must land a real PNG of the composed canvas (titles stacked),
+    // not a zero-byte file or a JPEG with a .png name.
+    #[tokio::test]
+    async fn export_frame_png_writes_a_portrait_png() {
+        let dir = std::env::temp_dir().join("morreel-frame-png-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=30",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", &src,
+        ]).await.unwrap();
+        let title = render_title(&TitleStyle {
+            text: "Frame".into(),
+            font_size: 72,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let out = dir.join("frame.png");
+        export_frame_png(
+            &src,
+            0.25,
+            540,
+            960,
+            "Crop",
+            "",
+            Over { titles: vec![(title, 1.0)], ..Default::default() },
+            "black",
+            &out,
+        )
+        .await
+        .unwrap();
+        assert!(std::fs::metadata(&out).unwrap().len() > 100, "empty PNG");
+        // PNG magic number — proves we didn't write MJPEG under a .png name.
+        let magic = std::fs::read(&out).unwrap();
+        assert_eq!(&magic[..8], b"\x89PNG\r\n\x1a\n");
+        let dims = capture("ffprobe", &[
+            "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0",
+            &out.display().to_string(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(dims.trim(), "540,960");
     }
 
     // Scrubbing a time-based effect must show its motion, not its t=0 pose.

@@ -7,9 +7,7 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/MoribundMurdoch/mor-reel-studio"
 
 [dependencies]
-dioxus = { version = "0.7", features = ["desktop"] }
 mor_rust_dioxus_ui_kit = { path = "../mor_rust_dioxus_ui_kit" }
-rfd = "0.15"
 # ponytail: dioxus-desktop already pulls image 0.25 — declaring it direct is free.
 image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { version = "1", features = ["process", "io-util", "time", "net", "sync"] }
@@ -20,6 +18,20 @@ futures-util = "0.3"
 # project file is the one thing worth not hand-rolling a parser for.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Desktop gets the webview window + native file dialogs; Android gets the
+# mobile activity and stubs the dialogs (see `mod rfd` in main.rs).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+dioxus = { version = "0.7", features = ["desktop"] }
+rfd = "0.15"
+
+[target.'cfg(target_os = "android")'.dependencies]
+dioxus = { version = "0.7", features = ["mobile"] }
+# Media-permission request + getExternalFilesDir for the in-app picker.
+jni = "0.21"
+ndk-context = "0.1"
+# Decoding webview fetch()/canvas payloads (droid.rs bridges).
+base64 = "0.22"
 
 # The terminal client. Explicit so the command is `morreel`, not `cli`; the
 # mcp bin stays auto-discovered from src/bin/.
