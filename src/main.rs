@@ -5085,11 +5085,16 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         on_action: move |_| show_appear.set(!show_appear()),
                     }
                     MenuSeparator {}
+                    // No second OS window on Android — the fullscreen monitor
+                    // and docked inspector are the phone equivalents.
+                    if cfg!(not(target_os = "android")) {
                     MenuItem {
                         label: "Pop out monitor".to_string(),
                         disabled: monitor_out(),
                         on_action: move |_| open_monitor(),
                     }
+                    }
+                    if cfg!(not(target_os = "android")) {
                     MenuItem {
                         label: if insp_float() {
                             "Dock inspector".to_string()
@@ -5114,6 +5119,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                 );
                             }
                         },
+                    }
                     }
                     MenuItem {
                         label: if insp_open() {
@@ -5825,7 +5831,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     },
                                     "✦"
                                 }
-                                if is_main {
+                                if is_main && cfg!(not(target_os = "android")) {
                                 button {
                                     class: "mr-panel-btn",
                                     disabled: inspector_out(),
@@ -5851,6 +5857,8 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     },
                                     if insp_float() { "⬚" } else { "⧉" }
                                 }
+                                }
+                                if is_main {
                                 button {
                                     class: "mr-panel-btn",
                                     title: "Hide inspector",
