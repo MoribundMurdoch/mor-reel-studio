@@ -311,6 +311,7 @@ pub fn publish_to_gallery(src: &Path) -> Option<String> {
         "mp4" => ("video/mp4", "android/provider/MediaStore$Video$Media", "Movies/MorReel"),
         "webm" => ("video/webm", "android/provider/MediaStore$Video$Media", "Movies/MorReel"),
         "gif" => ("image/gif", "android/provider/MediaStore$Images$Media", "Pictures/MorReel"),
+        "png" => ("image/png", "android/provider/MediaStore$Images$Media", "Pictures/MorReel"),
         _ => return None,
     };
     let mut file = std::fs::File::open(src).ok()?;

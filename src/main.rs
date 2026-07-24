@@ -2705,6 +2705,144 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         show_export.set(true);
     };
 
+    // One still of the composed monitor (V1 + overlays + FX + titles) at the
+    // playhead — same stack as scrub, written as PNG. Freeze frame puts a hold
+    // on the timeline; this is the "save what I see" path.
+    let export_frame_png = move |_: ()| {
+        if clips.read().is_empty() || export_progress().is_some() {
+            return;
+        }
+        let t = playhead();
+        let (w, h) = {
+            let o = export_opts();
+            (o.width, o.height)
+        };
+        let name = {
+            let n = export_name().replace('/', "-").trim().to_string();
+            if n.is_empty() { "morreel-frame".into() } else { format!("{n}-frame") }
+        };
+        let stamp = format!("{:.2}s", t).replace('.', "p");
+        spawn(async move {
+            let Some(file) = rfd::AsyncFileDialog::new()
+                .add_filter("PNG image", &["png"])
+                .set_file_name(format!("{name}-{stamp}.png"))
+                .set_title("Export frame as PNG")
+                .save_file()
+                .await
+            else {
+                return;
+            };
+            status.set(format!("Extracting frame at {}…", fmt_t(t)));
+            // Bake any missing title cards first so the stack below is complete.
+            ensure_titles().await;
+
+            // Same composite refresh_monitor would scrub — built *after* titles
+            // land so a card that just finished rendering is in the PNG.
+            let any_solo = clips.read().iter().any(|c| c.enabled && c.solo)
+                || overlays.read().iter().any(|o| o.enabled && o.solo)
+                || audios.read().iter().any(|a| a.enabled && a.solo);
+            let title_stack: Vec<(String, f64)> = {
+                let ts = titles.read();
+                let mut active: Vec<&TitleItem> = ts
+                    .iter()
+                    .filter(|ti| ti.enabled && t >= ti.at && t < ti.at + ti.dur && !ti.pngs.is_empty())
+                    .collect();
+                active.sort_by_key(|ti| ti.track);
+                active
+                    .into_iter()
+                    .filter_map(|ti| {
+                        let k = ti.card_at(t).unwrap_or(0).min(ti.pngs.len().saturating_sub(1));
+                        ti.pngs
+                            .get(k)
+                            .map(|p| (p.clone(), title_alpha(t, ti.at, ti.dur)))
+                    })
+                    .collect()
+            };
+            let overlay_layers: Vec<(String, f64, String, String)> = {
+                let ov = overlays.read();
+                let mut ovs: Vec<&OverlayItem> = ov
+                    .iter()
+                    .filter(|o| o.enabled && t >= o.at && t < o.at + o.trimmed())
+                    .collect();
+                ovs.sort_by_key(|o| o.track);
+                ovs.into_iter()
+                    .map(|o| {
+                        let mut look = o.look();
+                        if any_solo && !o.solo {
+                            look = join_chain(look, "hue=s=0".into());
+                        }
+                        // Original path — proxies are scrub-only.
+                        (o.path.clone(), o.src_at(t - o.at), o.framing.clone(), look)
+                    })
+                    .collect()
+            };
+            let active_adjust: Vec<String> = adjustments
+                .read()
+                .iter()
+                .filter(|a| a.enabled && t >= a.at && t < a.at + a.dur)
+                .map(|a| a.look())
+                .filter(|l| !l.is_empty())
+                .collect();
+            let adjust = (!active_adjust.is_empty()).then(|| active_adjust.join(","));
+            let mut layers = engine::Over {
+                titles: title_stack,
+                layers: overlay_layers,
+                adjust,
+                ..Default::default()
+            };
+            let fill = clips
+                .read()
+                .first()
+                .map_or("black", |c| c.transform.bg.color())
+                .to_string();
+            let (path, local, fr, eff) = if let Some((i, local)) = locate(&clips.read(), t) {
+                let cl = clips.read();
+                let c = &cl[i];
+                if !c.enabled {
+                    status.set("Clip under the playhead is disabled.".to_string());
+                    return;
+                }
+                let mut look = c.look();
+                if any_solo && !c.solo {
+                    look = join_chain(look, "hue=s=0".into());
+                }
+                if let Some((next, alpha, ntime)) = transition_at(&clips.read(), t) {
+                    if cl[next].enabled {
+                        let mut nlook = cl[next].look();
+                        if any_solo && !cl[next].solo {
+                            nlook = join_chain(nlook, "hue=s=0".into());
+                        }
+                        layers.blend =
+                            Some((cl[next].path.clone(), ntime, cl[next].framing.clone(), nlook, alpha));
+                    }
+                }
+                (c.path.clone(), local, c.framing.clone(), look)
+            } else if let Some((path, local, fr, eff)) = layers.layers.first().cloned() {
+                layers.layers.remove(0);
+                (path, local, fr, eff)
+            } else {
+                status.set("Park the playhead on a picture frame to export.".to_string());
+                return;
+            };
+
+            match engine::export_frame_png(&path, local, w, h, &fr, &eff, layers, &fill, file.path())
+                .await
+            {
+                Ok(()) => {
+                    #[cfg(target_os = "android")]
+                    let published = crate::droid::publish_to_gallery(file.path());
+                    #[cfg(not(target_os = "android"))]
+                    let published: Option<String> = None;
+                    status.set(match published {
+                        Some(rel) => format!("Frame saved to {rel}"),
+                        None => format!("Frame saved {}", file.path().display()),
+                    });
+                }
+                Err(e) => status.set(format!("Frame export failed: {e}")),
+            }
+        });
+    };
+
     // smplayer-style full-fidelity preview: fast-render the timeline to a temp
     // file and hand it to a real player (mpv, else ffplay) — audio included.
     let mut play_preview = move |_: ()| {
@@ -3794,116 +3932,259 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
         }
     };
 
-    // The Transform panel. A V1 clip and a V2 cutaway differ only in whether
-    // opacity means anything, and both write through the selection, so one
-    // definition serves both lanes.
-    let transform_panel = move |with_opacity: bool| {
+    // The Transform panel — one layout for V1 and V2. `with_opacity` adds the
+    // PiP alpha row; `with_layout` adds band presets, align and Ken Burns (V1).
+    // Sections: Layout → Position (+ align) → Size → Rotate/Flip → Pivot →
+    // Opacity → Motion → Reset.
+    let transform_panel = move |with_opacity: bool, with_layout: bool| {
         let Some(xf) = selected_xf() else {
             return rsx! {};
         };
-        // Order: orient (mirror) → place → size → spin → opacity.
-        // Mirror sits first so the discrete flip is one glance from the top;
-        // sliders follow in the usual place/scale/rotate stack.
+        let band = active_band(&xf);
+        let knobs = transform_knobs(&xf, with_opacity);
+        let sections = [
+            XformSection::Position,
+            XformSection::Size,
+            XformSection::Rotate,
+            XformSection::Pivot,
+            XformSection::Opacity,
+        ];
         rsx! {
-            h4 { class: "mr-fx-cat", "Transform" }
-            if with_opacity {
-                p { class: "mor-statusbar-muted mr-export-blurb",
-                    "Scale below 1 makes this a picture-in-picture — V1 shows through around it."
+            div { class: "mr-xf-panel",
+                if with_opacity {
+                    p { class: "mor-statusbar-muted mr-export-blurb",
+                        "Scale below 1 makes a picture-in-picture — V1 shows through around it."
+                    }
                 }
-            }
-            MorSelect {
-                label: "Mirror".to_string(),
-                value: match (xf.flip_h, xf.flip_v) {
-                    (true, true) => "Both".to_string(),
-                    (true, false) => "Across".to_string(),
-                    (false, true) => "Down".to_string(),
-                    _ => "None".to_string(),
-                },
-                options: ["None", "Across", "Down", "Both"].map(str::to_string).to_vec(),
-                onchange: move |v: String| {
-                    push_undo("");
-                    if let Some(mut t) = selected_xf() {
-                        t.flip_h = v == "Across" || v == "Both";
-                        t.flip_v = v == "Down" || v == "Both";
-                        set_selected_xf(t);
+                if with_layout {
+                    h4 { class: "mr-fx-cat", "Layout" }
+                    p { class: "mor-statusbar-muted mr-export-blurb",
+                        "Band fits a landscape strip; pick Background (Bg) for the surround."
                     }
-                },
-            }
-            for (label, value, min, max, step, _set) in transform_knobs(&xf, with_opacity) {
-                div { key: "{label}", class: "mr-xf-row",
-                    Slider {
-                        label: Some(label),
-                        min, max, step,
-                        precision: if step < 0.1 { 3 } else { 0 },
-                        value,
-                        oninput: Some(EventHandler::new(move |v: f64| {
-                            push_undo(&format!("xf-{label}"));
-                            // Keys the field in place when it's animated, sets a
-                            // constant otherwise — a sibling's curve is never lost.
-                            edit_sel_at(&|at, t| xf_write(at, label, v, t));
-                        })),
-                    }
-                    // A diamond only where the engine actually animates: scale and,
-                    // on a composited layer, opacity. Click drops or pulls a key at
-                    // the playhead; move the playhead, change the value, it tweens.
-                    if xf_keyable(label) {
-                        button {
-                            r#type: "button",
-                            class: if sel_field_animated(label) { "mr-kf-diamond on" } else { "mr-kf-diamond" },
-                            title: "Keyframe at the playhead",
-                            onclick: move |_| {
-                                push_undo("keyframe");
-                                edit_sel_at(&|at, t| xf_toggle_key(at, label, t));
-                                status.set(
-                                    "Keyframe toggled at the playhead — set a second one elsewhere to animate."
-                                        .to_string(),
-                                );
-                            },
-                            if sel_field_animated(label) { "◆" } else { "◇" }
-                        }
-                        // Velocity: when a key sits at the playhead, cycle its
-                        // ease (Ease → Lin → Hold). Each maps to a different
-                        // segment curve in the engine, so the tween's speed
-                        // changes in preview and export alike.
-                        if let Some(cur) = sel_key_interp(label) {
-                            button {
-                                r#type: "button",
-                                class: "mr-kf-ease",
-                                title: "Keyframe velocity — click to cycle ease in/out, linear, hold",
-                                onclick: move |_| {
-                                    push_undo("keyframe-ease");
-                                    edit_sel_at(&|at, t| xf_cycle_interp(at, label, t));
-                                    status.set("Keyframe velocity changed.".to_string());
-                                },
-                                "{interp_glyph(cur)}"
+                    div { class: "mr-preset-row",
+                        for (id, label, tip) in BAND_PRESETS {
+                            {
+                                let id = *id;
+                                let active = band == Some(id);
+                                rsx! {
+                                    button {
+                                        key: "{id}",
+                                        class: if active { "mor-btn active" } else { "mor-btn" },
+                                        title: "{tip}",
+                                        onclick: move |_| {
+                                            push_undo("band");
+                                            let mut t = selected_xf().unwrap_or_default();
+                                            apply_band(&mut t, id);
+                                            set_selected_xf(t);
+                                            status.set(match id {
+                                                "fill" => "Filling the frame.".to_string(),
+                                                "top" => "Band set — add text below.".to_string(),
+                                                "mid" => "Band set — add text above or below.".to_string(),
+                                                "bot" => "Band set — add text above.".to_string(),
+                                                _ => "Layout applied.".to_string(),
+                                            });
+                                        },
+                                        "{label}"
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
-            // Only a non-uniform box (a stretch or a band) has an aspect to keep,
-            // so the fit choice appears exactly when it does something.
-            if (xf.scale_x - xf.scale_y).abs() > 1e-6 {
-                MorCheckbox {
-                    label: "Keep aspect (crop to fill instead of stretch)".to_string(),
-                    checked: xf.cover,
-                    onchange: move |on: bool| {
-                        push_undo("xf-cover");
-                        if let Some(mut t) = selected_xf() {
-                            t.cover = on;
-                            set_selected_xf(t);
+
+                for sec in sections {
+                    {
+                        let rows: Vec<_> = knobs.iter().filter(|(l, ..)| xf_section(l) == sec).cloned().collect();
+                        // Opacity section is empty on V1 — skip the header entirely.
+                        let show = !rows.is_empty();
+                        rsx! {
+                            if show {
+                                h4 { class: "mr-fx-cat", key: "{sec.label()}", "{sec.label()}" }
+                                if sec == XformSection::Position {
+                                    if with_layout {
+                                        // Two rows: vertical align, then horizontal — keeps the
+                                        // independent axes (Middle ≠ dead-centre).
+                                        div { class: "mr-align-rows",
+                                            div { class: "mr-preset-row mr-align-row",
+                                                button { class: "mor-btn", title: "Align top edge",
+                                                    onclick: move |_| align_sel(engine::Align::Top), "⤒ Top" }
+                                                button { class: "mor-btn", title: "Centre vertically",
+                                                    onclick: move |_| align_sel(engine::Align::VCenter), "⇕ Middle" }
+                                                button { class: "mor-btn", title: "Align bottom edge",
+                                                    onclick: move |_| align_sel(engine::Align::Bottom), "⤓ Bottom" }
+                                            }
+                                            div { class: "mr-preset-row mr-align-row",
+                                                button { class: "mor-btn", title: "Align left edge",
+                                                    onclick: move |_| align_sel(engine::Align::Left), "⇤ Left" }
+                                                button { class: "mor-btn", title: "Centre horizontally",
+                                                    onclick: move |_| align_sel(engine::Align::HCenter), "⇔ Centre" }
+                                                button { class: "mor-btn", title: "Align right edge",
+                                                    onclick: move |_| align_sel(engine::Align::Right), "⇥ Right" }
+                                            }
+                                        }
+                                        p { class: "mor-statusbar-muted mr-export-blurb",
+                                            {if safe_area() {
+                                                "Align uses the safe area (guides on)."
+                                            } else {
+                                                "Align snaps to the frame — G for safe-area guides."
+                                            }}
+                                        }
+                                    }
+                                }
+                                if sec == XformSection::Pivot {
+                                    p { class: "mor-statusbar-muted mr-export-blurb",
+                                        "Rotation turns around this point. Position places the pivot."
+                                    }
+                                }
+                                if sec == XformSection::Rotate {
+                                    div { class: "mr-flip-row",
+                                        button {
+                                            class: if xf.flip_h { "mor-btn active" } else { "mor-btn" },
+                                            title: "Flip horizontally",
+                                            onclick: move |_| {
+                                                push_undo("xf-flip");
+                                                if let Some(mut t) = selected_xf() {
+                                                    t.flip_h = !t.flip_h;
+                                                    set_selected_xf(t);
+                                                }
+                                            },
+                                            "↔ Flip H"
+                                        }
+                                        button {
+                                            class: if xf.flip_v { "mor-btn active" } else { "mor-btn" },
+                                            title: "Flip vertically",
+                                            onclick: move |_| {
+                                                push_undo("xf-flip");
+                                                if let Some(mut t) = selected_xf() {
+                                                    t.flip_v = !t.flip_v;
+                                                    set_selected_xf(t);
+                                                }
+                                            },
+                                            "↕ Flip V"
+                                        }
+                                        button {
+                                            class: "mor-btn",
+                                            title: "Rotate −90°",
+                                            onclick: move |_| {
+                                                push_undo("xf-rot");
+                                                if let Some(mut t) = selected_xf() {
+                                                    t.rotation = (t.rotation - 90.0).rem_euclid(360.0);
+                                                    if t.rotation > 180.0 { t.rotation -= 360.0; }
+                                                    set_selected_xf(t);
+                                                }
+                                            },
+                                            "↶ 90°"
+                                        }
+                                        button {
+                                            class: "mor-btn",
+                                            title: "Rotate +90°",
+                                            onclick: move |_| {
+                                                push_undo("xf-rot");
+                                                if let Some(mut t) = selected_xf() {
+                                                    t.rotation = (t.rotation + 90.0).rem_euclid(360.0);
+                                                    if t.rotation > 180.0 { t.rotation -= 360.0; }
+                                                    set_selected_xf(t);
+                                                }
+                                            },
+                                            "↷ 90°"
+                                        }
+                                    }
+                                }
+                                for (label, value, min, max, step, _set) in rows {
+                                    div { key: "{label}", class: "mr-xf-row",
+                                        Slider {
+                                            label: Some(label),
+                                            min, max, step,
+                                            precision: if step < 0.1 { 3 } else { 0 },
+                                            value,
+                                            oninput: Some(EventHandler::new(move |v: f64| {
+                                                push_undo(&format!("xf-{label}"));
+                                                edit_sel_at(&|at, t| xf_write(at, label, v, t));
+                                            })),
+                                        }
+                                        if xf_keyable(label) {
+                                            button {
+                                                r#type: "button",
+                                                class: if sel_field_animated(label) { "mr-kf-diamond on" } else { "mr-kf-diamond" },
+                                                title: "Keyframe at the playhead",
+                                                onclick: move |_| {
+                                                    push_undo("keyframe");
+                                                    edit_sel_at(&|at, t| xf_toggle_key(at, label, t));
+                                                    status.set(
+                                                        "Keyframe toggled — set another elsewhere to animate."
+                                                            .to_string(),
+                                                    );
+                                                },
+                                                if sel_field_animated(label) { "◆" } else { "◇" }
+                                            }
+                                            if let Some(cur) = sel_key_interp(label) {
+                                                button {
+                                                    r#type: "button",
+                                                    class: "mr-kf-ease",
+                                                    title: "Keyframe velocity — cycle ease / linear / hold",
+                                                    onclick: move |_| {
+                                                        push_undo("keyframe-ease");
+                                                        edit_sel_at(&|at, t| xf_cycle_interp(at, label, t));
+                                                        status.set("Keyframe velocity changed.".to_string());
+                                                    },
+                                                    "{interp_glyph(cur)}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if sec == XformSection::Size && (xf.scale_x - xf.scale_y).abs() > 1e-6 {
+                                    MorCheckbox {
+                                        label: "Keep aspect (crop to fill)".to_string(),
+                                        checked: xf.cover,
+                                        onchange: move |on: bool| {
+                                            push_undo("xf-cover");
+                                            if let Some(mut t) = selected_xf() {
+                                                t.cover = on;
+                                                set_selected_xf(t);
+                                            }
+                                        },
+                                    }
+                                }
+                            }
                         }
-                    },
+                    }
                 }
-            }
-            if !xf.is_identity() {
-                button {
-                    class: "mor-btn mr-reset",
-                    onclick: move |_| {
-                        push_undo("");
-                        set_selected_xf(engine::Transform::default());
-                    },
-                    "↺ Reset transform"
+
+                if with_layout {
+                    h4 { class: "mr-fx-cat", "Motion" }
+                    MorCheckbox {
+                        label: "Ken Burns zoom (slow push over the clip)".to_string(),
+                        checked: matches!(selected(), Some(Sel::Main(i)) if clips.read().get(i).is_some_and(|c| c.transform.scale.is_animated())),
+                        onchange: move |on: bool| set_ken_burns(on),
+                    }
+                }
+
+                div { class: "mr-xf-footer",
+                    if !xf.is_identity() || band.is_some() {
+                        button {
+                            class: "mor-btn mr-reset",
+                            onclick: move |_| {
+                                push_undo("");
+                                set_selected_xf(engine::Transform::default());
+                            },
+                            "↺ Reset transform"
+                        }
+                    }
+                    button {
+                        class: if show_handles() { "mor-btn active" } else { "mor-btn" },
+                        title: "Toggle on-screen handles on the monitor (T)",
+                        onclick: move |_| {
+                            let on = !show_handles();
+                            show_handles.set(on);
+                            status.set(if on {
+                                "Transform handles on — drag to move, scale or rotate.".to_string()
+                            } else {
+                                "Transform handles off.".to_string()
+                            });
+                        },
+                        if show_handles() { "● Handles" } else { "○ Handles" }
+                    }
                 }
             }
         }
@@ -4661,6 +4942,12 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                         shortcut: Some("Ctrl+E".to_string()),
                         disabled: no_clips || exporting,
                         on_action: move |_| do_export(()),
+                    }
+                    MenuItem {
+                        label: "Export frame as PNG…".to_string(),
+                        shortcut: Some("Ctrl+Shift+E".to_string()),
+                        disabled: no_clips || exporting,
+                        on_action: move |_| export_frame_png(()),
                     }
                     MenuItem {
                         label: "Export OpenTimelineIO…".to_string(),
@@ -5957,6 +6244,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                             }
                             div { class: "mr-phase-actions",
                                 button { class: "mor-btn primary mr-export", disabled: clips.read().is_empty() || exporting, onclick: move |_| do_export(()), "⇪ Export MP4…" }
+                                button { class: "mor-btn", disabled: clips.read().is_empty() || exporting, onclick: move |_| export_frame_png(()), "🖼 Export frame as PNG…" }
                                 button { class: "mor-btn", disabled: clips.read().is_empty(), onclick: move |_| export_otio(()), "⇄ Export OpenTimelineIO…" }
                             }
                         } else if active_phase() == Phase::Effects {
@@ -6253,72 +6541,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                     }
                                     if active_phase() == Phase::Style {
                                     if style_tab() == "Transform" {
-                                    p { class: "mor-statusbar-muted mr-export-blurb",
-                                        "Band presets fit the clip into a landscape strip — pick a Background for the surround, then add text above or below."
-                                    }
-                                    div { class: "mr-preset-row",
-                                        button { class: "mor-btn", title: "Fill the whole 9:16 frame",
-                                            onclick: move |_| {
-                                                push_undo("band");
-                                                let mut t = selected_xf().unwrap_or_default();
-                                                t.scale = 1.0; t.scale_x = 1.0; t.scale_y = 1.0; t.x = 0.0; t.y = 0.0; t.rotation = 0.0; t.cover = false;
-                                                set_selected_xf(t);
-                                                status.set("Filling the frame.".to_string());
-                                            }, "▢ Fill" }
-                                        button { class: "mor-btn", title: "Landscape band near the top — text below",
-                                            onclick: move |_| {
-                                                push_undo("band");
-                                                let mut t = selected_xf().unwrap_or_default();
-                                                t.scale = 1.0; t.scale_x = 1.0; t.scale_y = 0.34; t.x = 0.0; t.y = -0.22; t.rotation = 0.0; t.cover = true;
-                                                set_selected_xf(t);
-                                                status.set("Band set — pick a Background (Bg) for the surround, then add Text below.".to_string());
-                                            }, "▭ Band ↑" }
-                                        button { class: "mor-btn", title: "Landscape band, centered",
-                                            onclick: move |_| {
-                                                push_undo("band");
-                                                let mut t = selected_xf().unwrap_or_default();
-                                                t.scale = 1.0; t.scale_x = 1.0; t.scale_y = 0.34; t.x = 0.0; t.y = 0.0; t.rotation = 0.0; t.cover = true;
-                                                set_selected_xf(t);
-                                                status.set("Band set — pick a Background (Bg) for the surround, then add Text above or below.".to_string());
-                                            }, "▭ Band" }
-                                        button { class: "mor-btn", title: "Landscape band near the bottom — text above",
-                                            onclick: move |_| {
-                                                push_undo("band");
-                                                let mut t = selected_xf().unwrap_or_default();
-                                                t.scale = 1.0; t.scale_x = 1.0; t.scale_y = 0.34; t.x = 0.0; t.y = 0.22; t.rotation = 0.0; t.cover = true;
-                                                set_selected_xf(t);
-                                                status.set("Band set — pick a Background (Bg) for the surround, then add Text above.".to_string());
-                                            }, "▭ Band ↓" }
-                                    }
-                                    p { class: "mor-statusbar-muted mr-export-blurb",
-                                        {if safe_area() {
-                                            "Align snaps the clip's box to the safe area (guides on) — computed from its real height, so a band of any size lands flush."
-                                        } else {
-                                            "Align snaps the clip's box to the frame — press G for safe-area guides to align to those instead. Works at any band height."
-                                        }}
-                                    }
-                                    div { class: "mr-preset-row",
-                                        button { class: "mor-btn", title: "Align top edge",
-                                            onclick: move |_| align_sel(engine::Align::Top), "⤒ Top" }
-                                        button { class: "mor-btn", title: "Centre vertically",
-                                            onclick: move |_| align_sel(engine::Align::VCenter), "⇕ Middle" }
-                                        button { class: "mor-btn", title: "Align bottom edge",
-                                            onclick: move |_| align_sel(engine::Align::Bottom), "⤓ Bottom" }
-                                    }
-                                    div { class: "mr-preset-row",
-                                        button { class: "mor-btn", title: "Align left edge",
-                                            onclick: move |_| align_sel(engine::Align::Left), "⇤ Left" }
-                                        button { class: "mor-btn", title: "Centre horizontally",
-                                            onclick: move |_| align_sel(engine::Align::HCenter), "⇔ Centre" }
-                                        button { class: "mor-btn", title: "Align right edge",
-                                            onclick: move |_| align_sel(engine::Align::Right), "⇥ Right" }
-                                    }
-                                    {transform_panel(false)}
-                                    MorCheckbox {
-                                        label: "Ken Burns zoom (animated push over the whole clip)".to_string(),
-                                        checked: c.transform.scale.is_animated(),
-                                        onchange: move |on: bool| set_ken_burns(on),
-                                    }
+                                    {transform_panel(false, true)}
                                     }
                                     }
                                     if active_phase() == Phase::Cut {
@@ -6480,7 +6703,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                             "⇄ Reverse"
                                         }
                                     }
-                                    {transform_panel(true)}
+                                    {transform_panel(true, false)}
                                     div { class: "mr-toolbar",
                                         button { class: "mor-btn mr-danger", onclick: move |_| delete_sel(()), "✕ Remove overlay" }
                                     }
@@ -8605,6 +8828,12 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                 disabled: no_clips || exporting,
                                 on_action: move |_| do_export(()),
                             }
+                            CtxItem {
+                                label: "Export frame as PNG…".to_string(),
+                                shortcut: Some("Ctrl+Shift+E".to_string()),
+                                disabled: no_clips || exporting,
+                                on_action: move |_| export_frame_png(()),
+                            }
                         },
                         Ctx::Clip(i) => {
                             let len = clips.read().len();
@@ -9553,6 +9782,7 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                     ("Ctrl+T", "Add text at playhead"),
                     ("Ctrl+U", "Detach selected clip audio to A1"),
                     ("Ctrl+E", "Export MP4"),
+                    ("Ctrl+Shift+E", "Export frame as PNG"),
                     ("Ctrl+Q", "Quit"),
                 ] {
                     tr {
@@ -11010,7 +11240,7 @@ mod tests {
         for (i, (_, _, _, _, _, set)) in transform_knobs(&t, true).into_iter().enumerate() {
             set(&mut t, i as f64 + 1.0);
         }
-        // Knob order (place → size → spin → anchor → opacity), so field i gets i+1.
+        // Knob order (place → size → spin → pivot → opacity), so field i gets i+1.
         assert_eq!(
             (t.x, t.y, t.scale, t.scale_x, t.scale_y, t.rotation, t.anchor_x, t.anchor_y, t.opacity),
             (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0)
@@ -11019,6 +11249,17 @@ mod tests {
         assert_eq!(transform_knobs(&t, false).len(), 8);
         assert_eq!(transform_knobs(&t, true).len(), 9);
         assert!(!transform_knobs(&t, false).iter().any(|k| k.0 == "Opacity"));
+        assert_eq!(xf_section("X"), XformSection::Position);
+        assert_eq!(xf_section("Stretch Y"), XformSection::Size);
+        assert_eq!(xf_section("Rotation"), XformSection::Rotate);
+
+        // Band presets: fill is the identity box; top band sits high with cover.
+        let mut b = engine::Transform::default();
+        apply_band(&mut b, "top");
+        assert_eq!(active_band(&b), Some("top"));
+        assert!(b.cover && (b.y + 0.22).abs() < 1e-9);
+        apply_band(&mut b, "fill");
+        assert_eq!(active_band(&b), Some("fill"));
 
         // Every slider's range must contain the value it starts at, or the
         // control would jump the moment it is touched.

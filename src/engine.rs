@@ -2155,6 +2155,50 @@ pub async fn frame_data_uri_fill(
     over: Over,
     fill: &str,
 ) -> Result<String, String> {
+    let bytes = render_frame_bytes(path, t, w, h, framing, effect, over, fill, "mjpeg").await?;
+    Ok(format!("data:image/jpeg;base64,{}", b64(&bytes)))
+}
+
+/// Write one composed timeline frame (same stack as the monitor) to `out` as PNG.
+/// Size is the export canvas (`w`×`h`); overlays, titles, FX and transitions are
+/// baked in, so what you scrub is what the file holds.
+#[allow(clippy::too_many_arguments)]
+pub async fn export_frame_png(
+    path: &str,
+    t: f64,
+    w: u32,
+    h: u32,
+    framing: &str,
+    effect: &str,
+    over: Over,
+    fill: &str,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    // Atomic write: a killed extract must not leave a half PNG at the final path.
+    let tmp = out.with_extension("part.png");
+    let bytes = render_frame_bytes(path, t, w, h, framing, effect, over, fill, "png").await?;
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, out).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
+    Ok(())
+}
+
+/// One composed frame as raw image bytes. `codec` is the ffmpeg image codec
+/// (`mjpeg` for the scrub data-URI, `png` for Export frame).
+#[allow(clippy::too_many_arguments)]
+async fn render_frame_bytes(
+    path: &str,
+    t: f64,
+    w: u32,
+    h: u32,
+    framing: &str,
+    effect: &str,
+    over: Over,
+    fill: &str,
+    codec: &str,
+) -> Result<Vec<u8>, String> {
     let mut chain = frame_chain_fill(framing, w, h, "m", fill);
     if !effect.is_empty() {
         // Seeking restarts the filter clock at 0, which would freeze every
@@ -2250,7 +2294,7 @@ pub async fn frame_data_uri_fill(
         cmd.args(["-filter_complex", &graph, "-map", "[out]"]);
     }
     let out = cmd
-        .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "mjpeg", "-"])
+        .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", codec, "-"])
         .stdin(Stdio::null())
         .output()
         .await
@@ -2258,7 +2302,7 @@ pub async fn frame_data_uri_fill(
     if !out.status.success() || out.stdout.is_empty() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    Ok(format!("data:image/jpeg;base64,{}", b64(&out.stdout)))
+    Ok(out.stdout)
 }
 
 /// Where a user's own settings live, as opposed to things that can be
@@ -5233,6 +5277,53 @@ noise
         let wav = dir.join("mix.wav");
         render_audio_mix(&clips, &[], &wav).await.unwrap();
         assert!(std::fs::metadata(&wav).unwrap().len() > 0);
+    }
+
+    // Export-frame must land a real PNG of the composed canvas (titles stacked),
+    // not a zero-byte file or a JPEG with a .png name.
+    #[tokio::test]
+    async fn export_frame_png_writes_a_portrait_png() {
+        let dir = std::env::temp_dir().join("morreel-frame-png-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4").display().to_string();
+        capture("ffmpeg", &[
+            "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=30",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", &src,
+        ]).await.unwrap();
+        let title = render_title(&TitleStyle {
+            text: "Frame".into(),
+            font_size: 72,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let out = dir.join("frame.png");
+        export_frame_png(
+            &src,
+            0.25,
+            540,
+            960,
+            "Crop",
+            "",
+            Over { titles: vec![(title, 1.0)], ..Default::default() },
+            "black",
+            &out,
+        )
+        .await
+        .unwrap();
+        assert!(std::fs::metadata(&out).unwrap().len() > 100, "empty PNG");
+        // PNG magic number — proves we didn't write MJPEG under a .png name.
+        let magic = std::fs::read(&out).unwrap();
+        assert_eq!(&magic[..8], b"\x89PNG\r\n\x1a\n");
+        let dims = capture("ffprobe", &[
+            "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0",
+            &out.display().to_string(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(dims.trim(), "540,960");
     }
 
     // Scrubbing a time-based effect must show its motion, not its t=0 pose.

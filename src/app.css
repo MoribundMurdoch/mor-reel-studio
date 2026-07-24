@@ -57,6 +57,15 @@
   background: linear-gradient(180deg, var(--mor-accent-hover), color-mix(in srgb, var(--mor-accent) 85%, black));
   box-shadow: 0 4px 14px color-mix(in srgb, var(--mor-accent) 35%, transparent);
 }
+/* Selected toggle (band preset, flip, speed chip, handles). Distinct from
+   :active (the press flash). */
+.mr-root .mor-btn.active {
+  border-color: var(--mor-accent);
+  color: var(--mor-accent-hover);
+  background: color-mix(in srgb, var(--mor-accent) 16%, var(--mor-btn));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mor-accent) 35%, transparent),
+              0 0 10px color-mix(in srgb, var(--mor-accent) 22%, transparent);
+}
 
 /* Signature: phone as a framed artifact — dual rim + soft brass bloom.
    Width-driven: aspect-ratio height doesn't feed the flex column's intrinsic
@@ -623,6 +632,25 @@
 /* Band presets + background swatches. */
 .mr-preset-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 12px; }
 .mr-preset-row .mor-btn { flex: 1; min-width: 68px; }
+
+/* Style › Transform panel: grouped sections, compact align pad, flip row. */
+.mr-xf-panel { display: flex; flex-direction: column; gap: 2px; }
+.mr-xf-panel > .mr-fx-cat:first-child { margin-top: 0; }
+.mr-xf-panel .mr-export-blurb { margin: 2px 0 6px; font-size: 11px; line-height: 1.35; }
+.mr-align-rows { margin: 2px 0 4px; }
+.mr-align-row { margin: 0 0 4px !important; }
+.mr-align-row .mor-btn { font-size: 11px; }
+.mr-flip-row {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  margin: 2px 0 8px;
+}
+.mr-flip-row .mor-btn { flex: 1; min-width: 64px; font-size: 11px; }
+.mr-xf-footer {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  align-items: center; margin-top: 10px; padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--mor-border) 80%, transparent);
+}
+.mr-xf-footer .mr-reset { margin: 0; }
 .mr-bg-swatches { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 .mr-bg-swatch {
   flex: 1; min-width: 66px; height: 58px; padding: 5px;

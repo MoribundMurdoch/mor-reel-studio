@@ -806,19 +806,58 @@ pub fn shape_knobs(t: &TitleItem) -> Vec<ShapeKnob> {
 /// write it back. Both lanes carry the same struct, so one table serves both.
 pub type XformKnob = (&'static str, f64, f64, f64, f64, fn(&mut engine::Transform, f64));
 
+/// Section a knob belongs to — drives the Transform tab's grouped layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum XformSection {
+    Position,
+    Size,
+    Rotate,
+    Pivot,
+    Opacity,
+}
+
+impl XformSection {
+    pub fn label(self) -> &'static str {
+        match self {
+            XformSection::Position => "Position",
+            XformSection::Size => "Size",
+            XformSection::Rotate => "Rotate",
+            XformSection::Pivot => "Pivot",
+            XformSection::Opacity => "Opacity",
+        }
+    }
+}
+
+/// Which section a knob label lives in. Keeps the UI grouping in step with the
+/// table below without re-listing the same names.
+pub fn xf_section(label: &str) -> XformSection {
+    match label {
+        "X" | "Y" => XformSection::Position,
+        "Scale" | "Stretch X" | "Stretch Y" => XformSection::Size,
+        "Rotation" => XformSection::Rotate,
+        "Anchor X" | "Anchor Y" => XformSection::Pivot,
+        "Opacity" => XformSection::Opacity,
+        // Legacy names still map if any caller still has them.
+        "Position X" | "Position Y" => XformSection::Position,
+        "Stretch across" | "Stretch down" => XformSection::Size,
+        _ => XformSection::Size,
+    }
+}
+
 /// Opacity is only offered where it composites over something — on V1 there is
 /// nothing underneath it but black.
 pub fn transform_knobs(t: &engine::Transform, with_opacity: bool) -> Vec<XformKnob> {
-    // Vertical order under Mirror: place → size → spin → anchor → opacity.
+    // Order: place → size → spin → pivot → opacity. Labels are short so the
+    // compact inspector rows stay readable; section headers carry the context.
     let set_scale: fn(&mut engine::Transform, f64) = |x, v| x.scale = v;
     let mut knobs: Vec<XformKnob> = vec![
-        ("Position X", t.x, -1.0, 1.0, 0.005, |x, v| x.x = v),
-        ("Position Y", t.y, -1.0, 1.0, 0.005, |x, v| x.y = v),
+        ("X", t.x, -1.0, 1.0, 0.005, |x, v| x.x = v),
+        ("Y", t.y, -1.0, 1.0, 0.005, |x, v| x.y = v),
         ("Scale", t.scale, 0.1, 4.0, 0.01, set_scale),
-        ("Stretch across", t.scale_x, 0.1, 4.0, 0.01, |x, v| x.scale_x = v),
-        ("Stretch down", t.scale_y, 0.1, 4.0, 0.01, |x, v| x.scale_y = v),
+        ("Stretch X", t.scale_x, 0.1, 4.0, 0.01, |x, v| x.scale_x = v),
+        ("Stretch Y", t.scale_y, 0.1, 4.0, 0.01, |x, v| x.scale_y = v),
         ("Rotation", t.rotation, -180.0, 180.0, 1.0, |x, v| x.rotation = v),
-        // The pivot rotation turns around; moving it shifts the picture (Position
+        // Pivot rotation turns around; moving it shifts the picture (Position
         // places the anchor), so a spin can swing/orbit instead of turning in place.
         ("Anchor X", t.anchor_x, -1.0, 1.0, 0.005, |x, v| x.anchor_x = v),
         ("Anchor Y", t.anchor_y, -1.0, 1.0, 0.005, |x, v| x.anchor_y = v),
@@ -827,6 +866,68 @@ pub fn transform_knobs(t: &engine::Transform, with_opacity: bool) -> Vec<XformKn
         knobs.push(("Opacity", t.opacity, 0.0, 1.0, 0.01, |x, v| x.opacity = v));
     }
     knobs
+}
+
+/// Named band presets for the Layout row. `id` is used for active-state matching.
+pub const BAND_PRESETS: &[(&str, &str, &str)] = &[
+    ("fill", "▢ Fill", "Fill the whole 9:16 frame"),
+    ("top", "▭ Band ↑", "Landscape band near the top — text below"),
+    ("mid", "▭ Band", "Landscape band, centered"),
+    ("bot", "▭ Band ↓", "Landscape band near the bottom — text above"),
+];
+
+/// Apply a band/layout preset onto a transform pose (keeps flips/opacity/bg).
+pub fn apply_band(t: &mut engine::Transform, id: &str) {
+    t.scale = 1.0;
+    t.scale_x = 1.0;
+    t.rotation = 0.0;
+    t.x = 0.0;
+    match id {
+        "fill" => {
+            t.scale_y = 1.0;
+            t.y = 0.0;
+            t.cover = false;
+        }
+        "top" => {
+            t.scale_y = 0.34;
+            t.y = -0.22;
+            t.cover = true;
+        }
+        "mid" => {
+            t.scale_y = 0.34;
+            t.y = 0.0;
+            t.cover = true;
+        }
+        "bot" => {
+            t.scale_y = 0.34;
+            t.y = 0.22;
+            t.cover = true;
+        }
+        _ => {}
+    }
+}
+
+/// Which band preset matches the current pose, if any.
+pub fn active_band(t: &engine::Transform) -> Option<&'static str> {
+    let near = |a: f64, b: f64| (a - b).abs() < 0.03;
+    if !near(t.scale, 1.0) || !near(t.scale_x, 1.0) || !near(t.x, 0.0) || t.rotation.abs() > 1.0 {
+        return None;
+    }
+    if near(t.scale_y, 1.0) && near(t.y, 0.0) && !t.cover {
+        return Some("fill");
+    }
+    if near(t.scale_y, 0.34) && t.cover {
+        if near(t.y, -0.22) {
+            return Some("top");
+        }
+        if near(t.y, 0.0) {
+            return Some("mid");
+        }
+        if near(t.y, 0.22) {
+            return Some("bot");
+        }
+    }
+    None
 }
 
 /// Which transform rows carry a keyframe diamond. `scale` animates through the
@@ -846,10 +947,10 @@ pub fn xf_field<'a>(
 ) -> Option<&'a mut keyframe::Animated<f64>> {
     Some(match label {
         "Scale" => &mut at.scale,
-        "Stretch across" => &mut at.scale_x,
-        "Stretch down" => &mut at.scale_y,
-        "Position X" => &mut at.x,
-        "Position Y" => &mut at.y,
+        "Stretch X" | "Stretch across" => &mut at.scale_x,
+        "Stretch Y" | "Stretch down" => &mut at.scale_y,
+        "X" | "Position X" => &mut at.x,
+        "Y" | "Position Y" => &mut at.y,
         "Rotation" => &mut at.rotation,
         "Opacity" => &mut at.opacity,
         _ => return None,
