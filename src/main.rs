@@ -5702,6 +5702,17 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                         onclick: move |_| toggle_play(()),
                                         if playing() { "⏸ Pause" } else { "▶ Play" }
                                     }
+                                    // The one edit you reach for constantly on a phone
+                                    // rides the transport — no workspace trip to cut.
+                                    if cfg!(target_os = "android") {
+                                        button {
+                                            class: "mor-btn",
+                                            disabled: exporting,
+                                            title: "Split the clip under the playhead",
+                                            onclick: move |_| split_at_playhead(()),
+                                            "✂ Split"
+                                        }
+                                    }
                                     button {
                                         class: "mor-btn",
                                         disabled: exporting,
