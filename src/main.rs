@@ -6497,6 +6497,66 @@ fn Editor(state: EditorState, view: EditorView) -> Element {
                                         }
                                     }
                                     }
+                                    // TikTok "text-to-speech": the card reads itself onto A2.
+                                    button {
+                                        class: "mor-btn",
+                                        title: "Speak this card's text onto A2 at the card's start (espeak-ng)",
+                                        onclick: move |_| {
+                                            let (text, at) = match titles.read().get(k) {
+                                                Some(t) => (t.text.clone(), t.at),
+                                                None => return,
+                                            };
+                                            status.set("Reading card aloud…".to_string());
+                                            spawn(async move {
+                                                let path = match engine::tts(&text).await {
+                                                    Ok(p) => p,
+                                                    Err(e) => {
+                                                        status.set(e);
+                                                        return;
+                                                    }
+                                                };
+                                                let path_s = path.display().to_string();
+                                                match engine::probe(&path_s).await {
+                                                    Ok((duration, true)) if duration > 0.05 => {
+                                                        push_undo("");
+                                                        let n = audios
+                                                            .read()
+                                                            .iter()
+                                                            .filter(|a| a.name.starts_with("Speech"))
+                                                            .count()
+                                                            + 1;
+                                                        audios.write().push(AudioItem {
+                                                            path: path_s.clone(),
+                                                            name: format!("Speech {n}"),
+                                                            duration,
+                                                            out_s: duration,
+                                                            at,
+                                                            fade_in: 0.02,
+                                                            fade_out: 0.05,
+                                                            lane: 2, // A2 — same bed as voiceover takes
+                                                            ..Default::default()
+                                                        });
+                                                        // TikTok keeps the card up while it's read.
+                                                        if let Some(item) = titles.write().get_mut(k) {
+                                                            if item.dur < duration {
+                                                                item.dur = duration;
+                                                            }
+                                                        }
+                                                        status.set(format!(
+                                                            "Speech on A2 at {} ({}).",
+                                                            fmt_t(at),
+                                                            fmt_clip_dur(duration)
+                                                        ));
+                                                        fill_audio_waves(path_s);
+                                                    }
+                                                    _ => status.set(
+                                                        "Text-to-speech produced no audio.".to_string(),
+                                                    ),
+                                                }
+                                            });
+                                        },
+                                        "Read aloud"
+                                    }
                                     MorSelect {
                                         label: "Backdrop".to_string(),
                                         value: if t.boxed { "Box".to_string() } else { "Transparent".to_string() },

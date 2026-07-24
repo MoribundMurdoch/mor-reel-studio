@@ -1086,6 +1086,11 @@ pub const AUDIO_TREATS: &[&str] = &[
     "Bright",
     "Bass cut",
     "Podcast",
+    "Chipmunk",
+    "Deep voice",
+    "Robot",
+    "Megaphone",
+    "Echo",
 ];
 
 /// ffmpeg filter chain for a treatment label (no leading/trailing commas).
@@ -1103,6 +1108,18 @@ pub fn audio_treat_chain(name: &str) -> &'static str {
             "highpass=f=80,equalizer=f=2500:t=q:w=1:g=2,\
              acompressor=threshold=-20dB:ratio=3:attack=8:release=80:makeup=2"
         }
+        // Voice-changer pair: relabel the rate to shift pitch, then atempo the
+        // duration back so the item still lines up on the timeline. The leading
+        // aresample pins the rate the asetrate math assumes.
+        "Chipmunk" => "aresample=48000,asetrate=72000,aresample=48000,atempo=0.66667",
+        "Deep voice" => "aresample=48000,asetrate=36000,aresample=48000,atempo=1.33333",
+        // Frequency shift breaks the harmonic series — metallic, robotic ring.
+        "Robot" => "afreqshift=shift=250",
+        "Megaphone" => {
+            "highpass=f=500,lowpass=f=2200,\
+             acompressor=threshold=-18dB:ratio=8:attack=2:release=60:makeup=6"
+        }
+        "Echo" => "aecho=0.8:0.7:120:0.35",
         _ => "",
     }
 }
@@ -2559,6 +2576,28 @@ pub fn voiceover_out_path() -> std::path::PathBuf {
     dir.join(format!("vo-{stamp}.wav"))
 }
 
+/// Speak `text` into a wav under the cache dir (TikTok-style text-to-speech on
+/// a text card). Shells to `espeak-ng` — same shell-over-engine stance as
+/// ffmpeg/curl. Returns the wav path for the caller to probe and insert.
+pub async fn tts(text: &str) -> Result<std::path::PathBuf, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("This card has no text to read.".to_string());
+    }
+    let dir = cache_dir("tts");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out = dir.join(format!("tts-{stamp}.wav"));
+    // ponytail: one fixed voice; add a voice picker if anyone asks.
+    capture("espeak-ng", &["-v", "en+f3", "-s", "165", "-w", &out.display().to_string(), text])
+        .await
+        .map_err(|e| format!("Text-to-speech needs espeak-ng on PATH ({e})"))?;
+    Ok(out)
+}
+
 /// Start capturing the default microphone into `path` (WAV, mono 48 kHz).
 /// Tries PulseAudio first, then ALSA. The child stays running until
 /// [`stop_mic_record`] writes `q` to its stdin (graceful so the WAV header is
@@ -3228,6 +3267,23 @@ mod tests {
         // Same-millisecond calls can collide; distinct paths are preferred but
         // not required for correctness of a single take.
         let _ = b;
+    }
+
+    /// Smoke: TTS lands a real wav with audio in it. Skips when espeak-ng
+    /// isn't installed (CI / headless).
+    #[tokio::test]
+    async fn tts_speaks_a_wav() {
+        assert!(tts("   ").await.is_err(), "blank text must not shell out");
+        let p = match tts("Hello from the timeline.").await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skip tts smoke (no espeak-ng): {e}");
+                return;
+            }
+        };
+        let (d, has_audio) = probe(&p.display().to_string()).await.unwrap();
+        assert!(has_audio && d > 0.3, "spoken wav should have audible length, got {d}");
+        let _ = std::fs::remove_file(&p);
     }
 
     /// Smoke: open the default mic briefly and land a valid WAV. Skips when
